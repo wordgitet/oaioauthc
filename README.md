@@ -26,7 +26,8 @@ The server binds to `127.0.0.1:10531` by default. Credentials are read from
 `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, unless `--oauth-file` is set.
 Use `/v1/models` to discover the account's current models; Responses and Chat
 Completions requests must specify one explicitly. The Codex client version is
-discovered automatically and can be pinned with `--codex-version`.
+discovered automatically at startup; use `--codex-version` to provide an
+explicit version when the registry is unavailable.
 
 Image-generation routes are not implemented.
 

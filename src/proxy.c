@@ -23,7 +23,6 @@
 #include <unistd.h>
 
 #define DEFAULT_BASE_URL "https://chatgpt.com/backend-api/codex"
-#define DEFAULT_CODEX_VERSION "0.144.1"
 #define CODEX_REGISTRY_URL \
 	"https://registry.npmjs.org/@openai/codex/latest"
 #define MAX_REQUEST_SIZE (8 * 1024 * 1024)
@@ -465,35 +464,38 @@ valid_codex_version(const char *version)
 }
 
 static char *
-resolve_codex_version(const struct proxy_options *options)
+resolve_codex_version(const struct proxy_options *options, char *error,
+    size_t length)
 {
 	struct http_response	response;
-	char			error[256];
 	const char		*version;
 	char			*result;
 	json_t			*root;
 
 	if (valid_codex_version(options->codex_version))
 		return oaio_strdup(options->codex_version);
-	result = NULL;
 	if (http_get(CODEX_REGISTRY_URL, NULL, NULL, &response, error,
-	    sizeof(error)) == 0) {
-		if (response.status >= 200 && response.status < 300) {
-			root = json_loads(response.body, 0, NULL);
-			version = json_string_value(json_object_get(root,
-			    "version"));
-			if (valid_codex_version(version))
-				result = oaio_strdup(version);
-			json_decref(root);
-		}
+	    length) == -1)
+		return NULL;
+	if (response.status < 200 || response.status >= 300) {
+		set_error(error, length, "Codex version lookup failed with HTTP %ld",
+		    response.status);
 		http_response_free(&response);
+		return NULL;
 	}
-	if (result == NULL) {
-		(void)fprintf(stderr, "Warning: could not determine the latest "
-		    "Codex version; using %s. Pass --codex-version to "
-		    "override it.\n", DEFAULT_CODEX_VERSION);
-		result = oaio_strdup(DEFAULT_CODEX_VERSION);
+	root = json_loads(response.body, 0, NULL);
+	http_response_free(&response);
+	version = json_string_value(json_object_get(root, "version"));
+	if (!valid_codex_version(version)) {
+		json_decref(root);
+		set_error(error, length,
+		    "Codex version registry returned an invalid version");
+		return NULL;
 	}
+	result = oaio_strdup(version);
+	json_decref(root);
+	if (result == NULL)
+		set_error(error, length, "could not allocate Codex version");
 	return result;
 }
 
@@ -525,8 +527,7 @@ load_model_catalog(const struct proxy_options *options,
 	    catalog->expires > time(NULL))
 		return 0;
 	url = upstream_url(options, "models?client_version=");
-	version = http_form_encode(options->codex_version == NULL ?
-	    DEFAULT_CODEX_VERSION : options->codex_version);
+	version = http_form_encode(options->codex_version);
 	if (url == NULL || version == NULL) {
 		free(url);
 		free(version);
@@ -934,10 +935,9 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		    strerror(errno));
 		return -1;
 	}
-	codex_version = resolve_codex_version(options);
+	codex_version = resolve_codex_version(options, error, length);
 	if (codex_version == NULL) {
 		close(listen_fd);
-		set_error(error, length, "could not resolve Codex version");
 		return -1;
 	}
 	effective_options = *options;

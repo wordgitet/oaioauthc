@@ -291,7 +291,7 @@ main(void)
 	if (pid == 0) {
 		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
 		    "--oauth-file", path, "--base-url", base_url,
-		    "--codex-version", "0.144.1", (char *)NULL);
+		    "--codex-version", "9.9.9", (char *)NULL);
 		_exit(127);
 	}
 	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
