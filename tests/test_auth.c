@@ -27,6 +27,12 @@ main(void)
 	CHECK(auth_load(path, &session, error, sizeof(error)) == 0);
 	CHECK(strcmp(session.account_id, "acct_jwt") == 0);
 	auth_session_free(&session);
+	memset(&session, 0, sizeof(session));
+	session.access_token = oaio_strdup("opaque");
+	session.refresh_token = oaio_strdup("refresh");
+	session.last_refresh = oaio_strdup("1970-01-01T00:00:00Z");
+	CHECK(auth_session_needs_refresh(&session) == 1);
+	auth_session_free(&session);
 	memset(&request, 0, sizeof(request));
 	CHECK(oauth_request_create("http://localhost:1455/auth/callback", NULL,
 	    &request, error, sizeof(error)) == 0);

@@ -18,6 +18,7 @@
 #define DEFAULT_CLIENT_ID "app_EMoamEEZ73f0CkXaXp7hrann"
 #define DEFAULT_ISSUER "https://auth.openai.com"
 #define DEFAULT_TOKEN_URL "https://auth.openai.com/oauth/token"
+#define REFRESH_INTERVAL 3300
 
 static void
 set_error(char *error, size_t length, const char *format, ...)
@@ -69,6 +70,77 @@ static char
 	encoded = base64url(bytes, length);
 	free(bytes);
 	return encoded;
+}
+
+static char
+*current_timestamp(void)
+{
+	char		buffer[32];
+	struct tm	*utc;
+	time_t		now;
+
+	now = time(NULL);
+	utc = gmtime(&now);
+	if (utc == NULL ||
+	    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", utc) == 0)
+		return NULL;
+	return oaio_strdup(buffer);
+}
+
+static long long
+days_from_civil(int year, unsigned int month, unsigned int day)
+{
+	int		era;
+	unsigned int	day_of_era;
+	unsigned int	day_of_year;
+	unsigned int	year_of_era;
+
+	year -= month <= 2;
+	era = (year >= 0 ? year : year - 399) / 400;
+	year_of_era = (unsigned int)(year - era * 400);
+	day_of_year = (153 * (month + (month > 2 ? -3U : 9U)) + 2) / 5 +
+	    day - 1;
+	day_of_era = year_of_era * 365 + year_of_era / 4 -
+	    year_of_era / 100 + day_of_year;
+	return (long long)era * 146097 + day_of_era - 719468;
+}
+
+static int
+parse_timestamp(const char *text, time_t *result)
+{
+	static const unsigned int month_days[] = {
+		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+	char		tail;
+	long long	seconds;
+	time_t		value;
+	int		year;
+	unsigned int	day;
+	unsigned int	days;
+	unsigned int	hour;
+	unsigned int	minute;
+	unsigned int	month;
+	unsigned int	second;
+
+	if (text == NULL || sscanf(text, "%4d-%2u-%2uT%2u:%2u:%2uZ%c",
+	    &year, &month, &day, &hour, &minute, &second, &tail) != 6)
+		return -1;
+	if (month < 1 || month > 12 || hour > 23 || minute > 59 ||
+	    second > 60)
+		return -1;
+	days = month_days[month - 1];
+	if (month == 2 && (year % 4 == 0 &&
+	    (year % 100 != 0 || year % 400 == 0)))
+		days++;
+	if (day < 1 || day > days)
+		return -1;
+	seconds = days_from_civil(year, month, day) * 86400 +
+	    (long long)hour * 3600 + (long long)minute * 60 + second;
+	value = (time_t)seconds;
+	if ((long long)value != seconds)
+		return -1;
+	*result = value;
+	return 0;
 }
 
 static char
@@ -268,17 +340,18 @@ auth_session_needs_refresh(const struct auth_session *session)
 	json_t		*claims;
 	json_int_t	expires;
 	int		result;
+	time_t		refreshed;
 
 	if (session->access_token == NULL || session->refresh_token == NULL)
 		return session->access_token == NULL;
 	first = strchr(session->access_token, '.');
 	if (first == NULL || (second = strchr(first + 1, '.')) == NULL)
-		return 0;
+		goto check_last_refresh;
 	payload_length = (size_t)(second - first - 1);
 	padding = (4 - payload_length % 4) % 4;
 	payload = malloc(payload_length + padding + 1);
 	if (payload == NULL)
-		return 0;
+		goto check_last_refresh;
 	memcpy(payload, first + 1, payload_length);
 	while (padding > 0) {
 		payload[payload_length++] = '=';
@@ -294,26 +367,32 @@ auth_session_needs_refresh(const struct auth_session *session)
 	decoded = malloc(payload_length + 1);
 	if (decoded == NULL) {
 		free(payload);
-		return 0;
+		goto check_last_refresh;
 	}
 	decoded_length = EVP_DecodeBlock(decoded, (unsigned char *)payload,
 	    (int)payload_length);
 	free(payload);
 	if (decoded_length < 0) {
 		free(decoded);
-		return 0;
+		goto check_last_refresh;
 	}
 	decoded[decoded_length] = '\0';
 	claims = json_loads((char *)decoded, 0, NULL);
 	free(decoded);
 	if (!json_is_object(claims)) {
 		json_decref(claims);
-		return 0;
+		goto check_last_refresh;
 	}
 	expires = json_integer_value(json_object_get(claims, "exp"));
 	json_decref(claims);
 	result = expires > 0 && expires <= (json_int_t)time(NULL) + 300;
-	return result;
+	if (result)
+		return 1;
+
+check_last_refresh:
+	if (parse_timestamp(session->last_refresh, &refreshed) == 0)
+		return refreshed <= time(NULL) - REFRESH_INTERVAL;
+	return 0;
 }
 
 static int
@@ -359,9 +438,10 @@ token_response(const char *text, struct auth_session *session, char *error,
 	free(session->account_id);
 	session->account_id = account;
 	free(session->last_refresh);
-	session->last_refresh = oaio_strdup("refreshed");
+	session->last_refresh = current_timestamp();
 	json_decref(root);
-	return session->access_token == NULL ? -1 : 0;
+	return session->access_token == NULL || session->last_refresh == NULL ?
+	    -1 : 0;
 }
 
 int
