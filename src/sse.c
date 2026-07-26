@@ -307,6 +307,8 @@ process_event(struct sse_chat_stream *stream, const char *data)
 				stream->id = next;
 			}
 		}
+		if (result == 0)
+			result = emit_role(stream);
 	} else if (type != NULL &&
 	    strcmp(type, "response.output_text.delta") == 0) {
 		delta_text = json_string_value(json_object_get(event, "delta"));
