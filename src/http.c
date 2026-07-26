@@ -182,6 +182,14 @@ request(const char *url, const char *method, const char *body,
 	}
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response->status);
 	response->body = buffer_steal(&response_body);
+	if (response->body == NULL) {
+		set_error(error, error_length,
+		    "could not allocate upstream response");
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+		http_response_free(response);
+		return -1;
+	}
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
 	return 0;
