@@ -30,6 +30,7 @@
 #define MAX_HEADER_SIZE ((size_t)64 * 1024)
 #define CLIENT_TIMEOUT 30
 #define MAX_WORKERS 32
+#define MODEL_CATALOG_RETRY 30
 
 struct request {
 	char	*method;
@@ -1240,6 +1241,34 @@ dispatch(int fd, const struct proxy_options *options,
 	return result;
 }
 
+static void
+refresh_parent_catalog(const struct proxy_options *options,
+    struct model_catalog *catalog)
+{
+	struct auth_session	session;
+	char			error[256];
+	const char		*auth_file;
+	time_t			now;
+
+	if (options->models != NULL)
+		return;
+	now = time(NULL);
+	if (catalog->expires > now)
+		return;
+	auth_file = options->auth_file == NULL ? auth_default_file() :
+	    options->auth_file;
+	if (auth_file == NULL ||
+	    auth_load(auth_file, &session, error, sizeof(error)) == -1) {
+		catalog->expires = now + MODEL_CATALOG_RETRY;
+		return;
+	}
+	if (auth_session_needs_refresh(&session) ||
+	    load_model_catalog(options, &session, catalog, error,
+	    sizeof(error)) == -1)
+		catalog->expires = now + MODEL_CATALOG_RETRY;
+	auth_session_free(&session);
+}
+
 int
 proxy_serve(const struct proxy_options *options, char *error, size_t length)
 {
@@ -1365,6 +1394,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		}
 		workers++;
 		close(client_fd);
+		refresh_parent_catalog(&effective_options, &catalog);
 	}
 	close(listen_fd);
 	model_catalog_free(&catalog);
