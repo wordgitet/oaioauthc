@@ -116,6 +116,121 @@ json_normalize_response_request(json_t *request, int force_stream,
 	return 0;
 }
 
+static int
+input_has_type(json_t *input, const char *expected)
+{
+	const char	*type;
+	json_t		*item;
+	size_t		index;
+
+	if (!json_is_array(input))
+		return 0;
+	json_array_foreach(input, index, item) {
+		type = json_string_value(json_object_get(item, "type"));
+		if (type != NULL && strcmp(type, expected) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+int
+json_apply_model_defaults(json_t *request, json_t *model, int *use_lite,
+    char *error, size_t length)
+{
+	const char	*default_effort;
+	const char	*default_verbosity;
+	const char	*instructions;
+	json_t		*input;
+	json_t		*item;
+	json_t		*next_input;
+	json_t		*reasoning;
+	json_t		*text;
+	json_t		*tools;
+	size_t		index;
+
+	*use_lite = json_is_true(json_object_get(model, "use_responses_lite"));
+	default_effort = json_string_value(json_object_get(model,
+	    "default_reasoning_level"));
+	reasoning = json_object_get(request, "reasoning");
+	if ((default_effort != NULL || *use_lite) &&
+	    !json_is_object(reasoning)) {
+		reasoning = json_object();
+		if (reasoning == NULL ||
+		    json_object_set_new(request, "reasoning", reasoning) == -1)
+			goto fail;
+	}
+	if (json_is_object(reasoning) && default_effort != NULL &&
+	    json_object_get(reasoning, "effort") == NULL &&
+	    json_object_set_new(reasoning, "effort",
+	    json_string(default_effort)) == -1)
+		goto fail;
+	if (*use_lite && json_object_set_new(reasoning, "context",
+	    json_string("all_turns")) == -1)
+		goto fail;
+	default_verbosity = json_string_value(json_object_get(model,
+	    "default_verbosity"));
+	if (json_is_true(json_object_get(model, "support_verbosity")) &&
+	    default_verbosity != NULL) {
+		text = json_object_get(request, "text");
+		if (!json_is_object(text)) {
+			text = json_object();
+			if (text == NULL ||
+			    json_object_set_new(request, "text", text) == -1)
+				goto fail;
+		}
+		if (json_object_get(text, "verbosity") == NULL &&
+		    json_object_set_new(text, "verbosity",
+		    json_string(default_verbosity)) == -1)
+			goto fail;
+	}
+	if (!*use_lite)
+		return 0;
+	input = json_object_get(request, "input");
+	next_input = json_array();
+	if (next_input == NULL)
+		goto fail;
+	tools = json_object_get(request, "tools");
+	if (json_is_array(tools) && json_array_size(tools) > 0 &&
+	    !input_has_type(input, "additional_tools")) {
+		item = json_pack("{s:s,s:s,s:O}", "type", "additional_tools",
+		    "role", "developer", "tools", tools);
+		if (item == NULL || json_array_append_new(next_input, item) == -1) {
+			json_decref(next_input);
+			goto fail;
+		}
+	}
+	instructions = json_string_value(json_object_get(request,
+	    "instructions"));
+	if (instructions != NULL && instructions[0] != '\0') {
+		item = json_pack("{s:s,s:[{s:s,s:s}]}", "role", "developer",
+		    "content", "type", "input_text", "text", instructions);
+		if (item == NULL || json_array_append_new(next_input, item) == -1) {
+			json_decref(next_input);
+			goto fail;
+		}
+	}
+	if (json_is_array(input)) {
+		json_array_foreach(input, index, item) {
+			if (json_array_append(next_input, item) == -1) {
+				json_decref(next_input);
+				goto fail;
+			}
+		}
+	}
+	if (json_object_set_new(request, "input", next_input) == -1)
+		goto fail;
+	if (json_object_set_new(request, "instructions", json_string("")) == -1 ||
+	    json_object_set_new(request, "parallel_tool_calls",
+	    json_false()) == -1)
+		goto fail;
+	json_object_del(request, "tools");
+	return 0;
+
+fail:
+	set_error(error, length, "could not apply model defaults");
+	return -1;
+}
+
 static json_t
 *chat_content_to_input(json_t *content)
 {

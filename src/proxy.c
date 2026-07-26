@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_BASE_URL "https://chatgpt.com/backend-api/codex"
@@ -27,6 +28,12 @@ struct request {
 	char	*method;
 	char	*path;
 	char	*body;
+};
+
+struct model_catalog {
+	json_t	*root;
+	char	*account_id;
+	time_t	expires;
 };
 
 static void
@@ -369,12 +376,106 @@ static char
 	return buffer_steal(&buffer);
 }
 
+static void
+model_catalog_free(struct model_catalog *catalog)
+{
+	json_decref(catalog->root);
+	free(catalog->account_id);
+	memset(catalog, 0, sizeof(*catalog));
+}
+
+static int
+load_model_catalog(const struct proxy_options *options,
+    const struct auth_session *session, struct model_catalog *catalog,
+    char *error, size_t length)
+{
+	struct buffer		full;
+	struct http_response	response;
+	char			*url;
+	char			*version;
+	json_t			*root;
+
+	if (catalog->root != NULL && catalog->account_id != NULL &&
+	    strcmp(catalog->account_id, session->account_id) == 0 &&
+	    catalog->expires > time(NULL))
+		return 0;
+	url = upstream_url(options, "models?client_version=");
+	version = http_form_encode(options->codex_version == NULL ?
+	    DEFAULT_CODEX_VERSION : options->codex_version);
+	if (url == NULL || version == NULL) {
+		free(url);
+		free(version);
+		set_error(error, length, "out of memory");
+		return -1;
+	}
+	buffer_init(&full);
+	if (buffer_append_string(&full, url) == -1 ||
+	    buffer_append_string(&full, version) == -1) {
+		free(url);
+		free(version);
+		buffer_free(&full);
+		set_error(error, length, "out of memory");
+		return -1;
+	}
+	free(url);
+	free(version);
+	url = buffer_steal(&full);
+	if (url == NULL)
+		return -1;
+	if (http_get(url, session->access_token, session->account_id, &response,
+	    error, length) == -1) {
+		free(url);
+		return -1;
+	}
+	free(url);
+	if (response.status < 200 || response.status >= 300) {
+		set_error(error, length, "failed to load models from Codex");
+		http_response_free(&response);
+		return -1;
+	}
+	root = json_load_string_checked(response.body, error, length);
+	http_response_free(&response);
+	if (!json_is_object(root) ||
+	    !json_is_array(json_object_get(root, "models"))) {
+		json_decref(root);
+		set_error(error, length, "Codex returned a malformed models response");
+		return -1;
+	}
+	model_catalog_free(catalog);
+	catalog->account_id = oaio_strdup(session->account_id);
+	if (catalog->account_id == NULL) {
+		json_decref(root);
+		return -1;
+	}
+	catalog->root = root;
+	catalog->expires = time(NULL) + 300;
+	return 0;
+}
+
+static json_t
+*find_model(struct model_catalog *catalog, const char *slug)
+{
+	json_t	*model;
+	json_t	*models;
+	size_t	index;
+
+	if (slug == NULL || catalog->root == NULL)
+		return NULL;
+	models = json_object_get(catalog->root, "models");
+	json_array_foreach(models, index, model) {
+		const char *candidate;
+
+		candidate = json_string_value(json_object_get(model, "slug"));
+		if (candidate != NULL && strcmp(candidate, slug) == 0)
+			return model;
+	}
+	return NULL;
+}
+
 static int
 handle_models(int fd, const struct proxy_options *options,
-    const struct auth_session *session)
+    const struct auth_session *session, struct model_catalog *catalog)
 {
-	char			*url;
-	struct http_response	response;
 	json_t			*root;
 	json_t			*models;
 	json_t			*data;
@@ -409,36 +510,10 @@ handle_models(int fd, const struct proxy_options *options,
 		json_decref(root);
 		return (int)index;
 	}
-	url = upstream_url(options, "models?client_version=");
-	if (url == NULL)
-		return send_error(fd, 500, "out of memory", "server_error");
-	{
-		struct buffer full;
-		char *version;
-
-		version = http_form_encode(options->codex_version == NULL ?
-		    DEFAULT_CODEX_VERSION : options->codex_version);
-		buffer_init(&full);
-		(void)buffer_append_string(&full, url);
-		(void)buffer_append_string(&full, version);
-		free(url);
-		free(version);
-		url = buffer_steal(&full);
-	}
-	if (http_get(url, session->access_token, session->account_id, &response, error,
-	    sizeof(error)) == -1) {
-		free(url);
+	if (load_model_catalog(options, session, catalog, error,
+	    sizeof(error)) == -1)
 		return send_error(fd, 502, error, "upstream_error");
-	}
-	free(url);
-	if (response.status < 200 || response.status >= 300) {
-		http_response_free(&response);
-		return send_error(fd, 502, "failed to load models from Codex", "upstream_error");
-	}
-	root = json_load_string_checked(response.body, error, sizeof(error));
-	http_response_free(&response);
-	if (root == NULL)
-		return send_error(fd, 502, error, "upstream_error");
+	root = catalog->root;
 	models = json_object_get(root, "models");
 	data = json_array();
 	if (json_is_array(models)) {
@@ -458,7 +533,6 @@ handle_models(int fd, const struct proxy_options *options,
 			}
 		}
 	}
-	json_decref(root);
 	root = json_pack("{s:s,s:o}", "object", "list", "data", data);
 	index = (size_t)send_json(fd, 200, root);
 	json_decref(root);
@@ -467,16 +541,19 @@ handle_models(int fd, const struct proxy_options *options,
 
 static int
 handle_responses(int fd, const struct proxy_options *options,
-    const struct auth_session *session, const char *body, int as_chat)
+    const struct auth_session *session, struct model_catalog *catalog,
+    const char *body, int as_chat)
 {
 	json_t			*request;
 	json_t			*upstream_request;
 	json_t			*completed;
+	json_t			*model;
 	char			*request_text;
 	char			*url;
 	struct http_response	response;
 	char			error[256];
 	int			want_stream;
+	int			use_lite;
 	int			result;
 
 	request = json_load_string_checked(body, error, sizeof(error));
@@ -503,6 +580,18 @@ handle_responses(int fd, const struct proxy_options *options,
 		json_decref(request);
 		return send_error(fd, 400, error, "invalid_request_error");
 	}
+	model = NULL;
+	if (load_model_catalog(options, session, catalog, error,
+	    sizeof(error)) == 0)
+		model = find_model(catalog, json_string_value(json_object_get(
+		    upstream_request, "model")));
+	use_lite = 0;
+	if (model != NULL && json_apply_model_defaults(upstream_request, model,
+	    &use_lite, error, sizeof(error)) == -1) {
+		json_decref(upstream_request);
+		json_decref(request);
+		return send_error(fd, 500, error, "server_error");
+	}
 	request_text = json_dump_compact(upstream_request);
 	json_decref(upstream_request);
 	if (request_text == NULL) {
@@ -510,8 +599,15 @@ handle_responses(int fd, const struct proxy_options *options,
 		return send_error(fd, 500, "out of memory", "server_error");
 	}
 	url = upstream_url(options, "responses");
+	if (url == NULL) {
+		free(request_text);
+		json_decref(request);
+		return send_error(fd, 500, "out of memory", "server_error");
+	}
 	result = http_post_json(url, request_text, session->access_token,
-	    session->account_id, NULL, &response, error, sizeof(error));
+	    session->account_id, use_lite ?
+	    "x-openai-internal-codex-responses-lite: true" : NULL, &response,
+	    error, sizeof(error));
 	free(url);
 	free(request_text);
 	if (result == -1) {
@@ -596,7 +692,8 @@ handle_responses(int fd, const struct proxy_options *options,
 }
 
 static int
-dispatch(int fd, const struct proxy_options *options, const struct request *request)
+dispatch(int fd, const struct proxy_options *options,
+    struct model_catalog *catalog, const struct request *request)
 {
 	struct auth_session	session;
 	char			error[256];
@@ -621,13 +718,15 @@ dispatch(int fd, const struct proxy_options *options, const struct request *requ
 		return send_error(fd, 401, error, "authentication_error");
 	}
 	if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/v1/models") == 0)
-		result = handle_models(fd, options, &session);
+		result = handle_models(fd, options, &session, catalog);
 	else if (strcmp(request->method, "POST") == 0 && strcmp(request->path,
 	    "/v1/responses") == 0)
-		result = handle_responses(fd, options, &session, request->body, 0);
+		result = handle_responses(fd, options, &session, catalog,
+		    request->body, 0);
 	else if (strcmp(request->method, "POST") == 0 && strcmp(request->path,
 	    "/v1/chat/completions") == 0)
-		result = handle_responses(fd, options, &session, request->body, 1);
+		result = handle_responses(fd, options, &session, catalog,
+		    request->body, 1);
 	else
 		result = send_error(fd, 404, "Route not found.", "not_found_error");
 	auth_session_free(&session);
@@ -644,11 +743,13 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	int		client_fd;
 	int		one;
 	struct request	request;
+	struct model_catalog	catalog;
 	const char	*host;
 	const char	*port;
 
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
+	memset(&catalog, 0, sizeof(catalog));
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
@@ -692,11 +793,12 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			(void)send_error(client_fd, 400, "Malformed HTTP request.",
 			    "invalid_request_error");
 		else {
-			(void)dispatch(client_fd, options, &request);
+			(void)dispatch(client_fd, options, &catalog, &request);
 			request_free(&request);
 		}
 		close(client_fd);
 	}
+	model_catalog_free(&catalog);
 	close(listen_fd);
 	set_error(error, length, "server accept failed: %s", strerror(errno));
 	return -1;
