@@ -187,6 +187,11 @@ app_main(int argc, char **argv)
 	int			open;
 	char			error[256];
 
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		(void)fprintf(stderr, "could not ignore SIGPIPE: %s\n",
+		    strerror(errno));
+		return 1;
+	}
 	memset(&options, 0, sizeof(options));
 	command = argc > 1 && argv[1][0] != '-' ? argv[1] : "serve";
 	index = strcmp(command, "serve") == 0 && argc > 1 && argv[1][0] == '-' ?
