@@ -150,18 +150,41 @@ read_file(const char *path, struct buffer *buffer)
 int
 write_private_file(const char *path, const char *data)
 {
-	int	fd;
+	struct buffer	temporary;
+	int		fd;
+	int		result;
 
 	if (make_parent_directories(path) == -1)
 		return -1;
-	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd == -1)
-		return -1;
-	if (fchmod(fd, 0600) == -1 || write_all(fd, data, strlen(data)) == -1) {
-		close(fd);
+	buffer_init(&temporary);
+	if (buffer_append_string(&temporary, path) == -1 ||
+	    buffer_append_string(&temporary, ".tmp.XXXXXX") == -1) {
+		buffer_free(&temporary);
 		return -1;
 	}
-	return close(fd);
+	fd = mkstemp(temporary.data);
+	if (fd == -1)
+		goto fail;
+	result = fchmod(fd, 0600);
+	if (result == 0)
+		result = write_all(fd, data, strlen(data));
+	if (result == 0)
+		result = fsync(fd);
+	if (close(fd) == -1)
+		result = -1;
+	if (result == 0)
+		result = rename(temporary.data, path);
+	if (result == -1) {
+		(void)unlink(temporary.data);
+		buffer_free(&temporary);
+		return -1;
+	}
+	buffer_free(&temporary);
+	return 0;
+
+fail:
+	buffer_free(&temporary);
+	return -1;
 }
 
 int

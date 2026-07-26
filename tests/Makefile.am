@@ -1,4 +1,4 @@
-AM_CPPFLAGS = -D_POSIX_C_SOURCE=200112L -I$(top_srcdir)/src $(LIBCURL_CFLAGS) $(OPENSSL_CFLAGS) $(JANSSON_CFLAGS)
+AM_CPPFLAGS = -D_POSIX_C_SOURCE=200809L -I$(top_srcdir)/src $(LIBCURL_CFLAGS) $(OPENSSL_CFLAGS) $(JANSSON_CFLAGS)
 AM_CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -Werror
 check_PROGRAMS = test_auth test_json test_sse test_proxy
 TESTS = $(check_PROGRAMS)
