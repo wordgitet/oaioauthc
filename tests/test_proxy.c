@@ -148,7 +148,9 @@ run_mock_upstream(const char *port)
 	    "\"output_text\",\"text\":\"hello\"}]}}\n\n"
 	    "data: {\"type\":\"response.completed\",\"response\":{\"id\":"
 	    "\"resp_test\",\"status\":\"completed\",\"output\":[],\"usage\":{"
-	    "\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
+	    "\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3,"
+	    "\"input_tokens_details\":{\"cached_tokens\":1},"
+	    "\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n";
 	char	request[32768];
 	int	client_fd;
 	int	listen_fd;
@@ -318,12 +320,14 @@ main(void)
 	    "\"content\":\"hi\"}]}", response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"content\":\"hello\"") != NULL);
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
+	REQUIRE(strstr(response, "\"cached_tokens\":1") != NULL);
 	REQUIRE(request_json(port, "/v1/chat/completions",
 	    "{\"model\":\"gpt-test\",\"messages\":[{\"role\":\"user\","
-	    "\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{"
-	    "\"include_usage\":true}}", response, sizeof(response)) == 0);
+	    "\"content\":\"hi\"}],\"stream\":true}", response,
+	    sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"content\":\"hello\"") != NULL);
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
+	REQUIRE(strstr(response, "\"reasoning_tokens\":1") != NULL);
 	REQUIRE(strstr(response, "data: [DONE]") != NULL);
 	REQUIRE(request_port(port, "POST /missing HTTP/1.1\r\n"
 	    "Host: localhost\r\ncontent-length: 2\r\n\r\n{}",

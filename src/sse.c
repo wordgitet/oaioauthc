@@ -23,7 +23,6 @@ struct sse_chat_stream {
 	sse_write_callback	write;
 	void			*argument;
 	time_t			created;
-	int			include_usage;
 	int			role_sent;
 	int			done;
 };
@@ -210,12 +209,11 @@ static int
 emit_usage(struct sse_chat_stream *stream, json_t *response)
 {
 	json_t	*upstream;
+	json_t	*details;
 	json_t	*usage;
 	json_t	*chunk;
 	int	result;
 
-	if (!stream->include_usage)
-		return 0;
 	upstream = json_object_get(response, "usage");
 	if (!json_is_object(upstream))
 		return 0;
@@ -225,6 +223,16 @@ emit_usage(struct sse_chat_stream *stream, json_t *response)
 	    json_integer_value(json_object_get(upstream, "output_tokens")),
 	    "total_tokens",
 	    json_integer_value(json_object_get(upstream, "total_tokens")));
+	details = json_object_get(upstream, "input_tokens_details");
+	if (json_is_integer(json_object_get(details, "cached_tokens")))
+		json_object_set_new(usage, "prompt_tokens_details",
+		    json_pack("{s:O}", "cached_tokens",
+		    json_object_get(details, "cached_tokens")));
+	details = json_object_get(upstream, "output_tokens_details");
+	if (json_is_integer(json_object_get(details, "reasoning_tokens")))
+		json_object_set_new(usage, "completion_tokens_details",
+		    json_pack("{s:O}", "reasoning_tokens",
+		    json_object_get(details, "reasoning_tokens")));
 	chunk = json_pack("{s:s,s:s,s:I,s:s,s:[],s:o}", "id", stream->id,
 	    "object", "chat.completion.chunk", "created",
 	    (json_int_t)stream->created, "model", stream->model, "choices",
@@ -364,8 +372,8 @@ process_block(struct sse_chat_stream *stream, char *block)
 }
 
 struct sse_chat_stream *
-sse_chat_stream_new(const char *model, int include_usage,
-    sse_write_callback callback, void *argument)
+sse_chat_stream_new(const char *model, sse_write_callback callback,
+    void *argument)
 {
 	struct sse_chat_stream	*stream;
 
@@ -380,7 +388,6 @@ sse_chat_stream_new(const char *model, int include_usage,
 		return NULL;
 	}
 	stream->created = time(NULL);
-	stream->include_usage = include_usage;
 	stream->write = callback;
 	stream->argument = argument;
 	return stream;

@@ -504,6 +504,7 @@ json_t
 	    json_string_value(json_object_get(request, "model")) : "", "choices",
 	    choices);
 	if (json_is_object(json_object_get(response, "usage"))) {
+		json_t *details;
 		json_t *usage;
 		json_t *upstream_usage;
 
@@ -513,6 +514,21 @@ json_t
 		    "completion_tokens", json_integer_value(json_object_get(upstream_usage,
 		    "output_tokens")), "total_tokens", json_integer_value(json_object_get(
 		    upstream_usage, "total_tokens")));
+		details = json_object_get(upstream_usage,
+		    "input_tokens_details");
+		if (json_is_integer(json_object_get(details,
+		    "cached_tokens")))
+			json_object_set_new(usage, "prompt_tokens_details",
+			    json_pack("{s:O}", "cached_tokens",
+			    json_object_get(details, "cached_tokens")));
+		details = json_object_get(upstream_usage,
+		    "output_tokens_details");
+		if (json_is_integer(json_object_get(details,
+		    "reasoning_tokens")))
+			json_object_set_new(usage,
+			    "completion_tokens_details",
+			    json_pack("{s:O}", "reasoning_tokens",
+			    json_object_get(details, "reasoning_tokens")));
 		json_object_set_new(result, "usage", usage);
 	}
 	return result;

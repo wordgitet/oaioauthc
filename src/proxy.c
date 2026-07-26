@@ -721,13 +721,8 @@ handle_responses(int fd, const struct proxy_options *options,
 	client.started = 0;
 	chat_stream = NULL;
 	if (as_chat && want_stream) {
-		json_t *stream_options;
-
-		stream_options = json_object_get(request, "stream_options");
 		chat_stream = sse_chat_stream_new(json_string_value(
-		    json_object_get(request, "model")),
-		    json_is_true(json_object_get(stream_options, "include_usage")),
-		    write_stream, &client);
+		    json_object_get(request, "model")), write_stream, &client);
 		if (chat_stream == NULL) {
 			free(url);
 			free(request_text);

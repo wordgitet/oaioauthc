@@ -50,9 +50,11 @@ main(void)
 	    "data: {\"type\":\"response.function_call_arguments.delta\","
 	    "\"item_id\":\"item_1\",\"delta\":\"\\\"x\\\"}\"}\n\n"
 	    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{"
-	    "\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n";
+	    "\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7,"
+	    "\"input_tokens_details\":{\"cached_tokens\":1},"
+	    "\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n";
 	buffer_init(&output);
-	chat = sse_chat_stream_new("gpt-test", 1, capture, &output);
+	chat = sse_chat_stream_new("gpt-test", capture, &output);
 	CHECK(chat != NULL);
 	split = strlen(stream) / 2;
 	CHECK(sse_chat_stream_feed(chat, stream, split) == 0);
@@ -66,6 +68,8 @@ main(void)
 	    != NULL);
 	CHECK(strstr(output.data, "\"finish_reason\":\"tool_calls\"") != NULL);
 	CHECK(strstr(output.data, "\"prompt_tokens\":3") != NULL);
+	CHECK(strstr(output.data, "\"cached_tokens\":1") != NULL);
+	CHECK(strstr(output.data, "\"reasoning_tokens\":2") != NULL);
 	CHECK(strstr(output.data, "data: [DONE]\n\n") != NULL);
 	sse_chat_stream_free(chat);
 	buffer_free(&output);
