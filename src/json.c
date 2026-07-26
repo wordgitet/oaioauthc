@@ -276,6 +276,7 @@ json_t
 	json_t	*message;
 	json_t	*result;
 	json_t	*tools;
+	json_t	*tool_choice;
 	json_t	*response_tools;
 	size_t	index;
 
@@ -337,6 +338,8 @@ json_t
 	result = json_pack("{s:o}", "input", input);
 	if (json_is_string(json_object_get(chat, "model")))
 		json_object_set(result, "model", json_object_get(chat, "model"));
+	else
+		json_object_set_new(result, "model", json_string("gpt-5.2"));
 	if (json_is_boolean(json_object_get(chat, "stream")))
 		json_object_set(result, "stream", json_object_get(chat, "stream"));
 	if (json_is_integer(json_object_get(chat, "max_tokens")))
@@ -348,6 +351,28 @@ json_t
 	if (json_is_real(json_object_get(chat, "top_p")) ||
 	    json_is_integer(json_object_get(chat, "top_p")))
 		json_object_set(result, "top_p", json_object_get(chat, "top_p"));
+	if (json_is_string(json_object_get(chat, "stop")) ||
+	    json_is_array(json_object_get(chat, "stop")))
+		json_object_set(result, "stop", json_object_get(chat, "stop"));
+	if (json_is_boolean(json_object_get(chat, "parallel_tool_calls")))
+		json_object_set(result, "parallel_tool_calls", json_object_get(chat,
+		    "parallel_tool_calls"));
+	if (json_is_string(json_object_get(chat, "reasoning_effort")))
+		json_object_set_new(result, "reasoning", json_pack("{s:O}", "effort",
+		    json_object_get(chat, "reasoning_effort")));
+	tool_choice = json_object_get(chat, "tool_choice");
+	if (json_is_string(tool_choice))
+		json_object_set(result, "tool_choice", tool_choice);
+	else if (json_is_object(tool_choice)) {
+		json_t *function;
+		const char *name;
+
+		function = json_object_get(tool_choice, "function");
+		name = json_string_value(json_object_get(function, "name"));
+		if (json_is_object(function) && name != NULL)
+			json_object_set_new(result, "tool_choice", json_pack(
+			    "{s:s,s:s}", "type", "function", "name", name));
+	}
 	tools = json_object_get(chat, "tools");
 	if (json_is_array(tools)) {
 		json_t *tool;

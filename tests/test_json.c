@@ -53,13 +53,19 @@ main(void)
 	CHECK(json_has_replay_state(request) == 1);
 	json_decref(request);
 
-	chat = json_load_string_checked("{\"model\":\"gpt-5.2\",\"messages\":[{\"role\":\"system\",\"content\":\"Be concise\"},{\"role\":\"user\",\"content\":\"Hello\"}]}",
+	chat = json_load_string_checked("{\"model\":\"gpt-5.2\",\"messages\":[{\"role\":\"system\",\"content\":\"Be concise\"},{\"role\":\"user\",\"content\":\"Hello\"}],\"stop\":[\"END\"],\"parallel_tool_calls\":false,\"reasoning_effort\":\"high\",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}}",
 	    error, sizeof(error));
 	CHECK(chat != NULL);
 	converted = json_chat_to_responses(chat, error, sizeof(error));
 	CHECK(converted != NULL);
 	CHECK(json_array_size(json_object_get(converted, "input")) == 2);
 	CHECK(strcmp(json_string_value(json_object_get(converted, "model")), "gpt-5.2") == 0);
+	CHECK(json_is_array(json_object_get(converted, "stop")));
+	CHECK(json_is_false(json_object_get(converted, "parallel_tool_calls")));
+	CHECK(strcmp(json_string_value(json_object_get(json_object_get(converted,
+	    "reasoning"), "effort")), "high") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(json_object_get(converted,
+	    "tool_choice"), "name")), "lookup") == 0);
 	json_decref(converted);
 	json_decref(chat);
 	return 0;
