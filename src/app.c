@@ -31,6 +31,7 @@ static const char
 {
 	if (*index + 1 >= argc) {
 		(void)fprintf(stderr, "%s requires a value\n", name);
+		*index = argc;
 		return NULL;
 	}
 	(*index)++;
