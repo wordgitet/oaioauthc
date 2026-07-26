@@ -36,6 +36,11 @@ struct model_catalog {
 	time_t	expires;
 };
 
+struct stream_client {
+	int	fd;
+	int	started;
+};
+
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -76,6 +81,34 @@ send_response(int fd, int status, const char *content_type, const char *body)
 		return -1;
 	return write_all(fd, headers, (size_t)length) == -1 ? -1 :
 	    write_all(fd, body, strlen(body));
+}
+
+static int
+send_stream_headers(struct stream_client *client)
+{
+	static const char headers[] =
+	    "HTTP/1.1 200 OK\r\n"
+	    "Content-Type: text/event-stream; charset=utf-8\r\n"
+	    "Cache-Control: no-cache\r\n"
+	    "Connection: close\r\n\r\n";
+
+	if (client->started)
+		return 0;
+	if (write_all(client->fd, headers, sizeof(headers) - 1) == -1)
+		return -1;
+	client->started = 1;
+	return 0;
+}
+
+static int
+write_stream(const void *data, size_t length, void *argument)
+{
+	struct stream_client	*client;
+
+	client = argument;
+	if (send_stream_headers(client) == -1)
+		return -1;
+	return write_all(client->fd, data, length);
 }
 
 static int
@@ -555,6 +588,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	int			want_stream;
 	int			use_lite;
 	int			result;
+	struct stream_client	client;
 
 	request = json_load_string_checked(body, error, sizeof(error));
 	if (request == NULL)
@@ -604,14 +638,24 @@ handle_responses(int fd, const struct proxy_options *options,
 		json_decref(request);
 		return send_error(fd, 500, "out of memory", "server_error");
 	}
-	result = http_post_json(url, request_text, session->access_token,
-	    session->account_id, use_lite ?
-	    "x-openai-internal-codex-responses-lite: true" : NULL, &response,
-	    error, sizeof(error));
+	client.fd = fd;
+	client.started = 0;
+	if (!as_chat && want_stream)
+		result = http_post_json_stream(url, request_text,
+		    session->access_token, session->account_id, use_lite ?
+		    "x-openai-internal-codex-responses-lite: true" : NULL,
+		    write_stream, &client, &response, error, sizeof(error));
+	else
+		result = http_post_json(url, request_text, session->access_token,
+		    session->account_id, use_lite ?
+		    "x-openai-internal-codex-responses-lite: true" : NULL,
+		    &response, error, sizeof(error));
 	free(url);
 	free(request_text);
 	if (result == -1) {
 		json_decref(request);
+		if (client.started)
+			return -1;
 		return send_error(fd, 502, error, "upstream_error");
 	}
 	if (response.status < 200 || response.status >= 300) {
@@ -623,8 +667,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		return result;
 	}
 	if (!as_chat && want_stream) {
-		result = send_response(fd, 200, "text/event-stream; charset=utf-8",
-		    response.body);
+		result = send_stream_headers(&client);
 		http_response_free(&response);
 		json_decref(request);
 		return result;

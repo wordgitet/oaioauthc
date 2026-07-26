@@ -9,8 +9,13 @@ struct http_response {
 	char	*content_type;
 };
 
+typedef int (*http_write_callback)(const void *, size_t, void *);
+
 int	http_post_json(const char *, const char *, const char *, const char *,
 	    const char *, struct http_response *, char *, size_t);
+int	http_post_json_stream(const char *, const char *, const char *,
+	    const char *, const char *, http_write_callback, void *,
+	    struct http_response *, char *, size_t);
 int	http_post_form(const char *, const char *, struct http_response *, char *,
 	    size_t);
 int	http_get(const char *, const char *, const char *, struct http_response *,

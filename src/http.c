@@ -10,6 +10,13 @@
 
 #define MAX_RESPONSE_SIZE (64 * 1024 * 1024)
 
+struct write_context {
+	struct http_response	*response;
+	struct buffer		*body;
+	http_write_callback	 callback;
+	void			*argument;
+};
+
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -25,17 +32,21 @@ set_error(char *error, size_t length, const char *format, ...)
 static size_t
 write_callback(char *data, size_t size, size_t count, void *argument)
 {
-	struct buffer	*body;
-	size_t		length;
+	struct write_context	*context;
+	size_t			 length;
 
-	body = argument;
+	context = argument;
 	if (count != 0 && size > (size_t)-1 / count)
 		return 0;
 	length = size * count;
-	if (body->len > MAX_RESPONSE_SIZE ||
-	    length > MAX_RESPONSE_SIZE - body->len)
+	if (context->callback != NULL && context->response->status >= 200 &&
+	    context->response->status < 300)
+		return context->callback(data, length, context->argument) == 0 ?
+		    length : 0;
+	if (context->body->len > MAX_RESPONSE_SIZE ||
+	    length > MAX_RESPONSE_SIZE - context->body->len)
 		return 0;
-	if (buffer_append(body, data, length) == -1)
+	if (buffer_append(context->body, data, length) == -1)
 		return 0;
 	return length;
 }
@@ -49,6 +60,20 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 
 	response = argument;
 	length = size * count;
+	if (length > 5 && strncasecmp(data, "HTTP/", 5) == 0) {
+		char *space;
+
+		space = memchr(data, ' ', length);
+		if (space != NULL && data + length - space >= 4 &&
+		    space[1] >= '0' && space[1] <= '9' &&
+		    space[2] >= '0' && space[2] <= '9' &&
+		    space[3] >= '0' && space[3] <= '9')
+			response->status = (space[1] - '0') * 100 +
+			    (space[2] - '0') * 10 + space[3] - '0';
+		free(response->content_type);
+		response->content_type = NULL;
+		return length;
+	}
 	if (length < 14 || strncasecmp(data, "Content-Type:", 13) != 0)
 		return length;
 	value = malloc(length - 12);
@@ -67,17 +92,22 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 static int
 request(const char *url, const char *method, const char *body,
     const char *authorization, const char *account_id, const char *extra_header,
-    const char *content_type, struct http_response *response, char *error,
-    size_t error_length)
+    const char *content_type, http_write_callback callback, void *argument,
+    struct http_response *response, char *error, size_t error_length)
 {
 	CURL			*curl;
 	CURLcode		code;
 	struct curl_slist	*headers;
 	struct buffer		response_body;
+	struct write_context	context;
 	char			header[4096];
 
 	memset(response, 0, sizeof(*response));
 	buffer_init(&response_body);
+	context.response = response;
+	context.body = &response_body;
+	context.callback = callback;
+	context.argument = argument;
 	headers = NULL;
 	curl = curl_easy_init();
 	if (curl == NULL) {
@@ -104,7 +134,7 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "oaioauthc/0.1.0");
@@ -137,7 +167,17 @@ http_post_json(const char *url, const char *body, const char *authorization,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, authorization, account_id, extra_header,
-	    NULL, response, error, error_length);
+	    NULL, NULL, NULL, response, error, error_length);
+}
+
+int
+http_post_json_stream(const char *url, const char *body,
+    const char *authorization, const char *account_id,
+    const char *extra_header, http_write_callback callback, void *argument,
+    struct http_response *response, char *error, size_t error_length)
+{
+	return request(url, "POST", body, authorization, account_id, extra_header,
+	    NULL, callback, argument, response, error, error_length);
 }
 
 int
@@ -145,8 +185,8 @@ http_post_form(const char *url, const char *body, struct http_response *response
     char *error, size_t error_length)
 {
 	return request(url, "POST", body, NULL, NULL, NULL,
-	    "Content-Type: application/x-www-form-urlencoded", response, error,
-	    error_length);
+	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL,
+	    response, error, error_length);
 }
 
 int
@@ -154,7 +194,7 @@ http_get(const char *url, const char *authorization, const char *account_id,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "GET", NULL, authorization, account_id, NULL, NULL,
-	    response, error, error_length);
+	    NULL, NULL, response, error, error_length);
 }
 
 void
