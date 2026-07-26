@@ -1,3 +1,18 @@
+/*
+** Small libcurl wrapper for the OAuth and Codex HTTP exchanges.
+**
+** The interface has two response modes.  Ordinary calls retain a bounded copy
+** of the complete response body.  Streaming calls forward only successful
+** response bytes to a callback, while still buffering non-2xx bodies so the
+** proxy can return a useful upstream error.  A callback failure stops curl
+** and is reported to the caller as a transport failure.
+**
+** This is the single place that adds the bearer authorization and
+** chatgpt-account-id headers used by Codex.  Callers supply already encoded
+** request bodies and own endpoint semantics; this module owns libcurl lists,
+** temporary buffers, and response allocations until they are handed back.
+*/
+
 #include "http.h"
 #include "util.h"
 
@@ -10,6 +25,13 @@
 
 #define MAX_RESPONSE_SIZE (64 * 1024 * 1024)
 
+/*
+** Per-transfer callback state.
+**
+** body receives buffered content.  callback is used only for successful
+** response bodies; keeping error bodies in body lets higher layers preserve
+** upstream status and diagnostics.
+*/
 struct write_context {
 	struct http_response	*response;
 	struct buffer		*body;
@@ -17,6 +39,7 @@ struct write_context {
 	void			*argument;
 };
 
+/* Populate an optional caller diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -29,6 +52,7 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+/* Append a header string without discarding the old list on failure. */
 static int
 append_header(struct curl_slist **headers, const char *value)
 {
@@ -41,6 +65,7 @@ append_header(struct curl_slist **headers, const char *value)
 	return 0;
 }
 
+/* Build "name + value" as one curl header and release the temporary buffer. */
 static int
 append_header_value(struct curl_slist **headers, const char *name,
     const char *value)
@@ -58,6 +83,12 @@ append_header_value(struct curl_slist **headers, const char *name,
 	return result;
 }
 
+/*
+** Consume one libcurl body fragment.
+**
+** Returning fewer bytes tells libcurl to stop.  Successful streams go directly
+** to callback; all other content is appended subject to MAX_RESPONSE_SIZE.
+*/
 static size_t
 write_callback(char *data, size_t size, size_t count, void *argument)
 {
@@ -68,6 +99,7 @@ write_callback(char *data, size_t size, size_t count, void *argument)
 	if (count != 0 && size > (size_t)-1 / count)
 		return 0;
 	length = size * count;
+	/* Stream only successful bodies; preserve upstream errors for the caller. */
 	if (context->callback != NULL && context->response->status >= 200 &&
 	    context->response->status < 300)
 		return context->callback(data, length, context->argument) == 0 ?
@@ -80,6 +112,12 @@ write_callback(char *data, size_t size, size_t count, void *argument)
 	return length;
 }
 
+/*
+** Record status and Content-Type while curl processes headers.
+**
+** Multiple response blocks (for redirects or 100 Continue) are tolerated by
+** replacing values when a new HTTP status line arrives.
+*/
 static size_t
 header_callback(char *data, size_t size, size_t count, void *argument)
 {
@@ -118,6 +156,15 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 	return length;
 }
 
+/*
+** Perform one synchronous HTTP exchange.
+**
+** url, method, and body are borrowed.  On success response owns body and
+** content_type until http_response_free.  On every failure this function
+** frees curl state and partial response data, then returns -1 with error set.
+** No redirect policy is enabled here: OAuth and Codex endpoint choices remain
+** explicit to their callers.
+*/
 static int
 request(const char *url, const char *method, const char *body,
     const char *authorization, const char *account_id, const char *extra_header,
@@ -130,6 +177,10 @@ request(const char *url, const char *method, const char *body,
 	struct buffer		response_body;
 	struct write_context	context;
 
+	/*
+	 * response is reset before work begins.  On success its body is owned by
+	 * the caller; on failure this function releases every partial allocation.
+	 */
 	memset(response, 0, sizeof(*response));
 	buffer_init(&response_body);
 	context.response = response;
@@ -198,6 +249,7 @@ request(const char *url, const char *method, const char *body,
 	return 0;
 }
 
+/* POST JSON with optional Codex auth/account/feature headers. */
 int
 http_post_json(const char *url, const char *body, const char *authorization,
     const char *account_id, const char *extra_header,
@@ -207,6 +259,7 @@ http_post_json(const char *url, const char *body, const char *authorization,
 	    NULL, NULL, NULL, response, error, error_length);
 }
 
+/* POST JSON and deliver successful response fragments to callback. */
 int
 http_post_json_stream(const char *url, const char *body,
     const char *authorization, const char *account_id,
@@ -217,6 +270,7 @@ http_post_json_stream(const char *url, const char *body,
 	    NULL, callback, argument, response, error, error_length);
 }
 
+/* POST an OAuth URL-encoded body without Codex authorization headers. */
 int
 http_post_form(const char *url, const char *body,
     struct http_response *response, char *error, size_t error_length)
@@ -226,6 +280,7 @@ http_post_form(const char *url, const char *body,
 	    response, error, error_length);
 }
 
+/* GET an authenticated Codex resource into a bounded buffered response. */
 int
 http_get(const char *url, const char *authorization, const char *account_id,
     struct http_response *response, char *error, size_t error_length)
@@ -234,6 +289,7 @@ http_get(const char *url, const char *authorization, const char *account_id,
 	    NULL, NULL, response, error, error_length);
 }
 
+/* Release both response allocations and reset the structure for safe reuse. */
 void
 http_response_free(struct http_response *response)
 {
@@ -242,6 +298,12 @@ http_response_free(struct http_response *response)
 	memset(response, 0, sizeof(*response));
 }
 
+/*
+** Form-encode one UTF-8 byte string with libcurl's escaping rules.
+**
+** curl_easy_escape returns a curl allocation, so copy it into the program's
+** ordinary malloc ownership domain before cleaning up the curl handle.
+*/
 char
 *http_form_encode(const char *value)
 {

@@ -1,3 +1,19 @@
+/*
+** Server-Sent Events parsing and Responses-to-Chat-Completions streaming.
+**
+** Codex streams Responses events.  A Chat Completions client instead expects
+** a sequence of chat.completion.chunk objects followed by "data: [DONE]".
+** This module bridges those protocols without assuming that one network read
+** contains one SSE event or even one complete line.
+**
+** sse_chat_stream retains an unfinished event block, strips CR so CRLF and LF
+** streams behave identically, and processes data only after a blank-line
+** separator.  It tracks tool calls by Codex item id, so argument deltas and a
+** later completed item cannot produce duplicate Chat Completions tool calls.
+** The writer callback owns transport delivery; a callback failure is fatal to
+** the conversion because clients must not receive a malformed partial stream.
+*/
+
 #include "sse.h"
 #include "util.h"
 
@@ -8,12 +24,21 @@
 
 #define MAX_EVENT_SIZE (1024 * 1024)
 
+/* One Codex function-call item and its Chat Completions array position. */
 struct sse_tool {
 	char	*item_id;
 	size_t	index;
 	int	arguments_seen;
 };
 
+/*
+** Stateful translator for one upstream Responses event stream.
+**
+** pending stores bytes after the last complete SSE block.  tools associates
+** Codex item ids with stable Chat Completions indices.  role_sent and done
+** enforce the required stream ordering even when Codex omits optional events.
+** The callback and argument are borrowed for the stream lifetime.
+*/
 struct sse_chat_stream {
 	struct buffer		pending;
 	char			*model;
@@ -27,6 +52,7 @@ struct sse_chat_stream {
 	int			done;
 };
 
+/* Set a short parse diagnostic in the caller-owned error buffer. */
 static void
 set_error(char *error, size_t length, const char *message)
 {
@@ -34,6 +60,13 @@ set_error(char *error, size_t length, const char *message)
 		(void)snprintf(error, length, "%s", message);
 }
 
+/*
+** Deep-copy an output item into items, replacing an earlier item with its id.
+**
+** Codex can describe an item incrementally and later provide a completed copy.
+** Deduplication preserves the most complete representation for non-streaming
+** response collection without changing its original output position.
+*/
 static int
 collect_output_item(json_t *items, json_t *item)
 {
@@ -59,6 +92,7 @@ collect_output_item(json_t *items, json_t *item)
 	return json_array_append_new(items, copy);
 }
 
+/* Serialize value as one complete SSE data block and write it to the client. */
 static int
 emit_json(struct sse_chat_stream *stream, json_t *value)
 {
@@ -82,6 +116,7 @@ emit_json(struct sse_chat_stream *stream, json_t *value)
 	return result;
 }
 
+/* Build and emit one OpenAI chat.completion.chunk around the supplied delta. */
 static int
 emit_chunk(struct sse_chat_stream *stream, json_t *delta,
     const char *finish_reason)
@@ -110,6 +145,7 @@ emit_chunk(struct sse_chat_stream *stream, json_t *delta,
 	return result;
 }
 
+/* Emit the mandatory assistant role exactly once before content/tool deltas. */
 static int
 emit_role(struct sse_chat_stream *stream)
 {
@@ -128,6 +164,7 @@ emit_role(struct sse_chat_stream *stream)
 	return result;
 }
 
+/* Find the stable Chat tool-call slot belonging to a Codex output item id. */
 static struct sse_tool *
 find_tool(struct sse_chat_stream *stream, const char *item_id)
 {
@@ -142,6 +179,12 @@ find_tool(struct sse_chat_stream *stream, const char *item_id)
 	return NULL;
 }
 
+/*
+** Emit the initial empty-arguments Chat tool-call delta for a Codex item.
+**
+** A repeated output_item.added or output_item.done event must not create a
+** second call, so item_id is registered before the first client write.
+*/
 static int
 emit_tool_start(struct sse_chat_stream *stream, json_t *item)
 {
@@ -183,6 +226,7 @@ emit_tool_start(struct sse_chat_stream *stream, json_t *item)
 	return result;
 }
 
+/* Append one function argument delta to the previously registered tool call. */
 static int
 emit_tool_arguments(struct sse_chat_stream *stream, const char *item_id,
     const char *arguments)
@@ -205,6 +249,7 @@ emit_tool_arguments(struct sse_chat_stream *stream, const char *item_id,
 	return result;
 }
 
+/* Copy available upstream usage accounting into the final Chat stream chunk. */
 static int
 emit_usage(struct sse_chat_stream *stream, json_t *response)
 {
@@ -244,6 +289,12 @@ emit_usage(struct sse_chat_stream *stream, json_t *response)
 	return result;
 }
 
+/*
+** Finish a translated Chat stream once, including finish reason, usage, DONE.
+**
+** No further upstream event can cause output after done becomes true.  This
+** guards both an explicit [DONE] block and a response.completed event.
+*/
 static int
 finish_chat_stream(struct sse_chat_stream *stream, json_t *response)
 {
@@ -269,6 +320,13 @@ finish_chat_stream(struct sse_chat_stream *stream, json_t *response)
 	return result;
 }
 
+/*
+** Translate one complete Codex SSE data payload.
+**
+** Unknown event types are harmless and ignored for forward compatibility.
+** Malformed JSON is likewise ignored because an upstream stream can include
+** non-JSON control data; allocation and client-write failures remain fatal.
+*/
 static int
 process_event(struct sse_chat_stream *stream, const char *data)
 {
@@ -282,6 +340,7 @@ process_event(struct sse_chat_stream *stream, const char *data)
 	struct sse_tool	*tool;
 	int		result;
 
+	/* One complete Codex event may produce zero, one, or several chat chunks. */
 	if (strcmp(data, "[DONE]") == 0)
 		return finish_chat_stream(stream, NULL);
 	event = json_loads(data, 0, &error);
@@ -351,6 +410,7 @@ process_event(struct sse_chat_stream *stream, const char *data)
 	return result;
 }
 
+/* Extract the first data: line from one complete SSE block and process it. */
 static int
 process_block(struct sse_chat_stream *stream, char *block)
 {
@@ -373,6 +433,13 @@ process_block(struct sse_chat_stream *stream, char *block)
 	return 0;
 }
 
+/*
+** Allocate a translator for one Chat Completions request.
+**
+** model is copied for every emitted chunk.  callback and argument are borrowed
+** until sse_chat_stream_free, and the returned stream starts with a local id
+** that is replaced if Codex sends response.created.
+*/
 struct sse_chat_stream *
 sse_chat_stream_new(const char *model, sse_write_callback callback,
     void *argument)
@@ -395,6 +462,13 @@ sse_chat_stream_new(const char *model, sse_write_callback callback,
 	return stream;
 }
 
+/*
+** Feed arbitrary upstream transport bytes into the incremental translator.
+**
+** CR is discarded so both CRLF and LF framing use one parser.  Bytes after the
+** final blank-line separator remain in pending for a later call; pending is
+** capped so an upstream peer cannot make the worker retain unbounded memory.
+*/
 int
 sse_chat_stream_feed(struct sse_chat_stream *stream, const void *data,
     size_t length)
@@ -404,6 +478,7 @@ sse_chat_stream_feed(struct sse_chat_stream *stream, const void *data,
 	size_t		index;
 	size_t		consumed;
 
+	/* Transport writes may split any SSE line, so retain an incomplete block. */
 	source = data;
 	for (index = 0; index < length; index++) {
 		if (source[index] != '\r' &&
@@ -425,6 +500,12 @@ sse_chat_stream_feed(struct sse_chat_stream *stream, const void *data,
 	return 0;
 }
 
+/*
+** Consume a final unterminated SSE block and require a completion signal.
+**
+** Returning -1 for a stream without [DONE] or response.completed prevents the
+** proxy from reporting an apparently clean Chat completion after truncation.
+*/
 int
 sse_chat_stream_finish(struct sse_chat_stream *stream)
 {
@@ -437,6 +518,7 @@ sse_chat_stream_finish(struct sse_chat_stream *stream)
 	return stream->done ? 0 : -1;
 }
 
+/* Release every owned stream allocation; safe for NULL and partial creation. */
 void
 sse_chat_stream_free(struct sse_chat_stream *stream)
 {
@@ -453,6 +535,13 @@ sse_chat_stream_free(struct sse_chat_stream *stream)
 	free(stream);
 }
 
+/*
+** Collect the completed Responses object from a buffered Codex SSE reply.
+**
+** The latest response object is authoritative, while item events fill an empty
+** output array when Codex delivered the items separately.  The caller owns the
+** returned reference; a missing completed response sets error and returns NULL.
+*/
 json_t
 *sse_collect_completed_response(const char *stream, char *error, size_t length)
 {
@@ -464,6 +553,7 @@ json_t
 	json_t	*items;
 	json_t	*latest;
 
+	/* Non-streaming Codex replies use SSE too; retain only the final response. */
 	copy = oaio_strdup(stream);
 	if (copy == NULL)
 		return NULL;

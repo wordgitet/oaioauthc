@@ -1,9 +1,17 @@
+/*
+ * Request and response shape tests for the OpenAI/Codex JSON adapter.
+ */
+
 #include "json.h"
 #include "test.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+/*
+** Cover normalization, discovered lite-model defaults, replay rejection, and
+** both directions of Chat/Responses history translation in one local test.
+*/
 int
 main(void)
 {

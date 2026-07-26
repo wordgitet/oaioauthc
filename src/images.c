@@ -1,3 +1,20 @@
+/*
+** OpenAI image request validation and translation for the Codex backend.
+**
+** OpenAI-compatible image generation is JSON, but image editing uploads a
+** multipart/form-data body.  Codex expects normalized JSON in both cases.
+** Generation therefore keeps only the supported JSON fields.  Editing parses
+** the multipart envelope, validates each field and file, then represents the
+** accepted image bytes as data URLs in the outbound JSON request.
+**
+** Multipart input is untrusted binary data.  Parser helpers carry explicit
+** lengths, cap headers, parts, complete request size, individual image size,
+** and image count, and never rely on a terminator in uploaded content.  The
+** conversion rejects unsupported features rather than silently changing their
+** meaning, because an apparently successful image edit with altered options
+** would be worse than a clear compatibility error.
+*/
+
 #include "images.h"
 #include "json.h"
 #include "util.h"
@@ -17,6 +34,13 @@
 #define MAX_FORM_HEADERS (16 * 1024)
 #define MAX_FORM_PARTS 64
 
+/*
+** A non-owning view of a scalar multipart part.
+**
+** data points into the original request body.  present distinguishes an
+** omitted field from an empty one, while is_file prevents file bytes from
+** accidentally being interpreted as a textual option.
+*/
 struct form_field {
 	const unsigned char	*data;
 	size_t			 length;
@@ -24,6 +48,10 @@ struct form_field {
 	int			 is_file;
 };
 
+/*
+** One accepted upload.  data remains a non-owning body slice; filename and
+** content_type are duplicated because multipart header storage is temporary.
+*/
 struct image_file {
 	const unsigned char	*data;
 	size_t			 length;
@@ -31,11 +59,19 @@ struct image_file {
 	char			*content_type;
 };
 
+/* A bounded ordered collection of accepted image uploads. */
 struct image_list {
 	struct image_file	 files[IMAGE_MAX_REFERENCE_IMAGES];
 	size_t			 count;
 };
 
+/*
+** Normalized multipart fields collected before validation and JSON emission.
+**
+** image_count counts every image part, including parts beyond the storage
+** limit, so validation can report an excessive request instead of silently
+** dropping uploads.  unsupported records the first incompatible option.
+*/
 struct image_form {
 	struct form_field	 stream;
 	struct form_field	 prompt;
@@ -52,6 +88,12 @@ struct image_form {
 	int			 has_mask;
 };
 
+/*
+** Owned header metadata for the part currently being parsed.
+**
+** name, filename, and content_type are freed immediately after collect_part
+** either copies/moves them into image_form or records the part as invalid.
+*/
 struct part_info {
 	char	*name;
 	char	*filename;
@@ -59,6 +101,7 @@ struct part_info {
 	int	 has_filename;
 };
 
+/* OpenAI options that cannot be represented through the Codex OAuth API. */
 static const char *unsupported_options[] = {
 	"input_fidelity",
 	"moderation",
@@ -67,6 +110,7 @@ static const char *unsupported_options[] = {
 	"partial_images"
 };
 
+/* Format a caller-owned diagnostic buffer without allocation. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -79,6 +123,7 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+/* Copy a binary slice and append a NUL for header parsing. */
 static char *
 copy_bytes(const void *data, size_t length)
 {
@@ -94,6 +139,7 @@ copy_bytes(const void *data, size_t length)
 	return copy;
 }
 
+/* Find a byte sequence in binary input without using NUL-terminated APIs. */
 static const unsigned char *
 find_bytes(const unsigned char *data, size_t length,
     const unsigned char *needle, size_t needle_length)
@@ -112,6 +158,7 @@ find_bytes(const unsigned char *data, size_t length,
 	return NULL;
 }
 
+/* RFC token predicate for multipart parameter names and header field names. */
 static int
 ascii_token_char(unsigned char character)
 {
@@ -122,6 +169,7 @@ ascii_token_char(unsigned char character)
 	return strchr("!#$%&'*+-.^_`|~", character) != NULL;
 }
 
+/* Restrict multipart boundaries to their permitted printable characters. */
 static int
 boundary_char(unsigned char character)
 {
@@ -130,6 +178,7 @@ boundary_char(unsigned char character)
 	return strchr("'()+_,-./:=? ", character) != NULL;
 }
 
+/* Advance over HTTP optional whitespace in a C-string header value. */
 static void
 skip_space(const char **cursor)
 {
@@ -137,6 +186,12 @@ skip_space(const char **cursor)
 		(*cursor)++;
 }
 
+/*
+** Parse one multipart parameter value, including quoted-pair escapes.
+**
+** Allocation failure and malformed syntax are distinct result values so the
+** caller can return either an internal error or an invalid-request response.
+*/
 static int
 read_parameter_value(const char **cursor, char **value)
 {
@@ -188,6 +243,13 @@ invalid_quoted:
 	return *value == NULL ? IMAGE_RESULT_NOMEM : IMAGE_RESULT_OK;
 }
 
+/*
+** Extract the single valid boundary from a multipart Content-Type value.
+**
+** The returned boundary is owned by the caller and excludes the leading "--"
+** used in body delimiters.  Duplicates, empty values, and unsafe characters
+** are rejected before searching the uploaded byte stream.
+*/
 static int
 parse_boundary(const char *content_type, char **boundary)
 {
@@ -268,6 +330,12 @@ invalid:
 	return IMAGE_RESULT_INVALID;
 }
 
+/*
+** Parse Content-Disposition metadata for one part.
+**
+** Multipart fields require a name.  Repeated name and filename parameters are
+** invalid, rather than depending on a parser-specific first/last value rule.
+*/
 static int
 parse_disposition(const char *value, struct part_info *part)
 {
@@ -333,6 +401,7 @@ parse_disposition(const char *value, struct part_info *part)
 	return part->name == NULL ? IMAGE_RESULT_INVALID : IMAGE_RESULT_OK;
 }
 
+/* Release the owned header metadata for one multipart part. */
 static void
 part_info_free(struct part_info *part)
 {
@@ -342,6 +411,12 @@ part_info_free(struct part_info *part)
 	memset(part, 0, sizeof(*part));
 }
 
+/*
+** Parse the bounded header section of one multipart part.
+**
+** The original body is immutable binary input, so headers are copied before
+** line tokenization.  Only Content-Disposition and Content-Type are retained.
+*/
 static int
 parse_part_headers(const unsigned char *data, size_t length,
     struct part_info *part)
@@ -428,6 +503,7 @@ parse_part_headers(const unsigned char *data, size_t length,
 	return result;
 }
 
+/* Store the first scalar field occurrence as a non-owning body view. */
 static void
 set_form_field(struct form_field *field, const struct part_info *part,
     const unsigned char *data, size_t length)
@@ -440,6 +516,7 @@ set_form_field(struct form_field *field, const struct part_info *part,
 	field->is_file = part->has_filename;
 }
 
+/* Check name against options intentionally unsupported by Codex. */
 static int
 is_unsupported(const char *name, const char **option)
 {
@@ -455,6 +532,7 @@ is_unsupported(const char *name, const char **option)
 	return 0;
 }
 
+/* Release copied filename/media-type metadata for image slices. */
 static void
 image_list_free(struct image_list *list)
 {
@@ -467,6 +545,7 @@ image_list_free(struct image_list *list)
 	memset(list, 0, sizeof(*list));
 }
 
+/* Release all metadata accumulated during multipart parsing. */
 static void
 image_form_free(struct image_form *form)
 {
@@ -475,6 +554,13 @@ image_form_free(struct image_form *form)
 	memset(form, 0, sizeof(*form));
 }
 
+/*
+** Admit one image body slice into its ordered destination list.
+**
+** image_count records every supplied upload before the fixed storage limit is
+** checked.  validate_form can then reject an excessive request instead of
+** silently dropping images.  Filename and type ownership move from part.
+*/
 static int
 add_image(struct image_form *form, struct image_list *list,
     struct part_info *part, const unsigned char *data, size_t length)
@@ -499,6 +585,7 @@ add_image(struct image_form *form, struct image_list *list,
 	return IMAGE_RESULT_OK;
 }
 
+/* Classify a parsed part as scalar metadata, image, or incompatible input. */
 static int
 collect_part(struct image_form *form, struct part_info *part,
     const unsigned char *data, size_t length)
@@ -533,6 +620,12 @@ collect_part(struct image_form *form, struct part_info *part,
 	return IMAGE_RESULT_OK;
 }
 
+/*
+** Find the next CRLF-prefixed delimiter that is a legal multipart boundary.
+**
+** Matching the suffix prevents arbitrary image bytes containing the boundary
+** string from terminating a part unless the complete framing is present.
+*/
 static const unsigned char *
 next_boundary(const unsigned char *data, size_t length,
     const unsigned char *delimiter, size_t delimiter_length)
@@ -555,6 +648,13 @@ next_boundary(const unsigned char *data, size_t length,
 	return NULL;
 }
 
+/*
+** Parse an entire multipart/form-data body into form.
+**
+** All body references in form are non-owning slices.  Cursor arithmetic is
+** bounded by length, part count is capped, and metadata is released on every
+** failure.  A successful form remains valid until the caller releases body.
+*/
 static int
 parse_multipart(const char *content_type, const void *body, size_t length,
     struct image_form *form)
@@ -570,6 +670,11 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 	size_t			 part_count;
 	int			 result;
 
+	/*
+	 * Keep pointers into the original body until normalization is complete.
+	 * Bounds are checked before every delimiter search so binary image content
+	 * cannot turn into an unbounded string scan.
+	 */
 	memset(form, 0, sizeof(*form));
 	boundary = NULL;
 	result = parse_boundary(content_type, &boundary);
@@ -645,6 +750,7 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 	return result;
 }
 
+/* Compare a scalar field without interpreting an uploaded file as text. */
 static int
 field_equals(const struct form_field *field, const char *value)
 {
@@ -657,6 +763,7 @@ field_equals(const struct form_field *field, const char *value)
 	    memcmp(field->data, value, length) == 0;
 }
 
+/* Copy one scalar multipart field into a JSON string property. */
 static int
 set_json_field(json_t *object, const char *name,
     const struct form_field *field)
@@ -674,6 +781,12 @@ set_json_field(json_t *object, const char *name,
 	return 0;
 }
 
+/*
+** Parse optional n into an exact JSON integer when possible, otherwise a real.
+**
+** Invalid numeric text is ignored for compatibility, leaving the upstream
+** default in effect.  Allocation failure is still reported to the caller.
+*/
 static int
 set_json_number(json_t *object, const struct form_field *field)
 {
@@ -732,6 +845,12 @@ set_json_number(json_t *object, const struct form_field *field)
 	return 0;
 }
 
+/*
+** Convert an accepted upload to the JSON data URL required by Codex.
+**
+** EVP_EncodeBlock needs an int length, so size arithmetic is checked before
+** conversion.  The caller owns the returned string.
+*/
 static char *
 file_data_url(const struct image_file *file)
 {
@@ -766,6 +885,7 @@ file_data_url(const struct image_file *file)
 	return buffer_steal(&url);
 }
 
+/* Append image_url objects in the same order as the multipart upload fields. */
 static int
 append_image_list(json_t *images, const struct image_list *list)
 {
@@ -788,12 +908,19 @@ append_image_list(json_t *images, const struct image_list *list)
 	return 0;
 }
 
+/*
+** Enforce semantic compatibility after syntax parsing succeeds.
+**
+** Parsing proves that the multipart body is well formed; this function decides
+** whether its fields can be represented faithfully by the Codex image API.
+*/
 static int
 validate_form(const struct image_form *form, char *error, size_t length)
 {
 	const struct image_file	*file;
 	size_t			 index;
 
+	/* Reject incompatible options instead of silently changing image semantics. */
 	if (field_equals(&form->stream, "true")) {
 		set_error(error, length,
 		    "Streaming image editing is not supported by ChatGPT OAuth.");
@@ -854,6 +981,13 @@ oversized:
 	return IMAGE_RESULT_INVALID;
 }
 
+/*
+** Validate an OpenAI-compatible generation object and produce Codex JSON.
+**
+** Only the supported field set is copied.  output is an owned compact JSON
+** string on success.  Invalid input and allocation failure have distinct
+** result codes so proxy.c can choose the correct HTTP status.
+*/
 int
 image_prepare_generation(const void *body, size_t length, char **output,
     char *error, size_t error_length)
@@ -867,6 +1001,7 @@ image_prepare_generation(const void *body, size_t length, char **output,
 	json_t		*value;
 	size_t		 index;
 
+	/* Emit only the Codex-supported subset; callers own output on success. */
 	*output = NULL;
 	root = json_loadb(body, length, 0, &json_error);
 	if (root == NULL) {
@@ -947,6 +1082,13 @@ nomem:
 	return IMAGE_RESULT_NOMEM;
 }
 
+/*
+** Translate a bounded multipart image edit into its Codex JSON request.
+**
+** Files are never written to disk: validated input bytes become data URLs in
+** memory.  Temporary parser metadata is released on all exits; output belongs
+** to the caller only when IMAGE_RESULT_OK is returned.
+*/
 int
 image_prepare_edit(const char *content_type, const void *body, size_t length,
     char **output, char *error, size_t error_length)
@@ -956,6 +1098,7 @@ image_prepare_edit(const char *content_type, const void *body, size_t length,
 	json_t			*images;
 	int			 result;
 
+	/* Convert uploaded bytes to JSON data URLs only after full form validation. */
 	*output = NULL;
 	if (length > IMAGE_MAX_EDIT_BODY) {
 		set_error(error, error_length,

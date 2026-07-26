@@ -1,3 +1,11 @@
+/*
+ * End-to-end local proxy test with a forked deterministic Codex mock.
+ *
+ * It exercises the public HTTP routes, streaming conversion, image request
+ * translation, startup behavior, and diagnostic redaction without real OAuth
+ * credentials or network access.
+ */
+
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -13,6 +21,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+** Assert a process-level condition and centralize descriptor/process cleanup.
+**
+** Unlike CHECK, proxy test failures may leave child processes and temporary
+** files behind, so every failure jumps to the cleanup block in main.
+*/
 #define REQUIRE(condition) do {						\
 	if (!(condition)) {						\
 		(void)fprintf(stderr, "%s:%d: check failed: %s\n",	\
@@ -21,6 +35,7 @@
 	}								\
 } while (0)
 
+/* Reserve an unused loopback port, then release it for a child to bind. */
 static int
 reserve_port(char *port, size_t length)
 {
@@ -48,6 +63,7 @@ reserve_port(char *port, size_t length)
 	return result;
 }
 
+/* Bind the deterministic mock to a caller-reserved loopback port. */
 static int
 listen_port(const char *port)
 {
@@ -72,6 +88,7 @@ listen_port(const char *port)
 	return fd;
 }
 
+/* Extract Content-Length from the mock's small HTTP request parser. */
 static size_t
 content_length(const char *request)
 {
@@ -87,6 +104,7 @@ content_length(const char *request)
 	return 0;
 }
 
+/* Read one complete mock request, including its declared body, into request. */
 static int
 read_mock_request(int fd, char *request, size_t length)
 {
@@ -116,6 +134,7 @@ read_mock_request(int fd, char *request, size_t length)
 	return headers == NULL ? -1 : 0;
 }
 
+/* Write the exact fixed-length HTTP response used by the local mock. */
 static int
 send_mock_response(int fd, const char *content_type, const char *body)
 {
@@ -133,6 +152,13 @@ send_mock_response(int fd, const char *content_type, const char *body)
 	return write_all(fd, body, strlen(body));
 }
 
+/*
+** Run the deterministic Codex stand-in until the parent terminates it.
+**
+** The readiness byte is written only after listen succeeds, preventing startup
+** model discovery from racing the mock bind.  Route checks also assert that
+** the proxy normalized images and removed intentionally unsupported fields.
+*/
 static void
 run_mock_upstream(const char *port, int ready_fd)
 {
@@ -200,6 +226,7 @@ run_mock_upstream(const char *port, int ready_fd)
 	}
 }
 
+/* Connect one test client to the loopback proxy. */
 static int
 open_port(const char *port)
 {
@@ -220,6 +247,7 @@ open_port(const char *port)
 	return fd;
 }
 
+/* Send a raw HTTP request and collect the connection-close response. */
 static int
 request_port(const char *port, const char *request, char *response,
     size_t response_length)
@@ -244,6 +272,7 @@ request_port(const char *port, const char *request, char *response,
 	return 0;
 }
 
+/* Build and send a minimal JSON POST request to one public proxy path. */
 static int
 request_json(const char *port, const char *path, const char *body,
     char *response, size_t response_length)
@@ -259,6 +288,7 @@ request_json(const char *port, const char *path, const char *body,
 	return request_port(port, request, response, response_length);
 }
 
+/* Build and send a multipart POST while preserving supplied body bytes. */
 static int
 request_multipart(const char *port, const char *path, const char *boundary,
     const char *body, char *response, size_t response_length)
@@ -276,6 +306,7 @@ request_multipart(const char *port, const char *path, const char *boundary,
 	return request_port(port, request, response, response_length);
 }
 
+/* Poll unauthenticated /health until the forked proxy listener accepts work. */
 static int
 wait_for_proxy(const char *port, char *response, size_t length)
 {
@@ -293,6 +324,13 @@ wait_for_proxy(const char *port, char *response, size_t length)
 	return -1;
 }
 
+/*
+** Exercise public routes against the local mock and inspect server diagnostics.
+**
+** The scenario also verifies the listener survives missing credentials and a
+** closed stderr, which are startup availability properties rather than route
+** response behavior.
+*/
 int
 main(void)
 {

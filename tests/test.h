@@ -1,3 +1,10 @@
+/*
+** Minimal failure-reporting helper for standalone test binaries.
+**
+** CHECK returns directly from the surrounding test function, so helpers that
+** require cleanup use the local REQUIRE pattern in test_proxy instead.
+*/
+
 #ifndef OAIOAUTHC_TEST_H
 #define OAIOAUTHC_TEST_H
 

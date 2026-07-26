@@ -1,3 +1,23 @@
+/*
+** JSON shape conversion between OpenAI-compatible clients and Codex.
+**
+** This module does not perform I/O and does not retain conversation state.
+** It receives Jansson values owned by the request worker, validates the
+** OpenAI-compatible parts that Codex depends on, and rewrites them into the
+** request and response shapes accepted by the upstream endpoint.
+**
+** Responses is the internal common representation.  Chat Completions input
+** is expanded into an ordered Responses input array, including assistant
+** output, tool calls, tool outputs, refusals, and image references.  Completed
+** Responses output is collapsed back into one Chat Completions choice.  This
+** explicit replay conversion is what keeps the proxy stateless.
+**
+** Model catalog entries supply defaults only when a client omits an option.
+** They also identify models that need the Responses-lite layout, where tools
+** and instructions become ordered developer input rather than top-level
+** fields.
+*/
+
 #include "json.h"
 #include "util.h"
 
@@ -6,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Populate the optional caller diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -18,12 +39,20 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+/* Serialize a JSON value compactly; the caller owns the Jansson allocation. */
 char
 *json_dump_compact(json_t *value)
 {
 	return json_dumps(value, JSON_COMPACT);
 }
 
+/*
+** Parse a NUL-terminated JSON string and report Jansson's parse detail.
+**
+** The caller receives one new reference on success and must decref it.  This
+** helper is reserved for trusted NUL-terminated buffers; binary request bodies
+** are parsed with length-aware APIs in their owning module.
+*/
 json_t
 *json_load_string_checked(const char *text, char *error, size_t length)
 {
@@ -36,6 +65,7 @@ json_t
 	return value;
 }
 
+/* Build a local OpenAI-compatible error envelope with an HTTP status field. */
 json_t
 *json_error_object(const char *message, const char *type, int status)
 {
@@ -47,6 +77,12 @@ json_t
 	return body;
 }
 
+/*
+** Detect References that require a persistent Responses store.
+**
+** Codex through this proxy is deliberately stateless, so previous_response_id
+** and item_reference input are rejected before normalizing the request.
+*/
 int
 json_has_replay_state(json_t *request)
 {
@@ -71,6 +107,14 @@ json_has_replay_state(json_t *request)
 	return 0;
 }
 
+/*
+** Normalize one Responses request in place for the Codex backend.
+**
+** A string input becomes a user input_text message.  store is forced false,
+** obsolete max_output_tokens is removed, encrypted reasoning is requested for
+** client-side replay, and force_stream can override a caller's stream choice.
+** The caller retains ownership of request on both success and failure.
+*/
 int
 json_normalize_response_request(json_t *request, int force_stream,
     char *error, size_t length)
@@ -82,6 +126,7 @@ json_normalize_response_request(json_t *request, int force_stream,
 	json_t	*item;
 	size_t	index;
 
+	/* Codex is stateless and always needs encrypted reasoning in replays. */
 	if (!json_is_object(request)) {
 		set_error(error, length, "request body must be a JSON object");
 		return -1;
@@ -121,6 +166,7 @@ json_normalize_response_request(json_t *request, int force_stream,
 	return 0;
 }
 
+/* Return true when an input array already contains the expected type. */
 static int
 input_has_type(json_t *input, const char *expected)
 {
@@ -138,6 +184,14 @@ input_has_type(json_t *input, const char *expected)
 	return 0;
 }
 
+/*
+** Apply discovered metadata for the selected model in place.
+**
+** Defaults never replace explicit reasoning effort or verbosity.  Lite models
+** use a different request layout: tools and instructions are represented as
+** leading developer inputs, context covers all turns, and parallel tool calls
+** are disabled to match the upstream capability.
+*/
 int
 json_apply_model_defaults(json_t *request, json_t *model, int *use_lite,
     char *error, size_t length)
@@ -153,6 +207,7 @@ json_apply_model_defaults(json_t *request, json_t *model, int *use_lite,
 	json_t		*tools;
 	size_t		index;
 
+	/* Catalog defaults fill omissions; client values take precedence. */
 	*use_lite = json_is_true(json_object_get(model, "use_responses_lite"));
 	default_effort = json_string_value(json_object_get(model,
 	    "default_reasoning_level"));
@@ -236,6 +291,13 @@ fail:
 	return -1;
 }
 
+/*
+** Convert one Chat Completions content value into Responses content parts.
+**
+** The returned array is a new reference.  Unsupported content parts are
+** omitted rather than reinterpreted; callers preserve only text, refusal, and
+** supported user image URLs.
+*/
 static json_t
 *chat_content_to_input(json_t *content, int assistant)
 {
@@ -282,6 +344,14 @@ static json_t
 	return result;
 }
 
+/*
+** Translate a complete Chat Completions request into a Responses request.
+**
+** The result owns newly created input and tool arrays but borrows compatible
+** scalar values through Jansson reference counting.  Tool messages become
+** function_call_output items, assistant tool calls become function_call items,
+** and system/developer messages share the upstream developer role.
+*/
 json_t
 *json_chat_to_responses(json_t *chat, char *error, size_t length)
 {
@@ -294,6 +364,7 @@ json_t
 	json_t	*response_tools;
 	size_t	index;
 
+	/* Rebuild history as Responses input because no server-side replay exists. */
 	messages = json_object_get(chat, "messages");
 	if (!json_is_string(json_object_get(chat, "model")) ||
 	    json_string_length(json_object_get(chat, "model")) == 0) {
@@ -427,6 +498,13 @@ json_t
 	return result;
 }
 
+/*
+** Translate a completed Responses object into one Chat Completions response.
+**
+** Text parts are concatenated in upstream output order.  Function calls become
+** Chat tool_calls, and available token details are copied into their matching
+** Chat usage fields.  The caller owns the returned JSON reference.
+*/
 json_t
 *json_response_to_chat(json_t *response, json_t *request, char *error,
     size_t length)
@@ -445,6 +523,7 @@ json_t
 	size_t	index;
 	size_t	part_index;
 
+	/* Collapse completed Responses output into the one Chat Completions choice. */
 	if (!json_is_object(response)) {
 		set_error(error, length, "upstream response is malformed");
 		return NULL;

@@ -1,3 +1,8 @@
+/*
+ * Focused tests for Codex auth.json parsing, JWT account discovery, refresh
+ * eligibility, and PKCE request construction.  They never contact OAuth.
+ */
+
 #include "auth.h"
 #include "test.h"
 #include "util.h"
@@ -7,6 +12,11 @@
 #include <string.h>
 #include <unistd.h>
 
+/*
+** Exercise both explicit and JWT-derived account ids, opaque-token refresh
+** fallback, and PKCE construction.  The temporary auth file is private and
+** removed before exit so the test never depends on a developer's real session.
+*/
 int
 main(void)
 {

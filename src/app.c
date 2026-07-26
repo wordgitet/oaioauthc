@@ -1,3 +1,19 @@
+/*
+** Command-line entry points and the interactive OAuth login callback.
+**
+** This file owns the user-facing "serve" and "login" commands.  The serve
+** command only parses configuration and delegates all request handling to
+** proxy.c.  The login command performs the browser-facing half of OAuth:
+** it builds a PKCE authorization request, opens a loopback listener, checks
+** the returned state, exchanges the code, and stores the resulting Codex
+** auth.json session.
+**
+** The callback listener is deliberately restricted to 127.0.0.1:1455 and
+** accepts exactly one request.  Its parser recognizes only the request line
+** and query parameters needed for the OAuth redirect.  Public HTTP parsing,
+** request limits, and route dispatch belong to proxy.c instead.
+*/
+
 #include "app.h"
 #include "auth.h"
 #include "proxy.h"
@@ -15,6 +31,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* Print the complete public command grammar to a diagnostic stream. */
 static void
 usage(FILE *stream)
 {
@@ -27,6 +44,12 @@ usage(FILE *stream)
 	    "  oaioauthc login [--oauth-file PATH] [--no-open]\n");
 }
 
+/*
+** Consume the next argv element for an option that requires a value.
+**
+** Advancing index to argc on failure makes the command parser stop without
+** accidentally treating a missing value as a later independent option.
+*/
 static const char
 *option_value(int *index, int argc, char **argv, const char *name)
 {
@@ -39,6 +62,12 @@ static const char
 	return argv[*index];
 }
 
+/*
+** Ask the desktop opener to visit url without making login depend on it.
+**
+** The child is intentionally not waited for: browsers often remain attached
+** to the opener, and the loopback callback is the actual completion signal.
+*/
 static int
 open_browser(const char *url)
 {
@@ -54,6 +83,12 @@ open_browser(const char *url)
 	return 0;
 }
 
+/*
+** Open the fixed loopback listener used by the OAuth redirect URI.
+**
+** Binding INADDR_LOOPBACK, rather than all interfaces, prevents another host
+** from submitting an authorization code to a local login attempt.
+*/
 static int
 listen_callback(void)
 {
@@ -78,6 +113,7 @@ listen_callback(void)
 	return fd;
 }
 
+/* Return one hexadecimal digit's numeric value, or -1 for invalid input. */
 static int
 hex_value(char character)
 {
@@ -90,6 +126,13 @@ hex_value(char character)
 	return -1;
 }
 
+/*
+** Return a decoded query parameter value owned by the caller.
+**
+** The search is exact on the parameter name.  Percent escapes and '+' follow
+** form-query rules, while malformed escapes and decoded NUL bytes are rejected
+** so callers never compare truncated security-sensitive values such as state.
+*/
 static char
 *query_value(const char *target, const char *name)
 {
@@ -102,6 +145,7 @@ static char
 	int		high;
 	int		low;
 
+	/* Decode only the selected parameter; reject embedded NULs in the URL. */
 	query = strchr(target, '?');
 	if (query == NULL)
 		return NULL;
@@ -149,6 +193,7 @@ fail:
 	return NULL;
 }
 
+/* Emit the small browser-facing success or callback-validation response. */
 static int
 send_callback_response(int fd, int status, const char *content_type,
     const char *body)
@@ -167,6 +212,14 @@ send_callback_response(int fd, int status, const char *content_type,
 	return write_all(fd, body, strlen(body));
 }
 
+/*
+** Perform the complete interactive PKCE login transaction.
+**
+** The authorization URL and verifier remain in oauth until after the local
+** callback passes state validation.  The listener closes after one connection
+** so it cannot become a general HTTP service.  Only a successfully exchanged
+** and saved session survives this function; all other paths release secrets.
+*/
 static int
 run_login(const struct proxy_options *options, int should_open)
 {
@@ -187,6 +240,11 @@ run_login(const struct proxy_options *options, int should_open)
 	const char		*body;
 	int			result;
 
+	/*
+	 * The state comparison binds the one local redirect to this PKCE request.
+	 * Do it before exchanging the code, since the callback listener is not an
+	 * authenticated HTTP endpoint.
+	 */
 	memset(&oauth, 0, sizeof(oauth));
 	memset(&session, 0, sizeof(session));
 	listen_fd = listen_callback();
@@ -274,6 +332,11 @@ run_login(const struct proxy_options *options, int should_open)
 	return 0;
 }
 
+/*
+** Parse the command line, install process-wide SIGPIPE behavior, and select
+** login or serve.  options only borrows argv strings, so it stays valid for
+** the synchronous proxy_serve call without a second allocation layer.
+*/
 int
 app_main(int argc, char **argv)
 {

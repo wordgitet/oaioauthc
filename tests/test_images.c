@@ -1,3 +1,8 @@
+/*
+ * Multipart and JSON image-translation tests.  The local builder creates
+ * exact form framing so malformed and boundary-sensitive cases stay explicit.
+ */
+
 #include "images.h"
 #include "test.h"
 #include "util.h"
@@ -7,12 +12,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+** Exact multipart byte builder used to test the production parser.
+**
+** body may deliberately contain NUL and boundary-like bytes.  finished avoids
+** accidentally creating a body with two closing delimiters in negative tests.
+*/
 struct multipart {
 	struct buffer	body;
 	const char	*boundary;
 	int		 finished;
 };
 
+/* Initialize a builder with a borrowed boundary string. */
 static void
 multipart_init(struct multipart *multipart, const char *boundary)
 {
@@ -21,6 +33,7 @@ multipart_init(struct multipart *multipart, const char *boundary)
 	multipart->finished = 0;
 }
 
+/* Append one Content-Disposition/Content-Type header section. */
 static int
 multipart_header(struct multipart *multipart, const char *name,
     const char *filename, const char *content_type)
@@ -45,6 +58,7 @@ multipart_header(struct multipart *multipart, const char *name,
 	return buffer_append_string(&multipart->body, "\r\n\r\n");
 }
 
+/* Append one textual form field with correct trailing CRLF framing. */
 static int
 multipart_field(struct multipart *multipart, const char *name,
     const char *value)
@@ -55,6 +69,7 @@ multipart_field(struct multipart *multipart, const char *name,
 	return buffer_append_string(&multipart->body, "\r\n");
 }
 
+/* Append one binary upload without converting it through string APIs. */
 static int
 multipart_file(struct multipart *multipart, const char *name,
     const char *filename, const char *content_type, const void *data,
@@ -66,6 +81,7 @@ multipart_file(struct multipart *multipart, const char *name,
 	return buffer_append_string(&multipart->body, "\r\n");
 }
 
+/* Close the body once; a second close indicates a malformed test fixture. */
 static int
 multipart_finish(struct multipart *multipart)
 {
@@ -78,6 +94,7 @@ multipart_finish(struct multipart *multipart)
 	return buffer_append_string(&multipart->body, "--\r\n");
 }
 
+/* Validate generation normalization and each public compatibility rejection. */
 static int
 test_generation(void)
 {
@@ -161,6 +178,7 @@ test_generation(void)
 	return 0;
 }
 
+/* Verify image order, binary data URLs, and optional edit fields. */
 static int
 test_edit_success(void)
 {
@@ -220,6 +238,7 @@ test_edit_success(void)
 	return 0;
 }
 
+/* Build a valid edit, vary one condition, and require its error text. */
 static int
 expect_edit_error(const char *extra_name, const char *extra_value,
     int include_model, int include_image, const char *expected)
@@ -257,6 +276,7 @@ nomem:
 	return 1;
 }
 
+/* Exercise rejected options, missing fields, and malformed edit forms. */
 static int
 test_edit_errors(void)
 {
@@ -305,6 +325,7 @@ test_edit_errors(void)
 	return 0;
 }
 
+/* Confirm the edit-body size limit is rejected before multipart parsing. */
 static int
 test_oversized_edit(void)
 {
@@ -344,6 +365,7 @@ test_oversized_edit(void)
 	return 0;
 }
 
+/* Run all image compatibility groups so failures remain independently named. */
 int
 main(void)
 {

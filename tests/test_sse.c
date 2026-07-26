@@ -1,15 +1,24 @@
+/*
+ * Incremental SSE parser and Chat Completions stream conversion tests.
+ */
+
 #include "sse.h"
 #include "test.h"
 #include "util.h"
 
 #include <string.h>
 
+/* Capture emitted Chat SSE bytes in a growable buffer for assertions. */
 static int
 capture(const void *data, size_t length, void *argument)
 {
 	return buffer_append(argument, data, length);
 }
 
+/*
+** Verify buffered completion collection and a deliberately split live stream,
+** including tool-call deltas, usage mapping, and terminal [DONE] framing.
+*/
 int
 main(void)
 {

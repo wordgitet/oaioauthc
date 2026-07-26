@@ -1,3 +1,18 @@
+/*
+** Small ownership and filesystem primitives shared by the program.
+**
+** buffer is a growable byte container with two simultaneous guarantees: len
+** is authoritative for binary callers, while data is always NUL-terminated
+** after a successful append for parsers that need a C string.  buffer_steal
+** transfers ownership of data and resets the source buffer to its initial
+** state.
+**
+** Credential writes use a sibling temporary file, mode 0600, fsync, and
+** rename.  This avoids readers seeing a partially written auth.json and keeps
+** new token files private even when the process umask is permissive.  Parent
+** directories are created with mode 0700 only as needed for that path.
+*/
+
 #include "util.h"
 
 #include <errno.h>
@@ -9,6 +24,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/*
+** Initialize buffer for first use.  No allocation occurs here, and the result
+** may be passed to buffer_free or buffer_steal even if no bytes are appended.
+*/
 void
 buffer_init(struct buffer *buffer)
 {
@@ -17,6 +36,7 @@ buffer_init(struct buffer *buffer)
 	buffer->cap = 0;
 }
 
+/* Release the owned allocation, then restore the initialization invariant. */
 void
 buffer_free(struct buffer *buffer)
 {
@@ -24,6 +44,13 @@ buffer_free(struct buffer *buffer)
 	buffer_init(buffer);
 }
 
+/*
+** Append length bytes to buffer.
+**
+** On success, buffer owns the combined bytes and data[len] is NUL.  On
+** failure, overflow and allocation checks leave the existing buffer intact.
+** The input may be binary and may alias no part of a future reallocation.
+*/
 int
 buffer_append(struct buffer *buffer, const void *data, size_t length)
 {
@@ -31,6 +58,7 @@ buffer_append(struct buffer *buffer, const void *data, size_t length)
 	size_t	cap;
 	char	*next;
 
+	/* Reserve one trailing NUL while keeping len valid for binary callers. */
 	if (length > (size_t)-1 - buffer->len - 1)
 		return -1;
 	needed = buffer->len + length + 1;
@@ -53,12 +81,19 @@ buffer_append(struct buffer *buffer, const void *data, size_t length)
 	return 0;
 }
 
+/* Append a C string without including its terminator in buffer->len. */
 int
 buffer_append_string(struct buffer *buffer, const char *string)
 {
 	return buffer_append(buffer, string, strlen(string));
 }
 
+/*
+** Transfer buffer's allocation to the caller and reset buffer.
+**
+** Empty buffers still return an allocated empty string.  This avoids forcing
+** every caller that hands a buffer to a string API to special-case NULL.
+*/
 char
 *buffer_steal(struct buffer *buffer)
 {
@@ -73,6 +108,7 @@ char
 	return data;
 }
 
+/* Allocate and copy one NUL-terminated string, or return NULL on allocation. */
 char
 *oaio_strdup(const char *string)
 {
@@ -86,6 +122,13 @@ char
 	return copy;
 }
 
+/*
+** Join two path fragments with exactly the separator needed between them.
+**
+** The caller owns the returned string.  This helper does not canonicalize
+** paths: preserving the supplied fragments is important for user-selected
+** credential locations and avoids changing symlink resolution semantics.
+*/
 char
 *oaio_join_path(const char *left, const char *right)
 {
@@ -102,6 +145,12 @@ char
 	return buffer_steal(&buffer);
 }
 
+/*
+** Write the full byte range, retrying interrupted writes.
+**
+** A short positive write is normal and advances the cursor.  Any other I/O
+** error is returned to the caller unchanged through errno.
+*/
 int
 write_all(int fd, const void *data, size_t length)
 {
@@ -122,6 +171,13 @@ write_all(int fd, const void *data, size_t length)
 	return 0;
 }
 
+/*
+** Read an entire file into an initialized buffer.
+**
+** The file is read in bounded chunks and EINTR is retried.  A read or append
+** failure leaves any bytes already accumulated available to the caller, which
+** must still release the buffer; this mirrors ordinary realloc ownership.
+*/
 int
 read_file(const char *path, struct buffer *buffer)
 {
@@ -147,6 +203,13 @@ read_file(const char *path, struct buffer *buffer)
 	return close(fd);
 }
 
+/*
+** Atomically replace path with private text data.
+**
+** The temporary file is created next to path so rename remains atomic within
+** one filesystem.  fsync makes the data durable before rename; failure removes
+** the temporary name and leaves the previous credential file untouched.
+*/
 int
 write_private_file(const char *path, const char *data)
 {
@@ -154,6 +217,7 @@ write_private_file(const char *path, const char *data)
 	int		fd;
 	int		result;
 
+	/* Write, sync, and rename a 0600 temporary file to avoid torn credentials. */
 	if (make_parent_directories(path) == -1)
 		return -1;
 	buffer_init(&temporary);
@@ -187,6 +251,13 @@ fail:
 	return -1;
 }
 
+/*
+** Create every missing directory component preceding path with mode 0700.
+**
+** Existing directories are accepted without inspecting their mode or owner;
+** callers use this only for a user-selected credential path, where refusing
+** an existing directory would be more surprising than using it.
+*/
 int
 make_parent_directories(const char *path)
 {
@@ -212,6 +283,7 @@ make_parent_directories(const char *path)
 	return result;
 }
 
+/* Return HOME when available, otherwise the relative "." fallback. */
 const char
 *oaio_home_dir(void)
 {

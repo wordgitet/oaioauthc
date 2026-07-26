@@ -1,3 +1,22 @@
+/*
+** Codex-compatible OAuth credential storage and PKCE token operations.
+**
+** Codex stores ChatGPT OAuth credentials in auth.json.  This module reads
+** that file without requiring fields unrelated to the proxy, writes refreshed
+** credentials without discarding unknown Codex fields, and derives an account
+** id from a JWT claim when the token response does not name one explicitly.
+** The account id is routing metadata required by the Codex backend.
+**
+** auth_session and oauth_request own all of their string members.  Creation
+** and load functions transfer those allocations to the caller; the matching
+** free function is safe on a zeroed or partially initialized structure.
+**
+** JWT payload decoding here is intentionally not signature verification.
+** Tokens originate from the OAuth exchange or the local credential file; the
+** decoded claim is used only to select a ChatGPT account header.  The backend
+** remains the authority that validates the bearer token.
+*/
+
 #include "auth.h"
 #include "http.h"
 #include "json.h"
@@ -20,6 +39,7 @@
 #define DEFAULT_TOKEN_URL "https://auth.openai.com/oauth/token"
 #define REFRESH_INTERVAL 3300
 
+/* Format an optional caller-owned diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -32,6 +52,12 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+/*
+** Encode bytes for OAuth PKCE and JWT transport.
+**
+** The result is standard Base64 with URL-safe substitutions and no trailing
+** padding.  The caller owns the result.  Callers pass small bounded lengths.
+*/
 static char
 *base64url(const unsigned char *data, size_t length)
 {
@@ -54,6 +80,7 @@ static char
 	return encoded;
 }
 
+/* Obtain cryptographically random bytes, then return their Base64url form. */
 static char
 *random_urlsafe(size_t length)
 {
@@ -72,6 +99,7 @@ static char
 	return encoded;
 }
 
+/* Return the current UTC time in the auth.json RFC 3339 form. */
 static char
 *current_timestamp(void)
 {
@@ -87,6 +115,13 @@ static char
 	return oaio_strdup(buffer);
 }
 
+/*
+** Convert a civil Gregorian date to days since the Unix epoch.
+**
+** This avoids non-standard timegm(3) and makes refresh timestamp validation
+** independent of the process timezone.  parse_timestamp validates all fields
+** before calling this arithmetic helper.
+*/
 static long long
 days_from_civil(int year, unsigned int month, unsigned int day)
 {
@@ -105,6 +140,12 @@ days_from_civil(int year, unsigned int month, unsigned int day)
 	return (long long)era * 146097 + day_of_era - 719468;
 }
 
+/*
+** Parse exactly the UTC timestamp format emitted by current_timestamp.
+**
+** Leap years and the time_t conversion are checked explicitly.  A value that
+** cannot be represented by the host time_t is not silently wrapped.
+*/
 static int
 parse_timestamp(const char *text, time_t *result)
 {
@@ -143,6 +184,12 @@ parse_timestamp(const char *text, time_t *result)
 	return 0;
 }
 
+/*
+** Extract chatgpt_account_id from an unverified JWT payload.
+**
+** The returned string is owned by the caller.  Invalid JWT syntax, invalid
+** Base64url, missing JSON, or a missing string claim all return NULL.
+*/
 static char
 *jwt_account_id(const char *token)
 {
@@ -159,6 +206,10 @@ static char
 	json_t		*account;
 	char		*result;
 
+	/*
+	 * This extracts routing metadata from a token already obtained through
+	 * OAuth; it does not authenticate a JWT or make an authorization decision.
+	 */
 	if (token == NULL)
 		return NULL;
 	first = strchr(token, '.');
@@ -209,6 +260,13 @@ static char
 	return result;
 }
 
+/*
+** Return the cached default Codex credential path.
+**
+** CODEX_HOME/auth.json takes precedence; otherwise use ~/.codex/auth.json.
+** The returned allocation has process lifetime because configuration is read
+** repeatedly by forked workers and never needs a mutable global path.
+*/
 const char
 *auth_default_file(void)
 {
@@ -230,6 +288,7 @@ const char
 	return path;
 }
 
+/* Release every credential string and zero the session for safe reuse. */
 void
 auth_session_free(struct auth_session *session)
 {
@@ -241,6 +300,14 @@ auth_session_free(struct auth_session *session)
 	memset(session, 0, sizeof(*session));
 }
 
+/*
+** Load the subset of Codex auth.json needed for authenticated requests.
+**
+** access_token and account_id must be available on success.  account_id is
+** first read from tokens, then derived from id_token or access_token.  All
+** resulting strings belong to session.  On failure session is zeroed and the
+** optional error buffer describes a usable recovery action.
+*/
 int
 auth_load(const char *path, struct auth_session *session, char *error,
     size_t length)
@@ -250,6 +317,7 @@ auth_load(const char *path, struct auth_session *session, char *error,
 	json_t		*tokens;
 	const char	*value;
 
+	/* A successful call transfers all duplicated fields to session. */
 	memset(session, 0, sizeof(*session));
 	buffer_init(&buffer);
 	if (read_file(path, &buffer) == -1) {
@@ -288,6 +356,13 @@ auth_load(const char *path, struct auth_session *session, char *error,
 	return 0;
 }
 
+/*
+** Merge session credentials into a Codex-compatible auth.json file.
+**
+** Existing unrelated top-level and token fields survive the merge.  The final
+** serialization is installed through write_private_file, so readers see old
+** complete credentials or new complete credentials, never a partial JSON file.
+*/
 int
 auth_save(const char *path, const struct auth_session *session, char *error,
     size_t length)
@@ -297,6 +372,7 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 	json_t	*tokens;
 	char	*text;
 
+	/* Preserve unknown Codex fields so this remains a cooperative auth.json. */
 	buffer_init(&buffer);
 	root = read_file(path, &buffer) == 0 ? json_loads(buffer.data, 0, NULL) : NULL;
 	buffer_free(&buffer);
@@ -331,6 +407,13 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 	return 0;
 }
 
+/*
+** Decide whether session should be refreshed before an upstream call.
+**
+** JWT access tokens refresh five minutes before exp.  Opaque tokens fall back
+** to last_refresh and REFRESH_INTERVAL.  Missing or unreadable refresh timing
+** is treated as needing refresh: serving with a stale token is not useful.
+*/
 int
 auth_session_needs_refresh(const struct auth_session *session)
 {
@@ -346,6 +429,7 @@ auth_session_needs_refresh(const struct auth_session *session)
 	int		result;
 	time_t		refreshed;
 
+	/* Prefer JWT expiry, then retain a conservative interval for opaque tokens. */
 	if (session->access_token == NULL || session->refresh_token == NULL)
 		return session->access_token == NULL;
 	first = strchr(session->access_token, '.');
@@ -399,6 +483,13 @@ check_last_refresh:
 	return 1;
 }
 
+/*
+** Merge a successful OAuth token response into session.
+**
+** Refresh responses may omit refresh_token, id_token, or account_id.  Existing
+** values are retained when safe, and account-id discovery follows the same
+** fallback order as auth_load.  session remains caller-owned on all paths.
+*/
 static int
 token_response(const char *text, struct auth_session *session, char *error,
     size_t length)
@@ -449,6 +540,13 @@ token_response(const char *text, struct auth_session *session, char *error,
 	    -1 : 0;
 }
 
+/*
+** Refresh an existing session and persist the replacement credentials.
+**
+** The in-memory session is updated before auth_save.  A save failure therefore
+** returns an error even though the caller holds a usable fresh token: later
+** workers would otherwise reload the stale on-disk session.
+*/
 int
 auth_refresh(const char *path, const char *client_id, const char *token_url,
     struct auth_session *session, char *error, size_t length)
@@ -489,6 +587,12 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 	return result;
 }
 
+/*
+** Create a complete authorization URL and the PKCE state needed to finish it.
+**
+** authorization_url, state, and code_verifier are all returned in request and
+** are owned by the caller.  Failure leaves request safe for oauth_request_free.
+*/
 int
 oauth_request_create(const char *redirect_uri, const char *client_id,
     struct oauth_request *request, char *error, size_t length)
@@ -499,6 +603,7 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 	char		*escaped_redirect;
 	struct buffer	url;
 
+	/* state prevents callback substitution; S256 binds the code to this client. */
 	memset(request, 0, sizeof(*request));
 	request->state = random_urlsafe(24);
 	request->code_verifier = random_urlsafe(48);
@@ -539,6 +644,7 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 	return 0;
 }
 
+/* Release a completed or partially built PKCE request. */
 void
 oauth_request_free(struct oauth_request *request)
 {
@@ -548,6 +654,14 @@ oauth_request_free(struct oauth_request *request)
 	memset(request, 0, sizeof(*request));
 }
 
+/*
+** Exchange the validated authorization code for OAuth credentials.
+**
+** Every form value is encoded independently before assembly.  This function
+** only updates session after a 2xx token response passes token_response; it
+** deliberately does not save auth.json because the interactive caller chooses
+** the destination path after the exchange succeeds.
+*/
 int
 oauth_exchange_code(const char *code, const char *code_verifier,
     const char *redirect_uri, const char *client_id, const char *token_url,

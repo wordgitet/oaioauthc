@@ -1,3 +1,25 @@
+/*
+** Local OpenAI-compatible HTTP proxy for a ChatGPT OAuth session.
+**
+** The parent owns the listening socket, signal handling, worker count, Codex
+** version, and a short-lived model catalog.  Every accepted connection is
+** processed in a forked worker.  That keeps a slow client, slow upstream
+** stream, and all request-scoped JSON/OAuth allocations out of the listener
+** process.  A worker owns its client fd and private post-fork copy of the
+** catalog; the parent remains responsible for refreshing future copies.
+**
+** Supported public routes are /health, /v1/models, /v1/responses,
+** /v1/chat/completions, and the deferred image endpoints.  /health is local
+** and deliberately unauthenticated.  All other routes load auth.json in the
+** worker and refresh it when required.  Responses is the upstream protocol;
+** Chat Completions is converted at the route boundary.
+**
+** The proxy has no persistent response store.  Requests which rely on a prior
+** response id are rejected, and clients must send the complete conversation.
+** This keeps the process small and avoids retaining prompt history or
+** encrypted reasoning content between requests.
+*/
+
 #include "proxy.h"
 #include "auth.h"
 #include "http.h"
@@ -32,6 +54,13 @@
 #define MAX_WORKERS 32
 #define MODEL_CATALOG_RETRY 30
 
+/*
+** Parsed representation of one client request.
+**
+** Every string and body is allocated by read_request and released by
+** request_free.  body_length, rather than the trailing NUL, is the boundary
+** used for multipart input.  The NUL exists solely for JSON and header APIs.
+*/
 struct request {
 	char	*method;
 	char	*path;
@@ -40,17 +69,33 @@ struct request {
 	size_t	 body_length;
 };
 
+/*
+** Per-account Codex model metadata inherited by workers at fork time.
+**
+** root is the complete upstream models object, account_id binds it to the
+** token that fetched it, and expires bounds its lifetime.  A child may refresh
+** its own copy for the current request.  The parent separately refreshes its
+** copy so that future children do not repeatedly fetch the same catalog.
+*/
 struct model_catalog {
 	json_t	*root;
 	char	*account_id;
 	time_t	expires;
 };
 
+/*
+** Output state shared by the raw and translated streaming paths.
+**
+** started becomes true only after response headers reach the client.  It lets
+** callers distinguish a pre-response upstream failure, which can become JSON
+** error output, from a broken stream that can only terminate the connection.
+*/
 struct stream_client {
 	int	fd;
 	int	started;
 };
 
+/* Format a bounded diagnostic message for a caller-owned error buffer. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -63,12 +108,14 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+/* SIGCHLD handler: interrupt accept so the parent can reap exited workers. */
 static void
 child_exited(int signal_number)
 {
 	(void)signal_number;
 }
 
+/* Apply finite send/receive timeouts to one accepted client connection. */
 static void
 set_client_timeout(int fd)
 {
@@ -82,6 +129,7 @@ set_client_timeout(int fd)
 	    sizeof(timeout));
 }
 
+/* Write a complete non-streaming HTTP response with its body length. */
 static int
 send_response(int fd, int status, const char *content_type, const char *body)
 {
@@ -99,6 +147,7 @@ send_response(int fd, int status, const char *content_type, const char *body)
 	    write_all(fd, body, strlen(body));
 }
 
+/* Send headers once before raw Responses SSE data reaches the client. */
 static int
 send_stream_headers(struct stream_client *client)
 {
@@ -116,6 +165,12 @@ send_stream_headers(struct stream_client *client)
 	return 0;
 }
 
+/*
+** Forward one upstream Responses stream fragment unchanged.
+**
+** started records that an HTTP response is already visible, so later failures
+** cannot be replaced by a conflicting JSON error response on the same socket.
+*/
 static int
 write_stream(const void *data, size_t length, void *argument)
 {
@@ -127,12 +182,14 @@ write_stream(const void *data, size_t length, void *argument)
 	return write_all(client->fd, data, length);
 }
 
+/* Feed Codex SSE bytes into the Responses-to-Chat streaming translator. */
 static int
 write_chat_stream(const void *data, size_t length, void *argument)
 {
 	return sse_chat_stream_feed(argument, data, length);
 }
 
+/* Serialize one JSON value and send it as the local HTTP response body. */
 static int
 send_json(int fd, int status, json_t *body)
 {
@@ -147,6 +204,7 @@ send_json(int fd, int status, json_t *body)
 	return result;
 }
 
+/* Build and send a local OpenAI-compatible error object. */
 static int
 send_error(int fd, int status, const char *message, const char *type)
 {
@@ -160,6 +218,7 @@ send_error(int fd, int status, const char *message, const char *type)
 	return result;
 }
 
+/* Identify object keys whose value must never appear in debug output. */
 static int
 debug_sensitive_key(const char *key)
 {
@@ -173,6 +232,7 @@ debug_sensitive_key(const char *key)
 	};
 	size_t	index;
 
+	/* Keep this list conservative: debug output must never collect secrets. */
 	for (index = 0; index < sizeof(sensitive) / sizeof(sensitive[0]);
 	    index++) {
 		if (strcasecmp(key, sensitive[index]) == 0)
@@ -181,6 +241,13 @@ debug_sensitive_key(const char *key)
 	return 0;
 }
 
+/*
+** Deep-copy JSON for diagnostic output while redacting values in the copy.
+**
+** The original request remains untouched for forwarding.  Redaction applies
+** recursively to sensitive object keys and every case-insensitive data URL,
+** regardless of whether the caller selected compact or pretty diagnostics.
+*/
 static json_t *
 debug_json_copy(json_t *value)
 {
@@ -192,6 +259,7 @@ debug_json_copy(json_t *value)
 	size_t		 index;
 	char		 redacted[96];
 
+	/* Redact before encoding so both compact and pretty modes share the policy. */
 	if (json_is_string(value)) {
 		string = json_string_value(value);
 		if (strncasecmp(string, "data:", 5) == 0) {
@@ -233,6 +301,7 @@ debug_json_copy(json_t *value)
 	return json_deep_copy(value);
 }
 
+/* Write one best-effort diagnostic line; logging cannot fail a route. */
 static void
 debug_json_write(const char *label, const char *text)
 {
@@ -255,6 +324,7 @@ debug_json_write(const char *label, const char *text)
 	buffer_free(&line);
 }
 
+/* Render a redacted JSON value according to the configured debug format. */
 static void
 debug_json_value(const struct proxy_options *options, const char *label,
     json_t *value)
@@ -278,6 +348,7 @@ debug_json_value(const struct proxy_options *options, const char *label,
 	free(text);
 }
 
+/* Parse a prepared JSON string before applying the shared redaction policy. */
 static void
 debug_json_text(const struct proxy_options *options, const char *label,
     const char *text)
@@ -295,6 +366,7 @@ debug_json_text(const struct proxy_options *options, const char *label,
 	json_decref(value);
 }
 
+/* Release every allocation made by read_request and reset the structure. */
 static void
 request_free(struct request *request)
 {
@@ -305,6 +377,7 @@ request_free(struct request *request)
 	memset(request, 0, sizeof(*request));
 }
 
+/* Read one bounded chunk, retrying EINTR and enforcing the caller's limit. */
 static int
 read_more(int fd, struct buffer *buffer, size_t limit)
 {
@@ -320,6 +393,7 @@ read_more(int fd, struct buffer *buffer, size_t limit)
 	return buffer_append(buffer, chunk, (size_t)count);
 }
 
+/* Parse decimal Content-Length without accepting signs, junk, or overflow. */
 static int
 parse_content_length(const char *value, size_t *length)
 {
@@ -342,6 +416,13 @@ parse_content_length(const char *value, size_t *length)
 	return 0;
 }
 
+/*
+** Decode HTTP/1.1 chunked framing into request->body.
+**
+** raw retains unread transport bytes; body receives only payload bytes.  Chunk
+** extensions and trailers are tolerated, but every size and cursor movement is
+** bounded by the route-specific body and raw-input limits.
+*/
 static int
 read_chunked_body(int fd, struct buffer *raw, size_t cursor,
     size_t body_limit, size_t raw_limit, struct request *request)
@@ -353,6 +434,7 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 	unsigned long long	chunk_length;
 	size_t		line_length;
 
+	/* Decode framing into a separate body so chunk metadata never reaches JSON. */
 	buffer_init(&body);
 	for (;;) {
 		while ((line_end = strstr(raw->data + cursor, "\r\n")) == NULL) {
@@ -408,6 +490,13 @@ fail:
 	return -1;
 }
 
+/*
+** Parse one supported HTTP/1.1 request from an accepted client fd.
+**
+** The parser owns the resulting request strings/body.  It accepts a narrow,
+** deliberately unambiguous header set, rejects conflicting body framing, and
+** applies the larger image-edit limit only to that route before allocating.
+*/
 static int
 read_request(int fd, struct request *request)
 {
@@ -435,6 +524,10 @@ read_request(int fd, struct request *request)
 	int		chunked;
 	int		last_header;
 
+	/*
+	 * Parse only the framing needed by the supported routes.  Reject ambiguous
+	 * Content-Length/Transfer-Encoding combinations before allocating a body.
+	 */
 	memset(request, 0, sizeof(*request));
 	buffer_init(&buffer);
 	while ((header_end = buffer.data == NULL ? NULL : strstr(buffer.data,
@@ -598,6 +691,7 @@ read_request(int fd, struct request *request)
 	return 0;
 }
 
+/* Join configured upstream base URL and endpoint suffix into an owned URL. */
 static char
 *upstream_url(const struct proxy_options *options, const char *suffix)
 {
@@ -616,6 +710,7 @@ static char
 	return buffer_steal(&buffer);
 }
 
+/* Accept only the numeric major.minor.patch form used in Codex headers. */
 static int
 valid_codex_version(const char *version)
 {
@@ -637,6 +732,13 @@ valid_codex_version(const char *version)
 	return *version == '\0';
 }
 
+/*
+** Return an owned Codex version for model discovery and upstream requests.
+**
+** A caller-provided valid version avoids the registry lookup.  Otherwise the
+** latest Codex package metadata is fetched and strictly validated so malformed
+** registry data never becomes a request header or model query parameter.
+*/
 static char *
 resolve_codex_version(const struct proxy_options *options, char *error,
     size_t length)
@@ -646,6 +748,7 @@ resolve_codex_version(const struct proxy_options *options, char *error,
 	char			*result;
 	json_t			*root;
 
+	/* An explicit valid version wins; otherwise discover the current Codex CLI. */
 	if (valid_codex_version(options->codex_version))
 		return oaio_strdup(options->codex_version);
 	if (http_get(CODEX_REGISTRY_URL, NULL, NULL, &response, error,
@@ -673,6 +776,7 @@ resolve_codex_version(const struct proxy_options *options, char *error,
 	return result;
 }
 
+/* Release the model JSON and its account binding, then reset the cache. */
 static void
 model_catalog_free(struct model_catalog *catalog)
 {
@@ -681,6 +785,14 @@ model_catalog_free(struct model_catalog *catalog)
 	memset(catalog, 0, sizeof(*catalog));
 }
 
+/*
+** Load or reuse the account-specific Codex model catalog.
+**
+** The cache is valid only while its account id matches session and expires is
+** in the future.  A successful replacement first validates that the upstream
+** response contains usable model slugs, preventing an error JSON from poisoning
+** later model selection or the public /v1/models route.
+*/
 static int
 load_model_catalog(const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog,
@@ -696,6 +808,7 @@ load_model_catalog(const struct proxy_options *options,
 	size_t			index;
 	int			valid_models;
 
+	/* Model defaults and visibility are account-specific, not global metadata. */
 	if (catalog->root != NULL && catalog->account_id != NULL &&
 	    strcmp(catalog->account_id, session->account_id) == 0 &&
 	    catalog->expires > time(NULL))
@@ -761,6 +874,7 @@ load_model_catalog(const struct proxy_options *options,
 	return 0;
 }
 
+/* Return the matching catalog model object as a borrowed JSON reference. */
 static json_t
 *find_model(struct model_catalog *catalog, const char *slug)
 {
@@ -781,6 +895,7 @@ static json_t
 	return NULL;
 }
 
+/* Append one comma-separated display name and update the displayed count. */
 static int
 append_model_name(struct buffer *names, const char *name, size_t *count)
 {
@@ -792,6 +907,12 @@ append_model_name(struct buffer *names, const char *name, size_t *count)
 	return 0;
 }
 
+/*
+** Build the startup banner's model list from explicit models or the catalog.
+**
+** Visibility and supported_in_api mirror the filtering used by /v1/models so
+** the banner never advertises a model the local API will not expose.
+*/
 static int
 append_startup_models(struct buffer *names,
     const struct proxy_options *options, const struct model_catalog *catalog,
@@ -841,6 +962,12 @@ append_startup_models(struct buffer *names,
 	return 0;
 }
 
+/*
+** Emit an informational startup banner to stderr.
+**
+** The caller deliberately treats failure as non-fatal: a closed stderr must
+** not prevent a local HTTP listener from serving health or authenticated work.
+*/
 static int
 announce_startup(const char *host, const char *port,
     const struct proxy_options *options, const struct model_catalog *catalog)
@@ -893,6 +1020,12 @@ fail:
 	return -1;
 }
 
+/*
+** Serve OpenAI-compatible /v1/models from explicit configuration or Codex.
+**
+** Explicit --models stays entirely local.  Discovered catalogs are filtered
+** to API-visible supported entries and mapped into the standard list envelope.
+*/
 static int
 handle_models(int fd, const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog)
@@ -965,6 +1098,14 @@ handle_models(int fd, const struct proxy_options *options,
 	return (int)index;
 }
 
+/*
+** Serve Responses or Chat Completions through the common upstream endpoint.
+**
+** Chat input is converted before normalization; native Responses replay state
+** is rejected because this proxy stores no server-side conversation.  Model
+** discovery is best effort for defaults: a catalog failure does not stop an
+** otherwise valid explicit-model request from reaching Codex.
+*/
 static int
 handle_responses(int fd, const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog,
@@ -984,6 +1125,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	struct stream_client	client;
 	struct sse_chat_stream	*chat_stream;
 
+	/* Convert Chat only here; all upstream work uses Responses JSON. */
 	request = json_load_string_checked(body, error, sizeof(error));
 	if (request == NULL)
 		return send_error(fd, 400, error, "invalid_request_error");
@@ -1121,6 +1263,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	return result;
 }
 
+/* Recognize multipart/form-data while tolerating whitespace and parameters. */
 static int
 content_type_is_multipart(const char *content_type)
 {
@@ -1142,6 +1285,12 @@ content_type_is_multipart(const char *content_type)
 	    strncasecmp(content_type, "multipart/form-data", length) == 0;
 }
 
+/*
+** Prepare and forward one image generation or image edit request.
+**
+** The image module performs compatibility validation before this function logs
+** the normalized redacted JSON and sends it to the matching Codex endpoint.
+*/
 static int
 handle_image(int fd, const struct proxy_options *options,
     const struct auth_session *session, const struct request *request,
@@ -1189,6 +1338,13 @@ handle_image(int fd, const struct proxy_options *options,
 	return result;
 }
 
+/*
+** Route one fully parsed client request inside its forked worker.
+**
+** /health does not read credentials or upstream state.  Every other route
+** loads auth.json, refreshes only when needed, and frees the session before
+** returning.  This is the sole route-level authentication boundary.
+*/
 static int
 dispatch(int fd, const struct proxy_options *options,
     struct model_catalog *catalog, const struct request *request)
@@ -1198,6 +1354,7 @@ dispatch(int fd, const struct proxy_options *options,
 	const char		*auth_file;
 	int			result;
 
+	/* Health intentionally avoids auth and upstream I/O for local supervisors. */
 	if (strcmp(request->method, "GET") == 0 &&
 	    strcmp(request->path, "/health") == 0) {
 		json_t *health;
@@ -1241,6 +1398,14 @@ dispatch(int fd, const struct proxy_options *options,
 	return result;
 }
 
+/*
+** Refresh the parent's catalog after a worker has been forked.
+**
+** A child cannot update the parent's memory.  Post-fork refresh keeps the
+** active request responsive while allowing later workers to inherit fresh
+** metadata.  Parent refresh never writes auth.json: token renewal remains in
+** the worker to avoid concurrent writers.
+*/
 static void
 refresh_parent_catalog(const struct proxy_options *options,
     struct model_catalog *catalog)
@@ -1250,6 +1415,12 @@ refresh_parent_catalog(const struct proxy_options *options,
 	const char		*auth_file;
 	time_t			now;
 
+	/*
+	 * fork gives each worker a private cache copy.  Refresh only in the parent
+	 * after a worker starts so later workers inherit it without delaying the
+	 * current client.  Workers alone refresh OAuth credentials to avoid two
+	 * processes writing auth.json at once.
+	 */
 	if (options->models != NULL)
 		return;
 	now = time(NULL);
@@ -1269,6 +1440,14 @@ refresh_parent_catalog(const struct proxy_options *options,
 	auth_session_free(&session);
 }
 
+/*
+** Bind the local listener and run the parent worker-management loop.
+**
+** proxy_serve borrows options and returns only after a fatal setup or accept
+** failure.  It resolves the Codex version once, opportunistically warms the
+** catalog for startup display, forks at most MAX_WORKERS connections, reaps
+** children, and releases all parent-owned state on its error exit path.
+*/
 int
 proxy_serve(const struct proxy_options *options, char *error, size_t length)
 {
@@ -1290,6 +1469,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	char		*codex_version;
 	struct proxy_options	effective_options;
 
+	/* The parent owns listener and cache; children own exactly one connection. */
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
 	memset(&action, 0, sizeof(action));
