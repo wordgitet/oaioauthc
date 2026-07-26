@@ -29,6 +29,35 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_end(ap);
 }
 
+static int
+append_header(struct curl_slist **headers, const char *value)
+{
+	struct curl_slist	*next;
+
+	next = curl_slist_append(*headers, value);
+	if (next == NULL)
+		return -1;
+	*headers = next;
+	return 0;
+}
+
+static int
+append_header_value(struct curl_slist **headers, const char *name,
+    const char *value)
+{
+	struct buffer	header;
+	int		result;
+
+	buffer_init(&header);
+	result = buffer_append_string(&header, name);
+	if (result == 0)
+		result = buffer_append_string(&header, value);
+	if (result == 0)
+		result = append_header(headers, header.data);
+	buffer_free(&header);
+	return result;
+}
+
 static size_t
 write_callback(char *data, size_t size, size_t count, void *argument)
 {
@@ -100,7 +129,6 @@ request(const char *url, const char *method, const char *body,
 	struct curl_slist	*headers;
 	struct buffer		response_body;
 	struct write_context	context;
-	char			header[4096];
 
 	memset(response, 0, sizeof(*response));
 	buffer_init(&response_body);
@@ -114,22 +142,20 @@ request(const char *url, const char *method, const char *body,
 		set_error(error, error_length, "could not initialize libcurl");
 		return -1;
 	}
-	headers = curl_slist_append(headers, "Accept: application/json");
-	if (body != NULL)
-		headers = curl_slist_append(headers, content_type == NULL ?
-		    "Content-Type: application/json" : content_type);
-	if (authorization != NULL) {
-		(void)snprintf(header, sizeof(header), "Authorization: Bearer %s",
-		    authorization);
-		headers = curl_slist_append(headers, header);
+	if (append_header(&headers, "Accept: application/json") == -1 ||
+	    (body != NULL && append_header(&headers, content_type == NULL ?
+	    "Content-Type: application/json" : content_type) == -1) ||
+	    (authorization != NULL && append_header_value(&headers,
+	    "Authorization: Bearer ", authorization) == -1) ||
+	    (account_id != NULL && append_header_value(&headers,
+	    "chatgpt-account-id: ", account_id) == -1) ||
+	    (extra_header != NULL &&
+	    append_header(&headers, extra_header) == -1)) {
+		set_error(error, error_length, "could not allocate HTTP headers");
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+		return -1;
 	}
-	if (account_id != NULL) {
-		(void)snprintf(header, sizeof(header), "chatgpt-account-id: %s",
-		    account_id);
-		headers = curl_slist_append(headers, header);
-	}
-	if (extra_header != NULL)
-		headers = curl_slist_append(headers, extra_header);
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
