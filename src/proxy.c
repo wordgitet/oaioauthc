@@ -445,10 +445,13 @@ handle_models(int fd, const struct proxy_options *options,
 		json_array_foreach(models, index, model) {
 			const char *slug;
 			const char *visibility;
+			json_t *supported;
 
 			slug = json_string_value(json_object_get(model, "slug"));
 			visibility = json_string_value(json_object_get(model, "visibility"));
-			if (slug != NULL && (visibility == NULL || strcmp(visibility, "list") == 0)) {
+			supported = json_object_get(model, "supported_in_api");
+			if (slug != NULL && !json_is_false(supported) &&
+			    (visibility == NULL || strcmp(visibility, "list") == 0)) {
 				entry = json_pack("{s:s,s:s,s:i,s:s}", "id", slug, "object",
 				    "model", "created", 0, "owned_by", "codex-oauth");
 				json_array_append_new(data, entry);
