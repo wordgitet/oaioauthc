@@ -60,8 +60,11 @@ json_has_replay_state(json_t *request)
 	if (!json_is_array(input))
 		return 0;
 	json_array_foreach(input, index, item) {
-		if (json_is_object(item) &&
-		    json_equal(json_object_get(item, "type"), json_string("item_reference")) &&
+		const char *type;
+
+		type = json_string_value(json_object_get(item, "type"));
+		if (json_is_object(item) && type != NULL &&
+		    strcmp(type, "item_reference") == 0 &&
 		    json_is_string(json_object_get(item, "id")))
 			return 1;
 	}
@@ -127,14 +130,16 @@ static json_t
 		return json_array();
 	result = json_array();
 	json_array_foreach(content, index, part) {
+		const char *type;
+
 		if (!json_is_object(part))
 			continue;
-		if (json_equal(json_object_get(part, "type"), json_string("text"))) {
+		type = json_string_value(json_object_get(part, "type"));
+		if (type != NULL && strcmp(type, "text") == 0) {
 			json_array_append_new(result, json_pack("{s:s,s:s}", "type",
 			    "input_text", "text", json_string_value(json_object_get(part,
-		    "text"))));
-		} else if (json_equal(json_object_get(part, "type"),
-		    json_string("image_url"))) {
+			    "text"))));
+		} else if (type != NULL && strcmp(type, "image_url") == 0) {
 			json_t *image;
 
 			image = json_object_get(part, "image_url");
@@ -311,8 +316,12 @@ json_t
 			if (!json_is_array(content))
 				continue;
 			json_array_foreach(content, part_index, part) {
-				if (json_equal(json_object_get(part, "type"),
-				    json_string("output_text")) &&
+				const char *part_type;
+
+				part_type = json_string_value(json_object_get(part,
+				    "type"));
+				if (part_type != NULL &&
+				    strcmp(part_type, "output_text") == 0 &&
 				    json_is_string(json_object_get(part, "text"))) {
 					char *next;
 					size_t old_len;
