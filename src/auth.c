@@ -449,30 +449,26 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
     struct auth_session *session, char *error, size_t length)
 {
 	struct http_response	response;
-	struct buffer		body;
-	char			*escaped;
+	json_t			*body;
+	char			*text;
 	int			result;
 
 	if (session->refresh_token == NULL) {
 		set_error(error, length, "auth file has no refresh token");
 		return -1;
 	}
-	escaped = http_form_encode(session->refresh_token);
-	if (escaped == NULL)
+	body = json_pack("{s:s,s:s,s:s}", "grant_type", "refresh_token",
+	    "refresh_token", session->refresh_token, "client_id",
+	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
+	if (body == NULL)
 		return -1;
-	buffer_init(&body);
-	if (buffer_append_string(&body, "grant_type=refresh_token&refresh_token=") == -1 ||
-	    buffer_append_string(&body, escaped) == -1 ||
-	    buffer_append_string(&body, "&client_id=") == -1 ||
-	    buffer_append_string(&body, client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1) {
-		free(escaped);
-		buffer_free(&body);
+	text = json_dump_compact(body);
+	json_decref(body);
+	if (text == NULL)
 		return -1;
-	}
-	free(escaped);
-	result = http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-	    body.data, &response, error, length);
-	buffer_free(&body);
+	result = http_post_json(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
+	    text, NULL, NULL, NULL, &response, error, length);
+	free(text);
 	if (result == -1)
 		return -1;
 	if (response.status < 200 || response.status >= 300) {
