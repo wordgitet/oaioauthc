@@ -207,8 +207,8 @@ http_post_json_stream(const char *url, const char *body,
 }
 
 int
-http_post_form(const char *url, const char *body, struct http_response *response,
-    char *error, size_t error_length)
+http_post_form(const char *url, const char *body,
+    struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, NULL, NULL, NULL,
 	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL,

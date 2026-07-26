@@ -416,7 +416,8 @@ static char
 	base = options->base_url == NULL ? DEFAULT_BASE_URL : options->base_url;
 	buffer_init(&buffer);
 	if (buffer_append_string(&buffer, base) == -1 ||
-	    (base[strlen(base) - 1] == '/' ? 0 : buffer_append_string(&buffer, "/")) == -1 ||
+	    (base[strlen(base) - 1] == '/' ? 0 :
+	    buffer_append_string(&buffer, "/")) == -1 ||
 	    buffer_append_string(&buffer, suffix) == -1) {
 		buffer_free(&buffer);
 		return NULL;
@@ -621,11 +622,16 @@ handle_responses(int fd, const struct proxy_options *options,
 		if (json_has_replay_state(upstream_request)) {
 			json_decref(upstream_request);
 			json_decref(request);
-			return send_error(fd, 400, "Stateless Codex responses endpoint does not support `previous_response_id` or `item_reference`. Replay the full conversation history in `input` on each request.", "invalid_request_error");
+			return send_error(fd, 400,
+			    "Stateless Codex responses endpoint does not support "
+			    "`previous_response_id` or `item_reference`. Replay "
+			    "the full conversation history in `input` on each "
+			    "request.", "invalid_request_error");
 		}
 	}
 	want_stream = json_is_true(json_object_get(upstream_request, "stream"));
-	if (json_normalize_response_request(upstream_request, 1, error, sizeof(error)) == -1) {
+	if (json_normalize_response_request(upstream_request, 1, error,
+	    sizeof(error)) == -1) {
 		json_decref(upstream_request);
 		json_decref(request);
 		return send_error(fd, 400, error, "invalid_request_error");
@@ -695,7 +701,8 @@ handle_responses(int fd, const struct proxy_options *options,
 	}
 	if (response.status < 200 || response.status >= 300) {
 		result = send_response(fd, (int)response.status,
-		    response.content_type == NULL ? "application/json" : response.content_type,
+		    response.content_type == NULL ? "application/json" :
+		    response.content_type,
 		    response.body == NULL ? "" : response.body);
 		http_response_free(&response);
 		sse_chat_stream_free(chat_stream);
@@ -715,7 +722,8 @@ handle_responses(int fd, const struct proxy_options *options,
 			    "completion", "upstream_error");
 		return result;
 	}
-	completed = sse_collect_completed_response(response.body, error, sizeof(error));
+	completed = sse_collect_completed_response(response.body, error,
+	    sizeof(error));
 	http_response_free(&response);
 	if (completed == NULL) {
 		json_decref(request);
@@ -748,7 +756,8 @@ dispatch(int fd, const struct proxy_options *options,
 	const char		*auth_file;
 	int			result;
 
-	if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/health") == 0) {
+	if (strcmp(request->method, "GET") == 0 &&
+	    strcmp(request->path, "/health") == 0) {
 		json_t *health;
 
 		health = json_pack("{s:b,s:s}", "ok", 1, "replay_state", "stateless");
@@ -756,8 +765,10 @@ dispatch(int fd, const struct proxy_options *options,
 		json_decref(health);
 		return result;
 	}
-	auth_file = options->auth_file == NULL ? auth_default_file() : options->auth_file;
-	if (auth_file == NULL || auth_load(auth_file, &session, error, sizeof(error)) == -1)
+	auth_file = options->auth_file == NULL ? auth_default_file() :
+	    options->auth_file;
+	if (auth_file == NULL || auth_load(auth_file, &session, error,
+	    sizeof(error)) == -1)
 		return send_error(fd, 401, error, "authentication_error");
 	if (auth_session_needs_refresh(&session) && auth_refresh(auth_file,
 	    options->client_id, options->token_url, &session, error,
@@ -765,7 +776,8 @@ dispatch(int fd, const struct proxy_options *options,
 		auth_session_free(&session);
 		return send_error(fd, 401, error, "authentication_error");
 	}
-	if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/v1/models") == 0)
+	if (strcmp(request->method, "GET") == 0 &&
+	    strcmp(request->path, "/v1/models") == 0)
 		result = handle_models(fd, options, &session, catalog);
 	else if (strcmp(request->method, "POST") == 0 && strcmp(request->path,
 	    "/v1/responses") == 0)

@@ -22,8 +22,8 @@ void	auth_session_free(struct auth_session *);
 int	auth_load(const char *, struct auth_session *, char *, size_t);
 int	auth_save(const char *, const struct auth_session *, char *, size_t);
 int	auth_session_needs_refresh(const struct auth_session *);
-int	auth_refresh(const char *, const char *, const char *, struct auth_session *,
-	    char *, size_t);
+int	auth_refresh(const char *, const char *, const char *,
+	    struct auth_session *, char *, size_t);
 int	oauth_request_create(const char *, const char *, struct oauth_request *,
 	    char *, size_t);
 void	oauth_request_free(struct oauth_request *);

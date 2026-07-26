@@ -14,8 +14,9 @@ main(void)
 	json_t	*model;
 	int	use_lite;
 
-	request = json_load_string_checked("{\"model\":\"gpt-5.2\",\"input\":\"Hello\",\"max_output_tokens\":5}",
-	    error, sizeof(error));
+	request = json_load_string_checked(
+	    "{\"model\":\"gpt-5.2\",\"input\":\"Hello\","
+	    "\"max_output_tokens\":5}", error, sizeof(error));
 	CHECK(request != NULL);
 	CHECK(json_normalize_response_request(request, 1, error, sizeof(error)) == 0);
 	CHECK(json_is_false(json_object_get(request, "store")));
@@ -26,13 +27,17 @@ main(void)
 	json_decref(request);
 
 	request = json_load_string_checked(
-	    "{\"model\":\"gpt-lite\",\"input\":\"Hello\",\"instructions\":\"Be concise\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\"}]}",
+	    "{\"model\":\"gpt-lite\",\"input\":\"Hello\","
+	    "\"instructions\":\"Be concise\",\"tools\":[{\"type\":"
+	    "\"function\",\"name\":\"lookup\"}]}",
 	    error, sizeof(error));
 	CHECK(request != NULL);
 	CHECK(json_normalize_response_request(request, 1, error,
 	    sizeof(error)) == 0);
 	model = json_load_string_checked(
-	    "{\"slug\":\"gpt-lite\",\"use_responses_lite\":true,\"default_reasoning_level\":\"medium\",\"support_verbosity\":true,\"default_verbosity\":\"low\"}",
+	    "{\"slug\":\"gpt-lite\",\"use_responses_lite\":true,"
+	    "\"default_reasoning_level\":\"medium\","
+	    "\"support_verbosity\":true,\"default_verbosity\":\"low\"}",
 	    error, sizeof(error));
 	CHECK(model != NULL);
 	CHECK(json_apply_model_defaults(request, model, &use_lite, error,
@@ -53,13 +58,19 @@ main(void)
 	CHECK(json_has_replay_state(request) == 1);
 	json_decref(request);
 
-	chat = json_load_string_checked("{\"model\":\"gpt-5.2\",\"messages\":[{\"role\":\"system\",\"content\":\"Be concise\"},{\"role\":\"user\",\"content\":\"Hello\"}],\"stop\":[\"END\"],\"parallel_tool_calls\":false,\"reasoning_effort\":\"high\",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}}",
+	chat = json_load_string_checked(
+	    "{\"model\":\"gpt-5.2\",\"messages\":[{\"role\":\"system\","
+	    "\"content\":\"Be concise\"},{\"role\":\"user\",\"content\":"
+	    "\"Hello\"}],\"stop\":[\"END\"],\"parallel_tool_calls\":false,"
+	    "\"reasoning_effort\":\"high\",\"tool_choice\":{\"type\":"
+	    "\"function\",\"function\":{\"name\":\"lookup\"}}}",
 	    error, sizeof(error));
 	CHECK(chat != NULL);
 	converted = json_chat_to_responses(chat, error, sizeof(error));
 	CHECK(converted != NULL);
 	CHECK(json_array_size(json_object_get(converted, "input")) == 2);
-	CHECK(strcmp(json_string_value(json_object_get(converted, "model")), "gpt-5.2") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(converted, "model")),
+	    "gpt-5.2") == 0);
 	CHECK(json_is_array(json_object_get(converted, "stop")));
 	CHECK(json_is_false(json_object_get(converted, "parallel_tool_calls")));
 	CHECK(strcmp(json_string_value(json_object_get(json_object_get(converted,

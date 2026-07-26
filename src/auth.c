@@ -203,7 +203,8 @@ static char
 	auth = json_object_get(claims, "https://api.openai.com/auth");
 	account = json_is_object(auth) ? json_object_get(auth,
 	    "chatgpt_account_id") : json_object_get(claims, "chatgpt_account_id");
-	result = json_is_string(account) ? oaio_strdup(json_string_value(account)) : NULL;
+	result = json_is_string(account) ?
+	    oaio_strdup(json_string_value(account)) : NULL;
 	json_decref(claims);
 	return result;
 }
@@ -280,7 +281,8 @@ auth_load(const char *path, struct auth_session *session, char *error,
 	json_decref(root);
 	if (session->access_token == NULL || session->account_id == NULL) {
 		auth_session_free(session);
-		set_error(error, length, "auth file does not contain ChatGPT OAuth credentials");
+		set_error(error, length,
+		    "auth file does not contain ChatGPT OAuth credentials");
 		return -1;
 	}
 	return 0;
@@ -308,9 +310,11 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 		json_object_set_new(root, "tokens", tokens);
 	}
 	json_object_set_new(root, "auth_mode", json_string("chatgpt"));
-	json_object_set_new(tokens, "access_token", json_string(session->access_token));
+	json_object_set_new(tokens, "access_token",
+	    json_string(session->access_token));
 	if (session->refresh_token != NULL)
-		json_object_set_new(tokens, "refresh_token", json_string(session->refresh_token));
+		json_object_set_new(tokens, "refresh_token",
+		    json_string(session->refresh_token));
 	if (session->id_token != NULL)
 		json_object_set_new(tokens, "id_token", json_string(session->id_token));
 	json_object_set_new(tokens, "account_id", json_string(session->account_id));
@@ -425,7 +429,8 @@ token_response(const char *text, struct auth_session *session, char *error,
 		session->id_token = oaio_strdup(value);
 	}
 	value = json_string_value(json_object_get(root, "account_id"));
-	account = value == NULL ? jwt_account_id(session->id_token) : oaio_strdup(value);
+	account = value == NULL ? jwt_account_id(session->id_token) :
+	    oaio_strdup(value);
 	if (account == NULL)
 		account = jwt_account_id(session->access_token);
 	if (account == NULL && session->account_id != NULL)
@@ -472,7 +477,8 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 	if (result == -1)
 		return -1;
 	if (response.status < 200 || response.status >= 300) {
-		set_error(error, length, "token refresh failed with HTTP %ld", response.status);
+		set_error(error, length, "token refresh failed with HTTP %ld",
+		    response.status);
 		http_response_free(&response);
 		return -1;
 	}
@@ -507,15 +513,20 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 	escaped_redirect = http_form_encode(redirect_uri);
 	buffer_init(&url);
 	if (challenge == NULL || escaped_redirect == NULL ||
-	    buffer_append_string(&url, DEFAULT_ISSUER "/oauth/authorize?response_type=code&client_id=") == -1 ||
-	    buffer_append_string(&url, client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
+	    buffer_append_string(&url, DEFAULT_ISSUER
+	    "/oauth/authorize?response_type=code&client_id=") == -1 ||
+	    buffer_append_string(&url, client_id == NULL ?
+	    DEFAULT_CLIENT_ID : client_id) == -1 ||
 	    buffer_append_string(&url, "&redirect_uri=") == -1 ||
 	    buffer_append_string(&url, escaped_redirect) == -1 ||
-	    buffer_append_string(&url, "&scope=openid%20profile%20email%20offline_access&state=") == -1 ||
+	    buffer_append_string(&url,
+	    "&scope=openid%20profile%20email%20offline_access&state=") == -1 ||
 	    buffer_append_string(&url, request->state) == -1 ||
 	    buffer_append_string(&url, "&code_challenge=") == -1 ||
 	    buffer_append_string(&url, challenge) == -1 ||
-	    buffer_append_string(&url, "&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true") == -1) {
+	    buffer_append_string(&url, "&code_challenge_method=S256"
+	    "&id_token_add_organizations=true"
+	    "&codex_cli_simplified_flow=true") == -1) {
 		free(challenge);
 		free(escaped_redirect);
 		buffer_free(&url);
@@ -553,7 +564,8 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 	escaped_code = http_form_encode(code);
 	escaped_verifier = http_form_encode(code_verifier);
 	escaped_redirect = http_form_encode(redirect_uri);
-	if (escaped_code == NULL || escaped_verifier == NULL || escaped_redirect == NULL) {
+	if (escaped_code == NULL || escaped_verifier == NULL ||
+	    escaped_redirect == NULL) {
 		free(escaped_code);
 		free(escaped_verifier);
 		free(escaped_redirect);
@@ -565,7 +577,8 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 	(void)buffer_append_string(&body, "&redirect_uri=");
 	(void)buffer_append_string(&body, escaped_redirect);
 	(void)buffer_append_string(&body, "&client_id=");
-	(void)buffer_append_string(&body, client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
+	(void)buffer_append_string(&body, client_id == NULL ?
+	    DEFAULT_CLIENT_ID : client_id);
 	(void)buffer_append_string(&body, "&code_verifier=");
 	(void)buffer_append_string(&body, escaped_verifier);
 	free(escaped_code);
@@ -577,7 +590,8 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 	if (result == -1)
 		return -1;
 	if (response.status < 200 || response.status >= 300) {
-		set_error(error, length, "token exchange failed with HTTP %ld", response.status);
+		set_error(error, length, "token exchange failed with HTTP %ld",
+		    response.status);
 		http_response_free(&response);
 		return -1;
 	}

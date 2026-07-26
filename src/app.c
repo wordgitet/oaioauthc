@@ -192,9 +192,8 @@ run_login(const struct proxy_options *options, int should_open)
 		    strerror(errno));
 		return 1;
 	}
-	if (oauth_request_create("http://localhost:1455/auth/callback", options->client_id,
-	    &oauth,
-	    error, sizeof(error)) == -1) {
+	if (oauth_request_create("http://localhost:1455/auth/callback",
+	    options->client_id, &oauth, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		close(listen_fd);
 		return 1;
