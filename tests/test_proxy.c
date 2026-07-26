@@ -469,6 +469,21 @@ main(void)
 	REQUIRE(read_file(debug_path, &debug_output) == 0);
 	REQUIRE(strstr(debug_output.data,
 	    "client request: {\n  \"model\": \"gpt-test\"") != NULL);
+	REQUIRE(kill(pid, SIGTERM) == 0);
+	REQUIRE(waitpid(pid, &status, 0) == pid);
+	pid = -1;
+	REQUIRE(unlink(path) == 0);
+	REQUIRE(reserve_port(port, sizeof(port)) == 0);
+	pid = fork();
+	REQUIRE(pid != -1);
+	if (pid == 0) {
+		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
+		    "--oauth-file", path, "--base-url", base_url,
+		    "--codex-version", "9.9.9", (char *)NULL);
+		_exit(127);
+	}
+	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "200 OK") != NULL);
 	result = 0;
 
 cleanup:

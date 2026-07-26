@@ -849,12 +849,19 @@ announce_startup(const char *host, const char *port,
 	size_t		count;
 	char		count_text[32];
 	int		length;
+	int		models_available;
 	int		result;
 
 	buffer_init(&message);
 	buffer_init(&names);
-	if (append_startup_models(&names, options, catalog, &count) == -1 ||
-	    (count == 0 && buffer_append_string(&names, "none") == -1))
+	models_available = options->models != NULL || catalog->root != NULL;
+	count = 0;
+	if (models_available) {
+		if (append_startup_models(&names, options, catalog, &count) == -1 ||
+		    (count == 0 &&
+		    buffer_append_string(&names, "none") == -1))
+			goto fail;
+	} else if (buffer_append_string(&names, "unavailable") == -1)
 		goto fail;
 	length = snprintf(count_text, sizeof(count_text), "%zu", count);
 	if (length < 0 || (size_t)length >= sizeof(count_text))
@@ -863,9 +870,14 @@ announce_startup(const char *host, const char *port,
 	    buffer_append_string(&message, host) == -1 ||
 	    buffer_append_string(&message, ":") == -1 ||
 	    buffer_append_string(&message, port) == -1 ||
-	    buffer_append_string(&message, "/v1\n  Models (") == -1 ||
+	    buffer_append_string(&message, "/v1\n  Models") == -1)
+		goto fail;
+	if (models_available &&
+	    (buffer_append_string(&message, " (") == -1 ||
 	    buffer_append(&message, count_text, (size_t)length) == -1 ||
-	    buffer_append_string(&message, "): ") == -1 ||
+	    buffer_append_string(&message, ")") == -1))
+		goto fail;
+	if (buffer_append_string(&message, ": ") == -1 ||
 	    buffer_append(&message, names.data, names.len) == -1 ||
 	    buffer_append_string(&message, "\n  Stop: Ctrl-C\n") == -1)
 		goto fail;
@@ -1241,8 +1253,8 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	size_t		workers;
 	struct sigaction	action;
 	struct request	request;
-	struct auth_session session;
-	struct model_catalog catalog;
+	struct auth_session	session;
+	struct model_catalog	catalog;
 	const char	*host;
 	const char	*port;
 	const char	*auth_file;
@@ -1298,28 +1310,15 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	if (options->models == NULL) {
 		auth_file = options->auth_file == NULL ? auth_default_file() :
 		    options->auth_file;
-		if (auth_file == NULL || auth_load(auth_file, &session, error,
-		    length) == -1) {
-			close(listen_fd);
-			free(codex_version);
-			return -1;
-		}
-		if (auth_session_needs_refresh(&session) && auth_refresh(auth_file,
-		    options->client_id, options->token_url, &session, error,
-		    length) == -1) {
+		if (auth_file != NULL && auth_load(auth_file, &session, error,
+		    length) == 0) {
+			if ((!auth_session_needs_refresh(&session) ||
+			    auth_refresh(auth_file, options->client_id,
+			    options->token_url, &session, error, length) == 0))
+				(void)load_model_catalog(&effective_options,
+				    &session, &catalog, error, length);
 			auth_session_free(&session);
-			close(listen_fd);
-			free(codex_version);
-			return -1;
 		}
-		if (load_model_catalog(&effective_options, &session, &catalog, error,
-		    length) == -1) {
-			auth_session_free(&session);
-			close(listen_fd);
-			free(codex_version);
-			return -1;
-		}
-		auth_session_free(&session);
 	}
 	if (announce_startup(host, port, &effective_options, &catalog) == -1) {
 		model_catalog_free(&catalog);
