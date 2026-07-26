@@ -134,7 +134,7 @@ send_mock_response(int fd, const char *content_type, const char *body)
 }
 
 static void
-run_mock_upstream(const char *port)
+run_mock_upstream(const char *port, int ready_fd)
 {
 	static const char models[] =
 	    "{\"models\":[{\"slug\":\"gpt-test\",\"visibility\":\"list\","
@@ -156,12 +156,17 @@ run_mock_upstream(const char *port)
 	    "{\"created\":1,\"data\":[{\"b64_json\":\"AQID\"}],"
 	    "\"usage\":{\"total_tokens\":5}}";
 	char	request[32768];
+	char	ready;
 	int	client_fd;
 	int	listen_fd;
 
 	listen_fd = listen_port(port);
 	if (listen_fd == -1)
 		_exit(1);
+	ready = 1;
+	if (write_all(ready_fd, &ready, sizeof(ready)) == -1)
+		_exit(1);
+	close(ready_fd);
 	for (;;) {
 		client_fd = accept(listen_fd, NULL, NULL);
 		if (client_fd == -1)
@@ -303,14 +308,18 @@ main(void)
 	pid_t	pid;
 	int	fd;
 	int	debug_fd;
+	int	mock_ready[2];
 	int	result;
 	int	slow_fd;
 	int	status;
+	char	ready;
 
 	pid = -1;
 	mock_pid = -1;
 	slow_fd = -1;
 	debug_fd = -1;
+	mock_ready[0] = -1;
+	mock_ready[1] = -1;
 	result = 1;
 	buffer_init(&debug_output);
 	fd = mkstemp(path);
@@ -327,10 +336,18 @@ main(void)
 	REQUIRE(reserve_port(mock_port, sizeof(mock_port)) == 0);
 	REQUIRE(snprintf(base_url, sizeof(base_url), "http://127.0.0.1:%s",
 	    mock_port) < (int)sizeof(base_url));
+	REQUIRE(pipe(mock_ready) == 0);
 	mock_pid = fork();
 	REQUIRE(mock_pid != -1);
-	if (mock_pid == 0)
-		run_mock_upstream(mock_port);
+	if (mock_pid == 0) {
+		close(mock_ready[0]);
+		run_mock_upstream(mock_port, mock_ready[1]);
+	}
+	close(mock_ready[1]);
+	mock_ready[1] = -1;
+	REQUIRE(read(mock_ready[0], &ready, sizeof(ready)) == sizeof(ready));
+	close(mock_ready[0]);
+	mock_ready[0] = -1;
 	pid = fork();
 	REQUIRE(pid != -1);
 	if (pid == 0) {
@@ -491,6 +508,10 @@ cleanup:
 	buffer_free(&debug_output);
 	if (debug_fd != -1)
 		close(debug_fd);
+	if (mock_ready[0] != -1)
+		close(mock_ready[0]);
+	if (mock_ready[1] != -1)
+		close(mock_ready[1]);
 	if (slow_fd != -1)
 		close(slow_fd);
 	if (pid > 0) {
