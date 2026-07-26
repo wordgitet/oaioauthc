@@ -167,6 +167,7 @@ debug_sensitive_key(const char *key)
 		"api_key",
 		"authorization",
 		"encrypted_content",
+		"id_token",
 		"refresh_token"
 	};
 	size_t	index;
@@ -192,8 +193,7 @@ debug_json_copy(json_t *value)
 
 	if (json_is_string(value)) {
 		string = json_string_value(value);
-		if (strncmp(string, "data:", 5) == 0 &&
-		    strstr(string, ";base64,") != NULL) {
+		if (strncasecmp(string, "data:", 5) == 0) {
 			(void)snprintf(redacted, sizeof(redacted),
 			    "[redacted data URL: %zu characters]", strlen(string));
 			return json_string(redacted);

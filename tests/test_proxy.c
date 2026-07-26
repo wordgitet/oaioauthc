@@ -358,7 +358,10 @@ main(void)
 	REQUIRE(strstr(response, "\"id\":\"gpt-test\"") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
 	    "{\"model\":\"gpt-test\",\"input\":\"hi\","
-	    "\"access_token\":\"debug-secret\"}", response, sizeof(response)) == 0);
+	    "\"access_token\":\"debug-secret\","
+	    "\"id_token\":\"identity-secret\",\"metadata\":{"
+	    "\"asset\":\"DATA:image/svg+xml,%3Csvg/%3E\"}}",
+	    response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"status\":\"completed\"") != NULL);
 	REQUIRE(strstr(response, "\"text\":\"hello\"") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
@@ -429,7 +432,11 @@ main(void)
 	REQUIRE(strstr(debug_output.data, "data:image/png;base64,YWJj") == NULL);
 	REQUIRE(strstr(debug_output.data, "\"access_token\":\"[redacted]\"") !=
 	    NULL);
+	REQUIRE(strstr(debug_output.data, "\"id_token\":\"[redacted]\"") !=
+	    NULL);
 	REQUIRE(strstr(debug_output.data, "debug-secret") == NULL);
+	REQUIRE(strstr(debug_output.data, "identity-secret") == NULL);
+	REQUIRE(strstr(debug_output.data, "DATA:image/svg+xml") == NULL);
 	REQUIRE(strstr(debug_output.data, "acct_1") == NULL);
 	REQUIRE(kill(pid, SIGTERM) == 0);
 	REQUIRE(waitpid(pid, &status, 0) == pid);
