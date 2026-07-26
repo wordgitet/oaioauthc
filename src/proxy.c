@@ -6,6 +6,7 @@
 #include "util.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
 #include <signal.h>
@@ -22,7 +23,9 @@
 #include <unistd.h>
 
 #define DEFAULT_BASE_URL "https://chatgpt.com/backend-api/codex"
-#define DEFAULT_CODEX_VERSION "0.145.0"
+#define DEFAULT_CODEX_VERSION "0.144.1"
+#define CODEX_REGISTRY_URL \
+	"https://registry.npmjs.org/@openai/codex/latest"
 #define MAX_REQUEST_SIZE (8 * 1024 * 1024)
 #define CLIENT_TIMEOUT 30
 #define MAX_WORKERS 32
@@ -425,6 +428,60 @@ static char
 	return buffer_steal(&buffer);
 }
 
+static int
+valid_codex_version(const char *version)
+{
+	int	segment;
+
+	if (version == NULL)
+		return 0;
+	for (segment = 0; segment < 3; segment++) {
+		if (!isdigit((unsigned char)*version))
+			return 0;
+		while (isdigit((unsigned char)*version))
+			version++;
+		if (segment < 2) {
+			if (*version != '.')
+				return 0;
+			version++;
+		}
+	}
+	return *version == '\0';
+}
+
+static char *
+resolve_codex_version(const struct proxy_options *options)
+{
+	struct http_response	response;
+	char			error[256];
+	const char		*version;
+	char			*result;
+	json_t			*root;
+
+	if (valid_codex_version(options->codex_version))
+		return oaio_strdup(options->codex_version);
+	result = NULL;
+	if (http_get(CODEX_REGISTRY_URL, NULL, NULL, &response, error,
+	    sizeof(error)) == 0) {
+		if (response.status >= 200 && response.status < 300) {
+			root = json_loads(response.body, 0, NULL);
+			version = json_string_value(json_object_get(root,
+			    "version"));
+			if (valid_codex_version(version))
+				result = oaio_strdup(version);
+			json_decref(root);
+		}
+		http_response_free(&response);
+	}
+	if (result == NULL) {
+		(void)fprintf(stderr, "Warning: could not determine the latest "
+		    "Codex version; using %s. Pass --codex-version to "
+		    "override it.\n", DEFAULT_CODEX_VERSION);
+		result = oaio_strdup(DEFAULT_CODEX_VERSION);
+	}
+	return result;
+}
+
 static void
 model_catalog_free(struct model_catalog *catalog)
 {
@@ -808,6 +865,8 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	struct request	request;
 	const char	*host;
 	const char	*port;
+	char		*codex_version;
+	struct proxy_options	effective_options;
 
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
@@ -847,6 +906,14 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		    strerror(errno));
 		return -1;
 	}
+	codex_version = resolve_codex_version(options);
+	if (codex_version == NULL) {
+		close(listen_fd);
+		set_error(error, length, "could not resolve Codex version");
+		return -1;
+	}
+	effective_options = *options;
+	effective_options.codex_version = codex_version;
 	(void)fprintf(stderr, "OpenAI-compatible endpoint ready at http://%s:%s/v1\n",
 	    host, port);
 	workers = 0;
@@ -885,7 +952,8 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 				    "Malformed HTTP request.",
 				    "invalid_request_error");
 			else {
-				(void)dispatch(client_fd, options, &catalog,
+				(void)dispatch(client_fd, &effective_options,
+				    &catalog,
 				    &request);
 				request_free(&request);
 			}
@@ -897,6 +965,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		close(client_fd);
 	}
 	close(listen_fd);
+	free(codex_version);
 	set_error(error, length, "server accept failed: %s", strerror(errno));
 	return -1;
 }
