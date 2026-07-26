@@ -237,14 +237,16 @@ fail:
 }
 
 static json_t
-*chat_content_to_input(json_t *content)
+*chat_content_to_input(json_t *content, int assistant)
 {
+	const char	*text_type;
 	json_t	*part;
 	json_t	*result;
 	size_t	index;
 
+	text_type = assistant ? "output_text" : "input_text";
 	if (json_is_string(content))
-		return json_pack("[{s:s,s:s}]", "type", "input_text", "text",
+		return json_pack("[{s:s,s:s}]", "type", text_type, "text",
 		    json_string_value(content));
 	if (!json_is_array(content))
 		return json_array();
@@ -257,9 +259,16 @@ static json_t
 		type = json_string_value(json_object_get(part, "type"));
 		if (type != NULL && strcmp(type, "text") == 0) {
 			json_array_append_new(result, json_pack("{s:s,s:s}", "type",
-			    "input_text", "text", json_string_value(json_object_get(part,
+			    text_type, "text", json_string_value(json_object_get(part,
 			    "text"))));
-		} else if (type != NULL && strcmp(type, "image_url") == 0) {
+		} else if (assistant && type != NULL &&
+		    strcmp(type, "refusal") == 0 &&
+		    json_is_string(json_object_get(part, "refusal"))) {
+			json_array_append_new(result, json_pack("{s:s,s:s}", "type",
+			    "refusal", "refusal", json_string_value(json_object_get(part,
+			    "refusal"))));
+		} else if (!assistant && type != NULL &&
+		    strcmp(type, "image_url") == 0) {
 			json_t *image;
 
 			image = json_object_get(part, "image_url");
@@ -299,6 +308,7 @@ json_t
 	json_array_foreach(messages, index, message) {
 		const char *role;
 		json_t *converted;
+		int assistant;
 
 		if (!json_is_object(message) || !json_is_string(json_object_get(message,
 		    "role")))
@@ -316,11 +326,18 @@ json_t
 				    "output", json_deep_copy(content)));
 			continue;
 		}
-		converted = chat_content_to_input(json_object_get(message, "content"));
+		assistant = strcmp(role, "assistant") == 0;
+		converted = chat_content_to_input(json_object_get(message,
+		    "content"), assistant);
+		if (assistant &&
+		    json_is_string(json_object_get(message, "refusal")))
+			json_array_append_new(converted, json_pack("{s:s,s:s}", "type",
+			    "refusal", "refusal", json_string_value(json_object_get(
+			    message, "refusal"))));
 		json_array_append_new(input, json_pack("{s:s,s:o}", "role",
 		    strcmp(role, "developer") == 0 || strcmp(role, "system") == 0 ?
 		    "developer" : role, "content", converted));
-		if (strcmp(role, "assistant") == 0 &&
+		if (assistant &&
 		    json_is_array(json_object_get(message, "tool_calls"))) {
 			json_t *calls;
 			json_t *call;

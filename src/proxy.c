@@ -1,6 +1,7 @@
 #include "proxy.h"
 #include "auth.h"
 #include "http.h"
+#include "images.h"
 #include "json.h"
 #include "sse.h"
 #include "util.h"
@@ -25,14 +26,17 @@
 #define DEFAULT_BASE_URL "https://chatgpt.com/backend-api/codex"
 #define CODEX_REGISTRY_URL \
 	"https://registry.npmjs.org/@openai/codex/latest"
-#define MAX_REQUEST_SIZE (8 * 1024 * 1024)
+#define MAX_REQUEST_SIZE ((size_t)8 * 1024 * 1024)
+#define MAX_HEADER_SIZE ((size_t)64 * 1024)
 #define CLIENT_TIMEOUT 30
 #define MAX_WORKERS 32
 
 struct request {
 	char	*method;
 	char	*path;
+	char	*content_type;
 	char	*body;
+	size_t	 body_length;
 };
 
 struct model_catalog {
@@ -160,12 +164,13 @@ request_free(struct request *request)
 {
 	free(request->method);
 	free(request->path);
+	free(request->content_type);
 	free(request->body);
 	memset(request, 0, sizeof(*request));
 }
 
 static int
-read_more(int fd, struct buffer *buffer)
+read_more(int fd, struct buffer *buffer, size_t limit)
 {
 	char	chunk[4096];
 	ssize_t	count;
@@ -173,7 +178,8 @@ read_more(int fd, struct buffer *buffer)
 	do {
 		count = read(fd, chunk, sizeof(chunk));
 	} while (count == -1 && errno == EINTR);
-	if (count <= 0 || buffer->len > MAX_REQUEST_SIZE - (size_t)count)
+	if (count <= 0 || (size_t)count > limit ||
+	    buffer->len > limit - (size_t)count)
 		return -1;
 	return buffer_append(buffer, chunk, (size_t)count);
 }
@@ -202,7 +208,7 @@ parse_content_length(const char *value, size_t *length)
 
 static int
 read_chunked_body(int fd, struct buffer *raw, size_t cursor,
-    struct request *request)
+    size_t body_limit, size_t raw_limit, struct request *request)
 {
 	struct buffer	body;
 	char		*end;
@@ -214,7 +220,7 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 	buffer_init(&body);
 	for (;;) {
 		while ((line_end = strstr(raw->data + cursor, "\r\n")) == NULL) {
-			if (read_more(fd, raw) == -1)
+			if (read_more(fd, raw, raw_limit) == -1)
 				goto fail;
 		}
 		line_length = (size_t)(line_end - (raw->data + cursor));
@@ -228,7 +234,7 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 			end++;
 		if (errno != 0 || end == number ||
 		    (*end != '\0' && *end != ';') ||
-		    chunk_length > MAX_REQUEST_SIZE - body.len)
+		    chunk_length > body_limit - body.len)
 			goto fail;
 		cursor = (size_t)(line_end - raw->data) + 2;
 		if (chunk_length == 0) {
@@ -240,13 +246,13 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 				if (strstr(raw->data + cursor,
 				    "\r\n\r\n") != NULL)
 					break;
-				if (read_more(fd, raw) == -1)
+				if (read_more(fd, raw, raw_limit) == -1)
 					goto fail;
 			}
 			break;
 		}
 		while (raw->len - cursor < (size_t)chunk_length + 2) {
-			if (read_more(fd, raw) == -1)
+			if (read_more(fd, raw, raw_limit) == -1)
 				goto fail;
 		}
 		if (raw->data[cursor + (size_t)chunk_length] != '\r' ||
@@ -257,6 +263,7 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 			goto fail;
 		cursor += (size_t)chunk_length + 2;
 	}
+	request->body_length = body.len;
 	request->body = buffer_steal(&body);
 	return request->body == NULL ? -1 : 0;
 
@@ -283,6 +290,10 @@ read_request(int fd, struct request *request)
 	size_t		body_offset;
 	size_t		length;
 	size_t		parsed_length;
+	size_t		body_limit;
+	size_t		raw_limit;
+	size_t		copied;
+	ssize_t		count;
 	int		has_content_length;
 	int		expect_continue;
 	int		chunked;
@@ -292,7 +303,7 @@ read_request(int fd, struct request *request)
 	buffer_init(&buffer);
 	while ((header_end = buffer.data == NULL ? NULL : strstr(buffer.data,
 	    "\r\n\r\n")) == NULL) {
-		if (read_more(fd, &buffer) == -1) {
+		if (read_more(fd, &buffer, MAX_HEADER_SIZE) == -1) {
 			buffer_free(&buffer);
 			return -1;
 		}
@@ -375,6 +386,21 @@ read_request(int fd, struct request *request)
 				buffer_free(&buffer);
 				return -1;
 			}
+		} else if (strcasecmp(header, "Content-Type") == 0) {
+			if (request->content_type != NULL &&
+			    strcasecmp(request->content_type, value) != 0) {
+				request_free(request);
+				buffer_free(&buffer);
+				return -1;
+			}
+			if (request->content_type == NULL) {
+				request->content_type = oaio_strdup(value);
+				if (request->content_type == NULL) {
+					request_free(request);
+					buffer_free(&buffer);
+					return -1;
+				}
+			}
 		}
 		if (last_header)
 			break;
@@ -385,11 +411,14 @@ read_request(int fd, struct request *request)
 		buffer_free(&buffer);
 		return -1;
 	}
-	if (length > MAX_REQUEST_SIZE) {
+	body_limit = strcmp(request->path, "/v1/images/edits") == 0 ?
+	    IMAGE_MAX_EDIT_BODY : MAX_REQUEST_SIZE;
+	if (length > body_limit || body_offset > (size_t)-1 - body_limit) {
 		request_free(request);
 		buffer_free(&buffer);
 		return -1;
 	}
+	raw_limit = body_offset + body_limit;
 	if (expect_continue &&
 	    write_all(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25) == -1) {
 		request_free(request);
@@ -397,7 +426,8 @@ read_request(int fd, struct request *request)
 		return -1;
 	}
 	if (chunked) {
-		if (read_chunked_body(fd, &buffer, body_offset, request) == -1) {
+		if (read_chunked_body(fd, &buffer, body_offset, body_limit,
+		    raw_limit, request) == -1) {
 			request_free(request);
 			buffer_free(&buffer);
 			return -1;
@@ -405,21 +435,29 @@ read_request(int fd, struct request *request)
 		buffer_free(&buffer);
 		return 0;
 	}
-	while (buffer.len - body_offset < length) {
-		if (read_more(fd, &buffer) == -1) {
-			request_free(request);
-			buffer_free(&buffer);
-			return -1;
-		}
-	}
 	request->body = malloc(length + 1);
 	if (request->body == NULL) {
 		request_free(request);
 		buffer_free(&buffer);
 		return -1;
 	}
-	memcpy(request->body, buffer.data + body_offset, length);
+	copied = buffer.len - body_offset;
+	if (copied > length)
+		copied = length;
+	memcpy(request->body, buffer.data + body_offset, copied);
+	while (copied < length) {
+		do {
+			count = read(fd, request->body + copied, length - copied);
+		} while (count == -1 && errno == EINTR);
+		if (count <= 0) {
+			request_free(request);
+			buffer_free(&buffer);
+			return -1;
+		}
+		copied += (size_t)count;
+	}
 	request->body[length] = '\0';
+	request->body_length = length;
 	buffer_free(&buffer);
 	return 0;
 }
@@ -834,6 +872,72 @@ handle_responses(int fd, const struct proxy_options *options,
 }
 
 static int
+content_type_is_multipart(const char *content_type)
+{
+	const char	*end;
+	size_t		 length;
+
+	if (content_type == NULL)
+		return 0;
+	while (*content_type == ' ' || *content_type == '\t')
+		content_type++;
+	end = strchr(content_type, ';');
+	if (end == NULL)
+		end = content_type + strlen(content_type);
+	while (end > content_type &&
+	    (end[-1] == ' ' || end[-1] == '\t'))
+		end--;
+	length = (size_t)(end - content_type);
+	return length == sizeof("multipart/form-data") - 1 &&
+	    strncasecmp(content_type, "multipart/form-data", length) == 0;
+}
+
+static int
+handle_image(int fd, const struct proxy_options *options,
+    const struct auth_session *session, const struct request *request,
+    int edit)
+{
+	struct http_response	response;
+	char			error[256];
+	char			*prepared;
+	char			*url;
+	int			 prepared_result;
+	int			 result;
+
+	if (edit && !content_type_is_multipart(request->content_type))
+		return send_error(fd, 400, "Image editing requires a "
+		    "multipart/form-data request body.", "invalid_request_error");
+	if (edit)
+		prepared_result = image_prepare_edit(request->content_type,
+		    request->body, request->body_length, &prepared, error,
+		    sizeof(error));
+	else
+		prepared_result = image_prepare_generation(request->body,
+		    request->body_length, &prepared, error, sizeof(error));
+	if (prepared_result != IMAGE_RESULT_OK)
+		return send_error(fd, prepared_result == IMAGE_RESULT_NOMEM ?
+		    500 : 400, error, prepared_result == IMAGE_RESULT_NOMEM ?
+		    "server_error" : "invalid_request_error");
+	url = upstream_url(options, edit ? "images/edits" :
+	    "images/generations");
+	if (url == NULL) {
+		free(prepared);
+		return send_error(fd, 500, "out of memory", "server_error");
+	}
+	result = http_post_json(url, prepared, session->access_token,
+	    session->account_id, NULL, &response, error, sizeof(error));
+	free(url);
+	free(prepared);
+	if (result == -1)
+		return send_error(fd, 502, error, "upstream_error");
+	result = send_response(fd, (int)response.status,
+	    response.content_type == NULL ? "application/json" :
+	    response.content_type, response.body == NULL ? "" : response.body);
+	http_response_free(&response);
+	return result;
+}
+
+static int
 dispatch(int fd, const struct proxy_options *options,
     struct model_catalog *catalog, const struct request *request)
 {
@@ -873,6 +977,12 @@ dispatch(int fd, const struct proxy_options *options,
 	    "/v1/chat/completions") == 0)
 		result = handle_responses(fd, options, &session, catalog,
 		    request->body, 1);
+	else if (strcmp(request->method, "POST") == 0 && strcmp(request->path,
+	    "/v1/images/generations") == 0)
+		result = handle_image(fd, options, &session, request, 0);
+	else if (strcmp(request->method, "POST") == 0 && strcmp(request->path,
+	    "/v1/images/edits") == 0)
+		result = handle_image(fd, options, &session, request, 1);
 	else
 		result = send_error(fd, 404, "Route not found.", "not_found_error");
 	auth_session_free(&session);

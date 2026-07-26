@@ -170,6 +170,9 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);
 	if (body != NULL)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	if (body != NULL)
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+		    (curl_off_t)strlen(body));
 	code = curl_easy_perform(curl);
 	if (code != CURLE_OK) {
 		set_error(error, error_length, "upstream request failed: %s",

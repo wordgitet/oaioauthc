@@ -2,7 +2,8 @@
 
 `oaioauthc` is a small C99, local-only OpenAI-compatible proxy for a ChatGPT
 OAuth session. It is compatible with the core local routes of `openai-oauth`:
-`/health`, `/v1/models`, `/v1/responses`, and `/v1/chat/completions`.
+`/health`, `/v1/models`, `/v1/responses`, `/v1/chat/completions`,
+`/v1/images/generations`, and `/v1/images/edits`.
 
 ## Build
 
@@ -29,7 +30,12 @@ Completions requests must specify one explicitly. The Codex client version is
 discovered automatically at startup; use `--codex-version` to provide an
 explicit version when the registry is unavailable.
 
-Image-generation routes are not implemented.
+Image generation and editing requests must also specify `model`; the proxy does
+not hardcode an image-model name. Edits accept OpenAI-compatible
+`multipart/form-data`, with `image` or `image[]` files, and convert up to five
+50 MB reference images to the Codex JSON format. For `openai-oauth`
+compatibility, streaming image requests, masks, and unsupported options return
+an `invalid_request_error`.
 
 The project is unaffiliated with OpenAI; treat stored OAuth credentials as
 passwords.

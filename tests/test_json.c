@@ -81,6 +81,27 @@ main(void)
 	json_decref(chat);
 
 	chat = json_load_string_checked(
+	    "{\"model\":\"gpt-test\",\"stream\":true,\"messages\":["
+	    "{\"role\":\"user\",\"content\":\"Hello\"},"
+	    "{\"role\":\"assistant\",\"content\":\"Hi there\"},"
+	    "{\"role\":\"user\",\"content\":\"Continue\"}]}",
+	    error, sizeof(error));
+	CHECK(chat != NULL);
+	converted = json_chat_to_responses(chat, error, sizeof(error));
+	CHECK(converted != NULL);
+	CHECK(strcmp(json_string_value(json_object_get(json_array_get(
+	    json_object_get(json_array_get(json_object_get(converted, "input"),
+	    0), "content"), 0), "type")), "input_text") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(json_array_get(
+	    json_object_get(json_array_get(json_object_get(converted, "input"),
+	    1), "content"), 0), "type")), "output_text") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(json_array_get(
+	    json_object_get(json_array_get(json_object_get(converted, "input"),
+	    2), "content"), 0), "type")), "input_text") == 0);
+	json_decref(converted);
+	json_decref(chat);
+
+	chat = json_load_string_checked(
 	    "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}",
 	    error, sizeof(error));
 	CHECK(chat != NULL);

@@ -151,6 +151,9 @@ run_mock_upstream(const char *port)
 	    "\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3,"
 	    "\"input_tokens_details\":{\"cached_tokens\":1},"
 	    "\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n";
+	static const char image[] =
+	    "{\"created\":1,\"data\":[{\"b64_json\":\"AQID\"}],"
+	    "\"usage\":{\"total_tokens\":5}}";
 	char	request[32768];
 	int	client_fd;
 	int	listen_fd;
@@ -169,6 +172,20 @@ run_mock_upstream(const char *port)
 			else if (strncmp(request, "POST /responses ", 16) == 0)
 				(void)send_mock_response(client_fd,
 				    "text/event-stream", events);
+			else if (strncmp(request,
+			    "POST /images/generations ", 25) == 0 &&
+			    strstr(request, "\"model\":\"image-model\"") != NULL &&
+			    strstr(request, "\"prompt\":\"draw a square\"") != NULL &&
+			    strstr(request, "\"ignored\"") == NULL)
+				(void)send_mock_response(client_fd,
+				    "application/json", image);
+			else if (strncmp(request, "POST /images/edits ", 19) == 0 &&
+			    strstr(request, "\"model\":\"image-model\"") != NULL &&
+			    strstr(request, "\"prompt\":\"add a red hat\"") != NULL &&
+			    strstr(request,
+			    "\"image_url\":\"data:image/png;base64,YWJj\"") != NULL)
+				(void)send_mock_response(client_fd,
+				    "application/json", image);
 			else
 				(void)send_mock_response(client_fd,
 				    "application/json", "{}");
@@ -237,6 +254,23 @@ request_json(const char *port, const char *path, const char *body,
 }
 
 static int
+request_multipart(const char *port, const char *path, const char *boundary,
+    const char *body, char *response, size_t response_length)
+{
+	char	request[4096];
+	int	length;
+
+	length = snprintf(request, sizeof(request),
+	    "POST %s HTTP/1.1\r\nHost: localhost\r\n"
+	    "Content-Type: multipart/form-data; boundary=%s\r\n"
+	    "Content-Length: %zu\r\n\r\n%s", path, boundary, strlen(body),
+	    body);
+	if (length < 0 || (size_t)length >= sizeof(request))
+		return -1;
+	return request_port(port, request, response, response_length);
+}
+
+static int
 wait_for_proxy(const char *port, char *response, size_t length)
 {
 	struct timespec	delay;
@@ -261,6 +295,7 @@ main(void)
 	char	mock_port[16];
 	char	port[16];
 	char	response[16384];
+	const char	*edit_body;
 	pid_t	mock_pid;
 	pid_t	pid;
 	int	fd;
@@ -329,6 +364,34 @@ main(void)
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
 	REQUIRE(strstr(response, "\"reasoning_tokens\":1") != NULL);
 	REQUIRE(strstr(response, "data: [DONE]") != NULL);
+	REQUIRE(request_json(port, "/v1/images/generations",
+	    "{\"model\":\"image-model\",\"prompt\":\"draw a square\","
+	    "\"response_format\":\"b64_json\",\"ignored\":true}", response,
+	    sizeof(response)) == 0);
+	REQUIRE(strstr(response, "\"b64_json\":\"AQID\"") != NULL);
+	edit_body =
+	    "--edit\r\n"
+	    "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+	    "image-model\r\n"
+	    "--edit\r\n"
+	    "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+	    "add a red hat\r\n"
+	    "--edit\r\n"
+	    "Content-Disposition: form-data; name=\"image\"; "
+	    "filename=\"input.png\"\r\n"
+	    "Content-Type: image/png\r\n\r\n"
+	    "abc\r\n"
+	    "--edit--\r\n";
+	REQUIRE(request_multipart(port, "/v1/images/edits", "edit",
+	    edit_body, response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "\"b64_json\":\"AQID\"") != NULL);
+	REQUIRE(request_json(port, "/v1/images/generations",
+	    "{\"prompt\":\"draw a square\"}", response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "400 Error") != NULL);
+	REQUIRE(strstr(response, "`model`") != NULL);
+	REQUIRE(request_json(port, "/v1/images/edits", "{}",
+	    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "multipart/form-data") != NULL);
 	REQUIRE(request_port(port, "POST /missing HTTP/1.1\r\n"
 	    "Host: localhost\r\ncontent-length: 2\r\n\r\n{}",
 	    response, sizeof(response)) == 0);
