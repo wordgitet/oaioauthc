@@ -13,12 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #define DEFAULT_BASE_URL "https://chatgpt.com/backend-api/codex"
 #define DEFAULT_CODEX_VERSION "0.145.0"
 #define MAX_REQUEST_SIZE (8 * 1024 * 1024)
+#define CLIENT_TIMEOUT 30
 
 struct request {
 	char	*method;
@@ -36,6 +38,19 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_start(ap, format);
 	(void)vsnprintf(error, length, format, ap);
 	va_end(ap);
+}
+
+static void
+set_client_timeout(int fd)
+{
+	struct timeval	timeout;
+
+	timeout.tv_sec = CLIENT_TIMEOUT;
+	timeout.tv_usec = 0;
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+	    sizeof(timeout));
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+	    sizeof(timeout));
 }
 
 static int
@@ -496,6 +511,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 				continue;
 			break;
 		}
+		set_client_timeout(client_fd);
 		if (read_request(client_fd, &request) == -1)
 			(void)send_error(client_fd, 400, "Malformed HTTP request.",
 			    "invalid_request_error");

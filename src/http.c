@@ -8,6 +8,8 @@
 #include <string.h>
 #include <strings.h>
 
+#define MAX_RESPONSE_SIZE (64 * 1024 * 1024)
+
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
@@ -27,7 +29,12 @@ write_callback(char *data, size_t size, size_t count, void *argument)
 	size_t		length;
 
 	body = argument;
+	if (count != 0 && size > (size_t)-1 / count)
+		return 0;
 	length = size * count;
+	if (body->len > MAX_RESPONSE_SIZE ||
+	    length > MAX_RESPONSE_SIZE - body->len)
+		return 0;
 	if (buffer_append(body, data, length) == -1)
 		return 0;
 	return length;
@@ -102,6 +109,9 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "oaioauthc/0.1.0");
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);
 	if (body != NULL)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 	code = curl_easy_perform(curl);
