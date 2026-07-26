@@ -515,6 +515,10 @@ load_model_catalog(const struct proxy_options *options,
 	char			*url;
 	char			*version;
 	json_t			*root;
+	json_t			*models;
+	json_t			*model;
+	size_t			index;
+	int			valid_models;
 
 	if (catalog->root != NULL && catalog->account_id != NULL &&
 	    strcmp(catalog->account_id, session->account_id) == 0 &&
@@ -556,10 +560,19 @@ load_model_catalog(const struct proxy_options *options,
 	}
 	root = json_load_string_checked(response.body, error, length);
 	http_response_free(&response);
-	if (!json_is_object(root) ||
-	    !json_is_array(json_object_get(root, "models"))) {
+	models = json_object_get(root, "models");
+	valid_models = 0;
+	if (json_is_array(models)) {
+		json_array_foreach(models, index, model) {
+			if (json_is_string(json_object_get(model, "slug")))
+				valid_models++;
+		}
+	}
+	if (!json_is_object(root) || !json_is_array(models) ||
+	    valid_models == 0) {
 		json_decref(root);
-		set_error(error, length, "Codex returned a malformed models response");
+		set_error(error, length,
+		    "Codex returned an empty or malformed models response");
 		return -1;
 	}
 	model_catalog_free(catalog);
@@ -653,6 +666,11 @@ handle_models(int fd, const struct proxy_options *options,
 				json_array_append_new(data, entry);
 			}
 		}
+	}
+	if (json_array_size(data) == 0) {
+		json_decref(data);
+		return send_error(fd, 502, "Codex returned no API-supported "
+		    "models for this account.", "upstream_error");
 	}
 	root = json_pack("{s:s,s:o}", "object", "list", "data", data);
 	index = (size_t)send_json(fd, 200, root);
