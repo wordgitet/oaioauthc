@@ -71,6 +71,14 @@ main(void)
 	    response, sizeof(response)) == 0);
 	CHECK(strstr(response, "\"id\":\"gpt-test\"") != NULL);
 	CHECK(strstr(response, "\"id\":\"gpt-other\"") != NULL);
+	CHECK(request_port(port, "POST /missing HTTP/1.1\r\n"
+	    "Host: localhost\r\ncontent-length: 2\r\n\r\n{}",
+	    response, sizeof(response)) == 0);
+	CHECK(strstr(response, "404 Error") != NULL);
+	CHECK(request_port(port, "POST /missing HTTP/1.1\r\n"
+	    "Host: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+	    "2\r\n{}\r\n0\r\n\r\n", response, sizeof(response)) == 0);
+	CHECK(strstr(response, "404 Error") != NULL);
 	(void)kill(pid, SIGTERM);
 	CHECK(waitpid(pid, &status, 0) == pid);
 	(void)unlink(path);

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -107,31 +108,124 @@ request_free(struct request *request)
 }
 
 static int
+read_more(int fd, struct buffer *buffer)
+{
+	char	chunk[4096];
+	ssize_t	count;
+
+	do {
+		count = read(fd, chunk, sizeof(chunk));
+	} while (count == -1 && errno == EINTR);
+	if (count <= 0 || buffer->len > MAX_REQUEST_SIZE - (size_t)count)
+		return -1;
+	return buffer_append(buffer, chunk, (size_t)count);
+}
+
+static int
+parse_content_length(const char *value, size_t *length)
+{
+	char			*end;
+	unsigned long long	number;
+
+	while (*value == ' ' || *value == '\t')
+		value++;
+	if (*value < '0' || *value > '9')
+		return -1;
+	errno = 0;
+	number = strtoull(value, &end, 10);
+	if (errno != 0 || number > (unsigned long long)(size_t)-1)
+		return -1;
+	while (*end == ' ' || *end == '\t')
+		end++;
+	if (*end != '\0')
+		return -1;
+	*length = (size_t)number;
+	return 0;
+}
+
+static int
+read_chunked_body(int fd, struct buffer *raw, size_t cursor,
+    struct request *request)
+{
+	struct buffer	body;
+	char		*end;
+	char		*line_end;
+	char		number[32];
+	unsigned long long	chunk_length;
+	size_t		line_length;
+
+	buffer_init(&body);
+	for (;;) {
+		while ((line_end = strstr(raw->data + cursor, "\r\n")) == NULL) {
+			if (read_more(fd, raw) == -1)
+				goto fail;
+		}
+		line_length = (size_t)(line_end - (raw->data + cursor));
+		if (line_length == 0 || line_length >= sizeof(number))
+			goto fail;
+		memcpy(number, raw->data + cursor, line_length);
+		number[line_length] = '\0';
+		errno = 0;
+		chunk_length = strtoull(number, &end, 16);
+		if (errno != 0 || end == number || *end != '\0' ||
+		    chunk_length > MAX_REQUEST_SIZE - body.len)
+			goto fail;
+		cursor = (size_t)(line_end - raw->data) + 2;
+		while (raw->len - cursor < (size_t)chunk_length + 2) {
+			if (read_more(fd, raw) == -1)
+				goto fail;
+		}
+		if (raw->data[cursor + (size_t)chunk_length] != '\r' ||
+		    raw->data[cursor + (size_t)chunk_length + 1] != '\n')
+			goto fail;
+		if (buffer_append(&body, raw->data + cursor,
+		    (size_t)chunk_length) == -1)
+			goto fail;
+		cursor += (size_t)chunk_length + 2;
+		if (chunk_length == 0)
+			break;
+	}
+	request->body = buffer_steal(&body);
+	return request->body == NULL ? -1 : 0;
+
+fail:
+	buffer_free(&body);
+	return -1;
+}
+
+static int
 read_request(int fd, struct request *request)
 {
 	struct buffer	buffer;
 	char		*header_end;
+	char		*header;
 	char		*line_end;
 	char		*line;
 	char		*method;
 	char		*path;
 	char		*version;
-	char		*content_length;
+	char		*colon;
+	char		*query;
+	char		*value_end;
+	char		*value;
+	size_t		body_offset;
 	size_t		length;
-	ssize_t		count;
-	char		chunk[4096];
+	size_t		parsed_length;
+	int		has_content_length;
+	int		expect_continue;
+	int		chunked;
+	int		last_header;
 
 	memset(request, 0, sizeof(*request));
 	buffer_init(&buffer);
 	while ((header_end = buffer.data == NULL ? NULL : strstr(buffer.data,
 	    "\r\n\r\n")) == NULL) {
-		count = read(fd, chunk, sizeof(chunk));
-		if (count <= 0 || buffer_append(&buffer, chunk, (size_t)count) == -1 ||
-		    buffer.len > MAX_REQUEST_SIZE) {
+		if (read_more(fd, &buffer) == -1) {
 			buffer_free(&buffer);
 			return -1;
 		}
 	}
+	body_offset = (size_t)(header_end - buffer.data) + 4;
 	*header_end = '\0';
 	line = buffer.data;
 	line_end = strstr(line, "\r\n");
@@ -143,25 +237,104 @@ read_request(int fd, struct request *request)
 	method = strtok(line, " ");
 	path = strtok(NULL, " ");
 	version = strtok(NULL, " ");
-	if (method == NULL || path == NULL || version == NULL) {
+	if (method == NULL || path == NULL || version == NULL ||
+	    strcmp(version, "HTTP/1.1") != 0) {
 		buffer_free(&buffer);
 		return -1;
 	}
 	request->method = oaio_strdup(method);
 	request->path = oaio_strdup(path);
-	content_length = strstr(line_end + 2, "Content-Length:");
-	length = content_length == NULL ? 0 : (size_t)strtoull(content_length + 15,
-	    NULL, 10);
+	if (request->method == NULL || request->path == NULL) {
+		request_free(request);
+		buffer_free(&buffer);
+		return -1;
+	}
+	query = strchr(request->path, '?');
+	if (query != NULL)
+		*query = '\0';
+	length = 0;
+	has_content_length = 0;
+	expect_continue = 0;
+	chunked = 0;
+	header = line_end + 2;
+	while (*header != '\0') {
+		line_end = strstr(header, "\r\n");
+		if (line_end == NULL) {
+			line_end = header + strlen(header);
+			last_header = 1;
+		} else {
+			last_header = 0;
+			*line_end = '\0';
+		}
+		colon = strchr(header, ':');
+		if (colon == NULL || colon == header) {
+			request_free(request);
+			buffer_free(&buffer);
+			return -1;
+		}
+		*colon = '\0';
+		value = colon + 1;
+		while (*value == ' ' || *value == '\t')
+			value++;
+		value_end = value + strlen(value);
+		while (value_end > value &&
+		    (value_end[-1] == ' ' || value_end[-1] == '\t'))
+			*--value_end = '\0';
+		if (strcasecmp(header, "Content-Length") == 0) {
+			if (parse_content_length(value, &parsed_length) == -1 ||
+			    (has_content_length && parsed_length != length)) {
+				request_free(request);
+				buffer_free(&buffer);
+				return -1;
+			}
+			length = parsed_length;
+			has_content_length = 1;
+		} else if (strcasecmp(header, "Transfer-Encoding") == 0) {
+			chunked = strcasecmp(value, "chunked") == 0;
+			if (!chunked) {
+				request_free(request);
+				buffer_free(&buffer);
+				return -1;
+			}
+		} else if (strcasecmp(header, "Expect") == 0) {
+			expect_continue = strcasecmp(value, "100-continue") == 0;
+			if (!expect_continue) {
+				request_free(request);
+				buffer_free(&buffer);
+				return -1;
+			}
+		}
+		if (last_header)
+			break;
+		header = line_end + 2;
+	}
+	if (chunked && has_content_length) {
+		request_free(request);
+		buffer_free(&buffer);
+		return -1;
+	}
 	if (length > MAX_REQUEST_SIZE) {
 		request_free(request);
 		buffer_free(&buffer);
 		return -1;
 	}
-	*header_end = '\r';
-	header_end += 4;
-	while (buffer.len - (size_t)(header_end - buffer.data) < length) {
-		count = read(fd, chunk, sizeof(chunk));
-		if (count <= 0 || buffer_append(&buffer, chunk, (size_t)count) == -1) {
+	if (expect_continue &&
+	    write_all(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25) == -1) {
+		request_free(request);
+		buffer_free(&buffer);
+		return -1;
+	}
+	if (chunked) {
+		if (read_chunked_body(fd, &buffer, body_offset, request) == -1) {
+			request_free(request);
+			buffer_free(&buffer);
+			return -1;
+		}
+		buffer_free(&buffer);
+		return 0;
+	}
+	while (buffer.len - body_offset < length) {
+		if (read_more(fd, &buffer) == -1) {
 			request_free(request);
 			buffer_free(&buffer);
 			return -1;
@@ -173,7 +346,7 @@ read_request(int fd, struct request *request)
 		buffer_free(&buffer);
 		return -1;
 	}
-	memcpy(request->body, header_end, length);
+	memcpy(request->body, buffer.data + body_offset, length);
 	request->body[length] = '\0';
 	buffer_free(&buffer);
 	return 0;
