@@ -77,26 +77,91 @@ listen_callback(void)
 	return fd;
 }
 
-static char
-*query_value(const char *request, const char *name)
+static int
+hex_value(char character)
 {
-	const char	*start;
-	const char	*end;
-	struct buffer	value;
+	if (character >= '0' && character <= '9')
+		return (char)(character - '0');
+	if (character >= 'a' && character <= 'f')
+		return (char)(character - 'a' + 10);
+	if (character >= 'A' && character <= 'F')
+		return (char)(character - 'A' + 10);
+	return -1;
+}
 
-	start = strstr(request, name);
-	if (start == NULL)
+static char
+*query_value(const char *target, const char *name)
+{
+	const char	*cursor;
+	const char	*end;
+	const char	*equal;
+	const char	*query;
+	struct buffer	value;
+	char		decoded;
+	int		high;
+	int		low;
+
+	query = strchr(target, '?');
+	if (query == NULL)
 		return NULL;
-	start += strlen(name);
-	end = strpbrk(start, " &\r\n");
-	if (end == NULL)
-		end = start + strlen(start);
+	cursor = query + 1;
+	while (*cursor != '\0') {
+		end = strchr(cursor, '&');
+		if (end == NULL)
+			end = cursor + strlen(cursor);
+		equal = memchr(cursor, '=', (size_t)(end - cursor));
+		if (equal != NULL && (size_t)(equal - cursor) == strlen(name) &&
+		    strncmp(cursor, name, strlen(name)) == 0)
+			break;
+		if (*end == '\0')
+			return NULL;
+		cursor = end + 1;
+	}
+	if (*cursor == '\0')
+		return NULL;
+	cursor = equal + 1;
 	buffer_init(&value);
-	if (buffer_append(&value, start, (size_t)(end - start)) == -1) {
-		buffer_free(&value);
-		return NULL;
+	while (cursor < end) {
+		if (*cursor == '%') {
+			if (end - cursor < 3)
+				goto fail;
+			high = hex_value(cursor[1]);
+			low = hex_value(cursor[2]);
+			if (high < 0 || low < 0)
+				goto fail;
+			decoded = (char)(high * 16 + low);
+			cursor += 3;
+		} else {
+			decoded = *cursor == '+' ? ' ' : *cursor;
+			cursor++;
+		}
+		if (decoded == '\0' ||
+		    buffer_append(&value, &decoded, sizeof(decoded)) == -1)
+			goto fail;
 	}
 	return buffer_steal(&value);
+
+fail:
+	buffer_free(&value);
+	return NULL;
+}
+
+static int
+send_callback_response(int fd, int status, const char *content_type,
+    const char *body)
+{
+	char	header[256];
+	int	length;
+
+	length = snprintf(header, sizeof(header),
+	    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+	    "Connection: close\r\n\r\n", status, status == 200 ? "OK" :
+	    "Bad Request", content_type, strlen(body));
+	if (length < 0 || (size_t)length >= sizeof(header))
+		return -1;
+	if (write_all(fd, header, (size_t)length) == -1)
+		return -1;
+	return write_all(fd, body, strlen(body));
 }
 
 static int
@@ -106,13 +171,17 @@ run_login(const struct proxy_options *options, int should_open)
 	int			client_fd;
 	char			request[8192];
 	ssize_t		count;
+	size_t			used;
 	struct oauth_request	oauth;
 	struct auth_session	session;
 	char			*code;
+	char			*method;
 	char			*state;
+	char			*target;
+	char			*version;
 	char			error[256];
 	const char		*path;
-	const char		*reply;
+	const char		*body;
 	int			result;
 
 	memset(&oauth, 0, sizeof(oauth));
@@ -139,23 +208,47 @@ run_login(const struct proxy_options *options, int should_open)
 		oauth_request_free(&oauth);
 		return 1;
 	}
-	count = read(client_fd, request, sizeof(request) - 1);
-	if (count < 0)
-		count = 0;
-	request[count] = '\0';
-	code = query_value(request, "code=");
-	state = query_value(request, "state=");
+	used = 0;
+	while (used + 1 < sizeof(request)) {
+		count = read(client_fd, request + used, sizeof(request) - used - 1);
+		if (count == -1 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			break;
+		used += (size_t)count;
+		request[used] = '\0';
+		if (strstr(request, "\r\n\r\n") != NULL)
+			break;
+	}
+	request[used] = '\0';
+	method = strtok(request, " ");
+	target = strtok(NULL, " ");
+	version = strtok(NULL, "\r\n");
+	code = target == NULL ? NULL : query_value(target, "code");
+	state = target == NULL ? NULL : query_value(target, "state");
+	if (method == NULL || strcmp(method, "GET") != 0 || target == NULL ||
+	    strncmp(target, "/auth/callback", strlen("/auth/callback")) != 0 ||
+	    (target[strlen("/auth/callback")] != '?' &&
+	    target[strlen("/auth/callback")] != '\0') || version == NULL ||
+	    strncmp(version, "HTTP/1.", strlen("HTTP/1.")) != 0) {
+		free(code);
+		free(state);
+		code = NULL;
+		state = NULL;
+	}
 	if (code == NULL || state == NULL || strcmp(state, oauth.state) != 0) {
-		reply = "HTTP/1.1 400 Bad Request\r\nContent-Length: 18\r\nConnection: close\r\n\r\nInvalid OAuth callback";
-		(void)write_all(client_fd, reply, strlen(reply));
+		body = "Invalid OAuth callback";
+		(void)send_callback_response(client_fd, 400,
+		    "text/plain; charset=utf-8", body);
 		free(code);
 		free(state);
 		oauth_request_free(&oauth);
 		close(client_fd);
 		return 1;
 	}
-	reply = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 64\r\nConnection: close\r\n\r\n<html><body>Sign-in complete. Return to your terminal.</body></html>";
-	(void)write_all(client_fd, reply, strlen(reply));
+	body = "<html><body>Sign-in complete. Return to your terminal.</body></html>";
+	(void)send_callback_response(client_fd, 200,
+	    "text/html; charset=utf-8", body);
 	close(client_fd);
 	result = oauth_exchange_code(code, oauth.code_verifier,
 	    "http://localhost:1455/auth/callback", options->client_id,
