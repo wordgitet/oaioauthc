@@ -117,7 +117,7 @@ static char
 			return NULL;
 		cursor = end + 1;
 	}
-	if (*cursor == '\0')
+	if (*cursor == '\0' || equal == NULL)
 		return NULL;
 	cursor = equal + 1;
 	buffer_init(&value);
