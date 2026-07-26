@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -23,6 +25,7 @@
 #define DEFAULT_CODEX_VERSION "0.145.0"
 #define MAX_REQUEST_SIZE (8 * 1024 * 1024)
 #define CLIENT_TIMEOUT 30
+#define MAX_WORKERS 32
 
 struct request {
 	char	*method;
@@ -51,6 +54,12 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_start(ap, format);
 	(void)vsnprintf(error, length, format, ap);
 	va_end(ap);
+}
+
+static void
+child_exited(int signal_number)
+{
+	(void)signal_number;
 }
 
 static void
@@ -781,14 +790,22 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	int		listen_fd;
 	int		client_fd;
 	int		one;
+	pid_t		pid;
+	size_t		workers;
+	struct sigaction	action;
 	struct request	request;
-	struct model_catalog	catalog;
 	const char	*host;
 	const char	*port;
 
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
-	memset(&catalog, 0, sizeof(catalog));
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = child_exited;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGCHLD, &action, NULL) == -1) {
+		set_error(error, length, "could not configure child handling");
+		return -1;
+	}
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
@@ -820,7 +837,12 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	}
 	(void)fprintf(stderr, "OpenAI-compatible endpoint ready at http://%s:%s/v1\n",
 	    host, port);
+	workers = 0;
 	for (;;) {
+		while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+			if (workers > 0)
+				workers--;
+		}
 		client_fd = accept(listen_fd, NULL, NULL);
 		if (client_fd == -1) {
 			if (errno == EINTR)
@@ -828,16 +850,40 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			break;
 		}
 		set_client_timeout(client_fd);
-		if (read_request(client_fd, &request) == -1)
-			(void)send_error(client_fd, 400, "Malformed HTTP request.",
-			    "invalid_request_error");
-		else {
-			(void)dispatch(client_fd, options, &catalog, &request);
-			request_free(&request);
+		if (workers >= MAX_WORKERS) {
+			(void)send_error(client_fd, 503,
+			    "Too many concurrent requests.", "server_error");
+			close(client_fd);
+			continue;
 		}
+		pid = fork();
+		if (pid == -1) {
+			(void)send_error(client_fd, 503,
+			    "Could not start request worker.", "server_error");
+			close(client_fd);
+			continue;
+		}
+		if (pid == 0) {
+			struct model_catalog catalog;
+
+			close(listen_fd);
+			memset(&catalog, 0, sizeof(catalog));
+			if (read_request(client_fd, &request) == -1)
+				(void)send_error(client_fd, 400,
+				    "Malformed HTTP request.",
+				    "invalid_request_error");
+			else {
+				(void)dispatch(client_fd, options, &catalog,
+				    &request);
+				request_free(&request);
+			}
+			model_catalog_free(&catalog);
+			close(client_fd);
+			_exit(0);
+		}
+		workers++;
 		close(client_fd);
 	}
-	model_catalog_free(&catalog);
 	close(listen_fd);
 	set_error(error, length, "server accept failed: %s", strerror(errno));
 	return -1;

@@ -176,13 +176,10 @@ run_mock_upstream(const char *port)
 }
 
 static int
-request_port(const char *port, const char *request, char *response,
-    size_t response_length)
+open_port(const char *port)
 {
 	struct sockaddr_in	address;
 	int			fd;
-	ssize_t			count;
-	size_t			length;
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd == -1)
@@ -191,9 +188,25 @@ request_port(const char *port, const char *request, char *response,
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	address.sin_port = htons((unsigned short)atoi(port));
-	if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1 ||
-	    write_all(fd, request, strlen(request)) == -1) {
+	if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
 		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int
+request_port(const char *port, const char *request, char *response,
+    size_t response_length)
+{
+	int	fd;
+	ssize_t	count;
+	size_t	length;
+
+	fd = open_port(port);
+	if (fd == -1 || write_all(fd, request, strlen(request)) == -1) {
+		if (fd != -1)
+			close(fd);
 		return -1;
 	}
 	length = 0;
@@ -250,10 +263,12 @@ main(void)
 	pid_t	pid;
 	int	fd;
 	int	result;
+	int	slow_fd;
 	int	status;
 
 	pid = -1;
 	mock_pid = -1;
+	slow_fd = -1;
 	result = 1;
 	fd = mkstemp(path);
 	REQUIRE(fd != -1);
@@ -279,6 +294,12 @@ main(void)
 	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "200 OK") != NULL);
 	REQUIRE(strstr(response, "\"replay_state\":\"stateless\"") != NULL);
+	slow_fd = open_port(port);
+	REQUIRE(slow_fd != -1);
+	REQUIRE(write_all(slow_fd, "GET /", 5) == 0);
+	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
+	REQUIRE(close(slow_fd) == 0);
+	slow_fd = -1;
 	REQUIRE(request_port(port, "GET /v1/models HTTP/1.1\r\n"
 	    "Host: localhost\r\n\r\n", response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"id\":\"gpt-test\"") != NULL);
@@ -314,6 +335,8 @@ main(void)
 	result = 0;
 
 cleanup:
+	if (slow_fd != -1)
+		close(slow_fd);
 	if (pid > 0) {
 		(void)kill(pid, SIGTERM);
 		(void)waitpid(pid, &status, 0);
