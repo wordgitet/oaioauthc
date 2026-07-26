@@ -87,6 +87,8 @@ static char
 	json_t		*account;
 	char		*result;
 
+	if (token == NULL)
+		return NULL;
 	first = strchr(token, '.');
 	if (first == NULL || (second = strchr(first + 1, '.')) == NULL)
 		return NULL;
@@ -197,6 +199,10 @@ auth_load(const char *path, struct auth_session *session, char *error,
 	session->id_token = value == NULL ? NULL : oaio_strdup(value);
 	value = json_string_value(json_object_get(tokens, "account_id"));
 	session->account_id = value == NULL ? NULL : oaio_strdup(value);
+	if (session->account_id == NULL)
+		session->account_id = jwt_account_id(session->id_token);
+	if (session->account_id == NULL)
+		session->account_id = jwt_account_id(session->access_token);
 	value = json_string_value(json_object_get(root, "last_refresh"));
 	session->last_refresh = value == NULL ? NULL : oaio_strdup(value);
 	json_decref(root);
@@ -341,6 +347,10 @@ token_response(const char *text, struct auth_session *session, char *error,
 	}
 	value = json_string_value(json_object_get(root, "account_id"));
 	account = value == NULL ? jwt_account_id(session->id_token) : oaio_strdup(value);
+	if (account == NULL)
+		account = jwt_account_id(session->access_token);
+	if (account == NULL && session->account_id != NULL)
+		account = oaio_strdup(session->account_id);
 	if (account == NULL) {
 		json_decref(root);
 		set_error(error, length, "token response has no ChatGPT account id");

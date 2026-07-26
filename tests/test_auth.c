@@ -22,6 +22,11 @@ main(void)
 	CHECK(strcmp(session.access_token, "access") == 0);
 	CHECK(strcmp(session.account_id, "acct_1") == 0);
 	auth_session_free(&session);
+	CHECK(write_private_file(path,
+	    "{\"tokens\":{\"access_token\":\"header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9qd3QifX0.signature\"}}") == 0);
+	CHECK(auth_load(path, &session, error, sizeof(error)) == 0);
+	CHECK(strcmp(session.account_id, "acct_jwt") == 0);
+	auth_session_free(&session);
 	memset(&request, 0, sizeof(request));
 	CHECK(oauth_request_create("http://localhost:1455/auth/callback", NULL,
 	    &request, error, sizeof(error)) == 0);
