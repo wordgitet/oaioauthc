@@ -3,6 +3,7 @@
 #include "util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -31,6 +32,9 @@ main(void)
 	session.access_token = oaio_strdup("opaque");
 	session.refresh_token = oaio_strdup("refresh");
 	session.last_refresh = oaio_strdup("1970-01-01T00:00:00Z");
+	CHECK(auth_session_needs_refresh(&session) == 1);
+	free(session.last_refresh);
+	session.last_refresh = NULL;
 	CHECK(auth_session_needs_refresh(&session) == 1);
 	auth_session_free(&session);
 	memset(&request, 0, sizeof(request));

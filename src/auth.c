@@ -392,7 +392,7 @@ auth_session_needs_refresh(const struct auth_session *session)
 check_last_refresh:
 	if (parse_timestamp(session->last_refresh, &refreshed) == 0)
 		return refreshed <= time(NULL) - REFRESH_INTERVAL;
-	return 0;
+	return 1;
 }
 
 static int
