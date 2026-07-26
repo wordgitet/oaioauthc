@@ -1,0 +1,34 @@
+# Autotools generated files
+/Makefile
+/Makefile.in
+/aclocal.m4
+/autom4te.cache/
+/compile
+/config.h
+/config.h.in
+/config.h.in~
+/config.log
+/config.status
+/configure
+/configure~
+/depcomp
+/install-sh
+/missing
+/stamp-h1
+/test-driver
+**/.dirstamp
+**/Makefile
+**/Makefile.in
+
+# Build and test output
+**/.deps/
+**/*.o
+/src/oaioauthc
+/tests/test_auth
+/tests/test_json
+/tests/test_proxy
+/tests/test_sse
+/tests/*.log
+/tests/*.trs
+/tests/test-suite.log
+/oaioauthc-*.tar.gz

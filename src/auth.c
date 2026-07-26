@@ -1,0 +1,501 @@
+#include "auth.h"
+#include "http.h"
+#include "json.h"
+#include "util.h"
+
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include <errno.h>
+#include <jansson.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#define DEFAULT_CLIENT_ID "app_EMoamEEZ73f0CkXaXp7hrann"
+#define DEFAULT_ISSUER "https://auth.openai.com"
+#define DEFAULT_TOKEN_URL "https://auth.openai.com/oauth/token"
+
+static void
+set_error(char *error, size_t length, const char *format, ...)
+{
+	va_list	ap;
+
+	if (error == NULL || length == 0)
+		return;
+	va_start(ap, format);
+	(void)vsnprintf(error, length, format, ap);
+	va_end(ap);
+}
+
+static char
+*base64url(const unsigned char *data, size_t length)
+{
+	char	*encoded;
+	int	encoded_length;
+	size_t	index;
+
+	encoded_length = 4 * ((int)length + 2) / 3;
+	encoded = malloc((size_t)encoded_length + 1);
+	if (encoded == NULL)
+		return NULL;
+	EVP_EncodeBlock((unsigned char *)encoded, data, (int)length);
+	for (index = 0; encoded[index] != '\0'; index++) {
+		if (encoded[index] == '+')
+			encoded[index] = '-';
+		else if (encoded[index] == '/')
+			encoded[index] = '_';
+	}
+	encoded[strcspn(encoded, "=")] = '\0';
+	return encoded;
+}
+
+static char
+*random_urlsafe(size_t length)
+{
+	unsigned char	*bytes;
+	char		*encoded;
+
+	bytes = malloc(length);
+	if (bytes == NULL)
+		return NULL;
+	if (RAND_bytes(bytes, (int)length) != 1) {
+		free(bytes);
+		return NULL;
+	}
+	encoded = base64url(bytes, length);
+	free(bytes);
+	return encoded;
+}
+
+static char
+*jwt_account_id(const char *token)
+{
+	const char		*first;
+	const char		*second;
+	char		*payload;
+	unsigned char	*decoded;
+	int		decoded_length;
+	size_t		payload_length;
+	size_t		padding;
+	json_error_t	json_error;
+	json_t		*claims;
+	json_t		*auth;
+	json_t		*account;
+	char		*result;
+
+	first = strchr(token, '.');
+	if (first == NULL || (second = strchr(first + 1, '.')) == NULL)
+		return NULL;
+	payload_length = (size_t)(second - first - 1);
+	padding = (4 - payload_length % 4) % 4;
+	payload = malloc(payload_length + padding + 1);
+	if (payload == NULL)
+		return NULL;
+	memcpy(payload, first + 1, payload_length);
+	payload[payload_length] = '\0';
+	while (padding > 0) {
+		payload[payload_length++] = '=';
+		padding--;
+	}
+	payload[payload_length] = '\0';
+	for (first = payload; *first != '\0'; first++) {
+		if (*first == '-')
+			*(char *)first = '+';
+		else if (*first == '_')
+			*(char *)first = '/';
+	}
+	decoded = malloc(strlen(payload) + 1);
+	if (decoded == NULL) {
+		free(payload);
+		return NULL;
+	}
+	decoded_length = EVP_DecodeBlock(decoded, (unsigned char *)payload,
+	    (int)strlen(payload));
+	if (decoded_length < 0) {
+		free(decoded);
+		free(payload);
+		return NULL;
+	}
+	decoded[decoded_length] = '\0';
+	claims = json_loads((char *)decoded, 0, &json_error);
+	free(decoded);
+	free(payload);
+	if (claims == NULL)
+		return NULL;
+	auth = json_object_get(claims, "https://api.openai.com/auth");
+	account = json_is_object(auth) ? json_object_get(auth,
+	    "chatgpt_account_id") : json_object_get(claims, "chatgpt_account_id");
+	result = json_is_string(account) ? oaio_strdup(json_string_value(account)) : NULL;
+	json_decref(claims);
+	return result;
+}
+
+const char
+*auth_default_file(void)
+{
+	static char	*path;
+	const char	*codex_home;
+	char		*default_home;
+
+	if (path != NULL)
+		return path;
+	codex_home = getenv("CODEX_HOME");
+	if (codex_home != NULL && codex_home[0] != '\0')
+		path = oaio_join_path(codex_home, "auth.json");
+	else {
+		default_home = oaio_join_path(oaio_home_dir(), ".codex");
+		path = default_home == NULL ? NULL : oaio_join_path(default_home,
+		    "auth.json");
+		free(default_home);
+	}
+	return path;
+}
+
+void
+auth_session_free(struct auth_session *session)
+{
+	free(session->access_token);
+	free(session->refresh_token);
+	free(session->id_token);
+	free(session->account_id);
+	free(session->last_refresh);
+	memset(session, 0, sizeof(*session));
+}
+
+int
+auth_load(const char *path, struct auth_session *session, char *error,
+    size_t length)
+{
+	struct buffer	buffer;
+	json_t		*root;
+	json_t		*tokens;
+	const char	*value;
+
+	memset(session, 0, sizeof(*session));
+	buffer_init(&buffer);
+	if (read_file(path, &buffer) == -1) {
+		set_error(error, length, "could not read auth file: %s", strerror(errno));
+		return -1;
+	}
+	root = json_load_string_checked(buffer.data, error, length);
+	buffer_free(&buffer);
+	if (root == NULL || !json_is_object(root)) {
+		json_decref(root);
+		set_error(error, length, "auth file must contain a JSON object");
+		return -1;
+	}
+	tokens = json_object_get(root, "tokens");
+	value = json_string_value(json_object_get(tokens, "access_token"));
+	session->access_token = value == NULL ? NULL : oaio_strdup(value);
+	value = json_string_value(json_object_get(tokens, "refresh_token"));
+	session->refresh_token = value == NULL ? NULL : oaio_strdup(value);
+	value = json_string_value(json_object_get(tokens, "id_token"));
+	session->id_token = value == NULL ? NULL : oaio_strdup(value);
+	value = json_string_value(json_object_get(tokens, "account_id"));
+	session->account_id = value == NULL ? NULL : oaio_strdup(value);
+	value = json_string_value(json_object_get(root, "last_refresh"));
+	session->last_refresh = value == NULL ? NULL : oaio_strdup(value);
+	json_decref(root);
+	if (session->access_token == NULL || session->account_id == NULL) {
+		auth_session_free(session);
+		set_error(error, length, "auth file does not contain ChatGPT OAuth credentials");
+		return -1;
+	}
+	return 0;
+}
+
+int
+auth_save(const char *path, const struct auth_session *session, char *error,
+    size_t length)
+{
+	struct buffer	buffer;
+	json_t	*root;
+	json_t	*tokens;
+	char	*text;
+
+	buffer_init(&buffer);
+	root = read_file(path, &buffer) == 0 ? json_loads(buffer.data, 0, NULL) : NULL;
+	buffer_free(&buffer);
+	if (!json_is_object(root)) {
+		json_decref(root);
+		root = json_object();
+	}
+	tokens = json_object_get(root, "tokens");
+	if (!json_is_object(tokens)) {
+		tokens = json_object();
+		json_object_set_new(root, "tokens", tokens);
+	}
+	json_object_set_new(root, "auth_mode", json_string("chatgpt"));
+	json_object_set_new(tokens, "access_token", json_string(session->access_token));
+	if (session->refresh_token != NULL)
+		json_object_set_new(tokens, "refresh_token", json_string(session->refresh_token));
+	if (session->id_token != NULL)
+		json_object_set_new(tokens, "id_token", json_string(session->id_token));
+	json_object_set_new(tokens, "account_id", json_string(session->account_id));
+	if (session->last_refresh != NULL)
+		json_object_set_new(root, "last_refresh", json_string(session->last_refresh));
+	text = json_dumps(root, JSON_INDENT(2));
+	json_decref(root);
+	if (text == NULL || write_private_file(path, text) == -1) {
+		free(text);
+		set_error(error, length, "could not write auth file: %s", strerror(errno));
+		return -1;
+	}
+	free(text);
+	return 0;
+}
+
+int
+auth_session_needs_refresh(const struct auth_session *session)
+{
+	const char	*first;
+	const char	*second;
+	char		*payload;
+	unsigned char	*decoded;
+	int		decoded_length;
+	size_t		payload_length;
+	size_t		padding;
+	json_t		*claims;
+	json_int_t	expires;
+	int		result;
+
+	if (session->access_token == NULL || session->refresh_token == NULL)
+		return session->access_token == NULL;
+	first = strchr(session->access_token, '.');
+	if (first == NULL || (second = strchr(first + 1, '.')) == NULL)
+		return 0;
+	payload_length = (size_t)(second - first - 1);
+	padding = (4 - payload_length % 4) % 4;
+	payload = malloc(payload_length + padding + 1);
+	if (payload == NULL)
+		return 0;
+	memcpy(payload, first + 1, payload_length);
+	while (padding > 0) {
+		payload[payload_length++] = '=';
+		padding--;
+	}
+	payload[payload_length] = '\0';
+	for (first = payload; *first != '\0'; first++) {
+		if (*first == '-')
+			*(char *)first = '+';
+		else if (*first == '_')
+			*(char *)first = '/';
+	}
+	decoded = malloc(payload_length + 1);
+	if (decoded == NULL) {
+		free(payload);
+		return 0;
+	}
+	decoded_length = EVP_DecodeBlock(decoded, (unsigned char *)payload,
+	    (int)payload_length);
+	free(payload);
+	if (decoded_length < 0) {
+		free(decoded);
+		return 0;
+	}
+	decoded[decoded_length] = '\0';
+	claims = json_loads((char *)decoded, 0, NULL);
+	free(decoded);
+	if (!json_is_object(claims)) {
+		json_decref(claims);
+		return 0;
+	}
+	expires = json_integer_value(json_object_get(claims, "exp"));
+	json_decref(claims);
+	result = expires > 0 && expires <= (json_int_t)time(NULL) + 300;
+	return result;
+}
+
+static int
+token_response(const char *text, struct auth_session *session, char *error,
+    size_t length)
+{
+	json_t	*root;
+	const char	*value;
+	char	*account;
+
+	root = json_load_string_checked(text, error, length);
+	if (root == NULL)
+		return -1;
+	value = json_string_value(json_object_get(root, "access_token"));
+	if (value == NULL) {
+		json_decref(root);
+		set_error(error, length, "token response has no access_token");
+		return -1;
+	}
+	free(session->access_token);
+	session->access_token = oaio_strdup(value);
+	value = json_string_value(json_object_get(root, "refresh_token"));
+	if (value != NULL) {
+		free(session->refresh_token);
+		session->refresh_token = oaio_strdup(value);
+	}
+	value = json_string_value(json_object_get(root, "id_token"));
+	if (value != NULL) {
+		free(session->id_token);
+		session->id_token = oaio_strdup(value);
+	}
+	value = json_string_value(json_object_get(root, "account_id"));
+	account = value == NULL ? jwt_account_id(session->id_token) : oaio_strdup(value);
+	if (account == NULL) {
+		json_decref(root);
+		set_error(error, length, "token response has no ChatGPT account id");
+		return -1;
+	}
+	free(session->account_id);
+	session->account_id = account;
+	free(session->last_refresh);
+	session->last_refresh = oaio_strdup("refreshed");
+	json_decref(root);
+	return session->access_token == NULL ? -1 : 0;
+}
+
+int
+auth_refresh(const char *path, const char *client_id, const char *token_url,
+    struct auth_session *session, char *error, size_t length)
+{
+	struct http_response	response;
+	struct buffer		body;
+	char			*escaped;
+	int			result;
+
+	if (session->refresh_token == NULL) {
+		set_error(error, length, "auth file has no refresh token");
+		return -1;
+	}
+	escaped = http_form_encode(session->refresh_token);
+	if (escaped == NULL)
+		return -1;
+	buffer_init(&body);
+	if (buffer_append_string(&body, "grant_type=refresh_token&refresh_token=") == -1 ||
+	    buffer_append_string(&body, escaped) == -1 ||
+	    buffer_append_string(&body, "&client_id=") == -1 ||
+	    buffer_append_string(&body, client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1) {
+		free(escaped);
+		buffer_free(&body);
+		return -1;
+	}
+	free(escaped);
+	result = http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
+	    body.data, &response, error, length);
+	buffer_free(&body);
+	if (result == -1)
+		return -1;
+	if (response.status < 200 || response.status >= 300) {
+		set_error(error, length, "token refresh failed with HTTP %ld", response.status);
+		http_response_free(&response);
+		return -1;
+	}
+	result = token_response(response.body, session, error, length);
+	http_response_free(&response);
+	if (result == 0)
+		result = auth_save(path, session, error, length);
+	return result;
+}
+
+int
+oauth_request_create(const char *redirect_uri, const char *client_id,
+    struct oauth_request *request, char *error, size_t length)
+{
+	unsigned char	digest[EVP_MAX_MD_SIZE];
+	unsigned int	digest_length;
+	char		*challenge;
+	char		*escaped_redirect;
+	struct buffer	url;
+
+	memset(request, 0, sizeof(*request));
+	request->state = random_urlsafe(24);
+	request->code_verifier = random_urlsafe(48);
+	if (request->state == NULL || request->code_verifier == NULL ||
+	    EVP_Digest(request->code_verifier, strlen(request->code_verifier), digest,
+	    &digest_length, EVP_sha256(), NULL) != 1) {
+		set_error(error, length, "could not create OAuth PKCE request");
+		oauth_request_free(request);
+		return -1;
+	}
+	challenge = base64url(digest, digest_length);
+	escaped_redirect = http_form_encode(redirect_uri);
+	buffer_init(&url);
+	if (challenge == NULL || escaped_redirect == NULL ||
+	    buffer_append_string(&url, DEFAULT_ISSUER "/oauth/authorize?response_type=code&client_id=") == -1 ||
+	    buffer_append_string(&url, client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
+	    buffer_append_string(&url, "&redirect_uri=") == -1 ||
+	    buffer_append_string(&url, escaped_redirect) == -1 ||
+	    buffer_append_string(&url, "&scope=openid%20profile%20email%20offline_access&state=") == -1 ||
+	    buffer_append_string(&url, request->state) == -1 ||
+	    buffer_append_string(&url, "&code_challenge=") == -1 ||
+	    buffer_append_string(&url, challenge) == -1 ||
+	    buffer_append_string(&url, "&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true") == -1) {
+		free(challenge);
+		free(escaped_redirect);
+		buffer_free(&url);
+		oauth_request_free(request);
+		return -1;
+	}
+	free(challenge);
+	free(escaped_redirect);
+	request->authorization_url = buffer_steal(&url);
+	return 0;
+}
+
+void
+oauth_request_free(struct oauth_request *request)
+{
+	free(request->authorization_url);
+	free(request->state);
+	free(request->code_verifier);
+	memset(request, 0, sizeof(*request));
+}
+
+int
+oauth_exchange_code(const char *code, const char *code_verifier,
+    const char *redirect_uri, const char *client_id, const char *token_url,
+    struct auth_session *session, char *error,
+    size_t length)
+{
+	char			*escaped_code;
+	char			*escaped_verifier;
+	char			*escaped_redirect;
+	struct buffer		body;
+	struct http_response	response;
+	int			result;
+
+	escaped_code = http_form_encode(code);
+	escaped_verifier = http_form_encode(code_verifier);
+	escaped_redirect = http_form_encode(redirect_uri);
+	if (escaped_code == NULL || escaped_verifier == NULL || escaped_redirect == NULL) {
+		free(escaped_code);
+		free(escaped_verifier);
+		free(escaped_redirect);
+		return -1;
+	}
+	buffer_init(&body);
+	(void)buffer_append_string(&body, "grant_type=authorization_code&code=");
+	(void)buffer_append_string(&body, escaped_code);
+	(void)buffer_append_string(&body, "&redirect_uri=");
+	(void)buffer_append_string(&body, escaped_redirect);
+	(void)buffer_append_string(&body, "&client_id=");
+	(void)buffer_append_string(&body, client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
+	(void)buffer_append_string(&body, "&code_verifier=");
+	(void)buffer_append_string(&body, escaped_verifier);
+	free(escaped_code);
+	free(escaped_verifier);
+	free(escaped_redirect);
+	result = http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
+	    body.data, &response, error, length);
+	buffer_free(&body);
+	if (result == -1)
+		return -1;
+	if (response.status < 200 || response.status >= 300) {
+		set_error(error, length, "token exchange failed with HTTP %ld", response.status);
+		http_response_free(&response);
+		return -1;
+	}
+	result = token_response(response.body, session, error, length);
+	http_response_free(&response);
+	return result;
+}
