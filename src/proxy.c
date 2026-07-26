@@ -112,6 +112,12 @@ write_stream(const void *data, size_t length, void *argument)
 }
 
 static int
+write_chat_stream(const void *data, size_t length, void *argument)
+{
+	return sse_chat_stream_feed(argument, data, length);
+}
+
+static int
 send_json(int fd, int status, json_t *body)
 {
 	char	*text;
@@ -589,6 +595,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	int			use_lite;
 	int			result;
 	struct stream_client	client;
+	struct sse_chat_stream	*chat_stream;
 
 	request = json_load_string_checked(body, error, sizeof(error));
 	if (request == NULL)
@@ -640,11 +647,29 @@ handle_responses(int fd, const struct proxy_options *options,
 	}
 	client.fd = fd;
 	client.started = 0;
-	if (!as_chat && want_stream)
+	chat_stream = NULL;
+	if (as_chat && want_stream) {
+		json_t *stream_options;
+
+		stream_options = json_object_get(request, "stream_options");
+		chat_stream = sse_chat_stream_new(json_string_value(
+		    json_object_get(request, "model")),
+		    json_is_true(json_object_get(stream_options, "include_usage")),
+		    write_stream, &client);
+		if (chat_stream == NULL) {
+			free(url);
+			free(request_text);
+			json_decref(request);
+			return send_error(fd, 500, "out of memory", "server_error");
+		}
+	}
+	if (want_stream)
 		result = http_post_json_stream(url, request_text,
 		    session->access_token, session->account_id, use_lite ?
 		    "x-openai-internal-codex-responses-lite: true" : NULL,
-		    write_stream, &client, &response, error, sizeof(error));
+		    as_chat ? write_chat_stream : write_stream,
+		    as_chat ? (void *)chat_stream : (void *)&client, &response,
+		    error, sizeof(error));
 	else
 		result = http_post_json(url, request_text, session->access_token,
 		    session->account_id, use_lite ?
@@ -653,6 +678,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	free(url);
 	free(request_text);
 	if (result == -1) {
+		sse_chat_stream_free(chat_stream);
 		json_decref(request);
 		if (client.started)
 			return -1;
@@ -663,13 +689,21 @@ handle_responses(int fd, const struct proxy_options *options,
 		    response.content_type == NULL ? "application/json" : response.content_type,
 		    response.body == NULL ? "" : response.body);
 		http_response_free(&response);
+		sse_chat_stream_free(chat_stream);
 		json_decref(request);
 		return result;
 	}
-	if (!as_chat && want_stream) {
-		result = send_stream_headers(&client);
+	if (want_stream) {
+		if (as_chat)
+			result = sse_chat_stream_finish(chat_stream);
+		else
+			result = send_stream_headers(&client);
 		http_response_free(&response);
+		sse_chat_stream_free(chat_stream);
 		json_decref(request);
+		if (result == -1 && !client.started)
+			return send_error(fd, 502, "upstream stream ended before "
+			    "completion", "upstream_error");
 		return result;
 	}
 	completed = sse_collect_completed_response(response.body, error, sizeof(error));
@@ -686,45 +720,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		json_decref(request);
 		if (chat == NULL)
 			return send_error(fd, 502, error, "upstream_error");
-		if (want_stream) {
-			json_t *message;
-			json_t *chunk;
-			json_t *final_chunk;
-			struct buffer stream;
-			char *text;
-
-			message = json_object_get(json_array_get(json_object_get(chat,
-			    "choices"), 0), "message");
-			chunk = json_pack("{s:s,s:s,s:i,s:s,s:[{s:i,s:{s:s,s:o},s:n}]}",
-			    "id", "chatcmpl_local", "object", "chat.completion.chunk",
-			    "created", 0, "model", json_string_value(json_object_get(chat,
-			    "model")) == NULL ? "" : json_string_value(json_object_get(chat,
-			    "model")), "choices", "index", 0, "delta", "role", "assistant",
-			    "content", json_deep_copy(json_object_get(message, "content")),
-			    "finish_reason");
-			final_chunk = json_pack("{s:s,s:s,s:i,s:s,s:[{s:i,s:{},s:s}]}",
-			    "id", "chatcmpl_local", "object", "chat.completion.chunk",
-			    "created", 0, "model", json_string_value(json_object_get(chat,
-			    "model")) == NULL ? "" : json_string_value(json_object_get(chat,
-			    "model")), "choices", "index", 0, "delta", "finish_reason", "stop");
-			buffer_init(&stream);
-			text = json_dump_compact(chunk);
-			(void)buffer_append_string(&stream, "data: ");
-			(void)buffer_append_string(&stream, text);
-			(void)buffer_append_string(&stream, "\n\n");
-			free(text);
-			text = json_dump_compact(final_chunk);
-			(void)buffer_append_string(&stream, "data: ");
-			(void)buffer_append_string(&stream, text);
-			(void)buffer_append_string(&stream, "\n\ndata: [DONE]\n\n");
-			free(text);
-			json_decref(chunk);
-			json_decref(final_chunk);
-			result = send_response(fd, 200, "text/event-stream; charset=utf-8",
-			    stream.data);
-			buffer_free(&stream);
-		} else
-			result = send_json(fd, 200, chat);
+		result = send_json(fd, 200, chat);
 		json_decref(chat);
 		return result;
 	}
