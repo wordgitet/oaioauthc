@@ -23,6 +23,7 @@ usage(FILE *stream)
 	    "  oaioauthc serve [--host HOST] [--port PORT] [--models IDS]\n"
 	    "                  [--codex-version VERSION] [--base-url URL]\n"
 	    "                  [--oauth-file PATH]\n"
+	    "                  [--debug-json[=compact|pretty]]\n"
 	    "  oaioauthc login [--oauth-file PATH] [--no-open]\n");
 }
 
@@ -309,7 +310,17 @@ app_main(int argc, char **argv)
 			options.client_id = option_value(&index, argc, argv, "--oauth-client-id");
 		else if (strcmp(argv[index], "--oauth-token-url") == 0)
 			options.token_url = option_value(&index, argc, argv, "--oauth-token-url");
-		else if (strcmp(argv[index], "--no-open") == 0)
+		else if (strcmp(argv[index], "--debug-json") == 0)
+			options.debug_json = debug_json_compact;
+		else if (strcmp(argv[index], "--debug-json=compact") == 0)
+			options.debug_json = debug_json_compact;
+		else if (strcmp(argv[index], "--debug-json=pretty") == 0)
+			options.debug_json = debug_json_pretty;
+		else if (strncmp(argv[index], "--debug-json=", 13) == 0) {
+			(void)fprintf(stderr, "invalid --debug-json format: %s\n",
+			    argv[index] + 13);
+			return 1;
+		} else if (strcmp(argv[index], "--no-open") == 0)
 			open = 0;
 		else if (strcmp(argv[index], "--help") == 0) {
 			usage(stdout);
@@ -330,6 +341,9 @@ app_main(int argc, char **argv)
 	if (options.host != NULL && strcmp(options.host, "127.0.0.1") != 0 &&
 	    strcmp(options.host, "localhost") != 0 && strcmp(options.host, "::1") != 0)
 		(void)fprintf(stderr, "Warning: this proxy is exposed to your network.\n");
+	if (options.debug_json != debug_json_disabled)
+		(void)fprintf(stderr, "Warning: --debug-json logs prompts and "
+		    "conversation history to stderr.\n");
 	if (proxy_serve(&options, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		return 1;

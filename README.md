@@ -37,6 +37,14 @@ not hardcode an image-model name. Edits accept OpenAI-compatible
 compatibility, streaming image requests, masks, and unsupported options return
 an `invalid_request_error`.
 
+Use `oaioauthc serve --debug-json` to print parsed client requests and
+normalized Codex request JSON to stderr. Output is compact by default;
+`--debug-json=pretty` selects indented output and `--debug-json=compact`
+selects compact output explicitly. Image data URLs, token fields, and encrypted
+reasoning content are redacted. Prompts, conversation history, and tool
+definitions are not redacted; enable this flag only while debugging and protect
+captured logs accordingly.
+
 The project is unaffiliated with OpenAI; treat stored OAuth credentials as
 passwords.
 

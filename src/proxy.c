@@ -159,6 +159,141 @@ send_error(int fd, int status, const char *message, const char *type)
 	return result;
 }
 
+static int
+debug_sensitive_key(const char *key)
+{
+	static const char *sensitive[] = {
+		"access_token",
+		"api_key",
+		"authorization",
+		"encrypted_content",
+		"refresh_token"
+	};
+	size_t	index;
+
+	for (index = 0; index < sizeof(sensitive) / sizeof(sensitive[0]);
+	    index++) {
+		if (strcasecmp(key, sensitive[index]) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static json_t *
+debug_json_copy(json_t *value)
+{
+	const char	*key;
+	const char	*string;
+	json_t		*child;
+	json_t		*copy;
+	json_t		*result;
+	size_t		 index;
+	char		 redacted[96];
+
+	if (json_is_string(value)) {
+		string = json_string_value(value);
+		if (strncmp(string, "data:", 5) == 0 &&
+		    strstr(string, ";base64,") != NULL) {
+			(void)snprintf(redacted, sizeof(redacted),
+			    "[redacted data URL: %zu characters]", strlen(string));
+			return json_string(redacted);
+		}
+		return json_stringn(string, json_string_length(value));
+	}
+	if (json_is_array(value)) {
+		result = json_array();
+		if (result == NULL)
+			return NULL;
+		json_array_foreach(value, index, child) {
+			copy = debug_json_copy(child);
+			if (copy == NULL ||
+			    json_array_append_new(result, copy) == -1) {
+				json_decref(result);
+				return NULL;
+			}
+		}
+		return result;
+	}
+	if (json_is_object(value)) {
+		result = json_object();
+		if (result == NULL)
+			return NULL;
+		json_object_foreach(value, key, child) {
+			copy = debug_sensitive_key(key) ?
+			    json_string("[redacted]") : debug_json_copy(child);
+			if (copy == NULL ||
+			    json_object_set_new(result, key, copy) == -1) {
+				json_decref(result);
+				return NULL;
+			}
+		}
+		return result;
+	}
+	return json_deep_copy(value);
+}
+
+static void
+debug_json_write(const char *label, const char *text)
+{
+	struct buffer	line;
+	char		prefix[128];
+	int		length;
+
+	length = snprintf(prefix, sizeof(prefix), "[debug-json pid=%ld] %s: ",
+	    (long)getpid(), label);
+	if (length < 0 || (size_t)length >= sizeof(prefix))
+		return;
+	buffer_init(&line);
+	if (buffer_append(&line, prefix, (size_t)length) == -1 ||
+	    buffer_append_string(&line, text) == -1 ||
+	    buffer_append_string(&line, "\n") == -1) {
+		buffer_free(&line);
+		return;
+	}
+	(void)write_all(STDERR_FILENO, line.data, line.len);
+	buffer_free(&line);
+}
+
+static void
+debug_json_value(const struct proxy_options *options, const char *label,
+    json_t *value)
+{
+	json_t	*copy;
+	char	*text;
+	size_t	 flags;
+
+	if (options->debug_json == debug_json_disabled)
+		return;
+	copy = debug_json_copy(value);
+	flags = options->debug_json == debug_json_pretty ?
+	    JSON_INDENT(2) : JSON_COMPACT;
+	text = copy == NULL ? NULL : json_dumps(copy, flags);
+	json_decref(copy);
+	if (text == NULL) {
+		debug_json_write(label, "[could not encode JSON]");
+		return;
+	}
+	debug_json_write(label, text);
+	free(text);
+}
+
+static void
+debug_json_text(const struct proxy_options *options, const char *label,
+    const char *text)
+{
+	json_t	*value;
+
+	if (options->debug_json == debug_json_disabled)
+		return;
+	value = json_loads(text, 0, NULL);
+	if (value == NULL) {
+		debug_json_write(label, "[invalid JSON]");
+		return;
+	}
+	debug_json_value(options, label, value);
+	json_decref(value);
+}
+
 static void
 request_free(struct request *request)
 {
@@ -646,6 +781,106 @@ static json_t
 }
 
 static int
+append_model_name(struct buffer *names, const char *name, size_t *count)
+{
+	if (*count > 0 && buffer_append_string(names, ", ") == -1)
+		return -1;
+	if (buffer_append_string(names, name) == -1)
+		return -1;
+	(*count)++;
+	return 0;
+}
+
+static int
+append_startup_models(struct buffer *names,
+    const struct proxy_options *options, const struct model_catalog *catalog,
+    size_t *count)
+{
+	json_t		*models;
+	json_t		*model;
+	const char	*cursor;
+	const char	*comma;
+	size_t		index;
+
+	*count = 0;
+	if (options->models != NULL) {
+		cursor = options->models;
+		while (cursor != NULL) {
+			comma = strchr(cursor, ',');
+			if (comma == NULL)
+				comma = cursor + strlen(cursor);
+			if (comma > cursor) {
+				if ((*count > 0 &&
+				    buffer_append_string(names, ", ") == -1) ||
+				    buffer_append(names, cursor,
+				    (size_t)(comma - cursor)) == -1)
+					return -1;
+				(*count)++;
+			}
+			cursor = *comma == '\0' ? NULL : comma + 1;
+		}
+		return 0;
+	}
+	models = json_object_get(catalog->root, "models");
+	if (!json_is_array(models))
+		return -1;
+	json_array_foreach(models, index, model) {
+		const char *slug;
+		const char *visibility;
+		json_t *supported;
+
+		slug = json_string_value(json_object_get(model, "slug"));
+		visibility = json_string_value(json_object_get(model, "visibility"));
+		supported = json_object_get(model, "supported_in_api");
+		if (slug != NULL && !json_is_false(supported) &&
+		    (visibility == NULL || strcmp(visibility, "list") == 0) &&
+		    append_model_name(names, slug, count) == -1)
+			return -1;
+	}
+	return 0;
+}
+
+static int
+announce_startup(const char *host, const char *port,
+    const struct proxy_options *options, const struct model_catalog *catalog)
+{
+	struct buffer	message;
+	struct buffer	names;
+	size_t		count;
+	char		count_text[32];
+	int		length;
+	int		result;
+
+	buffer_init(&message);
+	buffer_init(&names);
+	if (append_startup_models(&names, options, catalog, &count) == -1 ||
+	    (count == 0 && buffer_append_string(&names, "none") == -1))
+		goto fail;
+	length = snprintf(count_text, sizeof(count_text), "%zu", count);
+	if (length < 0 || (size_t)length >= sizeof(count_text))
+		goto fail;
+	if (buffer_append_string(&message, "oaioauthc ready\n  API: http://") == -1 ||
+	    buffer_append_string(&message, host) == -1 ||
+	    buffer_append_string(&message, ":") == -1 ||
+	    buffer_append_string(&message, port) == -1 ||
+	    buffer_append_string(&message, "/v1\n  Models (") == -1 ||
+	    buffer_append(&message, count_text, (size_t)length) == -1 ||
+	    buffer_append_string(&message, "): ") == -1 ||
+	    buffer_append(&message, names.data, names.len) == -1 ||
+	    buffer_append_string(&message, "\n  Stop: Ctrl-C\n") == -1)
+		goto fail;
+	result = write_all(STDERR_FILENO, message.data, message.len);
+	buffer_free(&names);
+	buffer_free(&message);
+	return result;
+
+fail:
+	buffer_free(&names);
+	buffer_free(&message);
+	return -1;
+}
+
+static int
 handle_models(int fd, const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog)
 {
@@ -739,6 +974,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	request = json_load_string_checked(body, error, sizeof(error));
 	if (request == NULL)
 		return send_error(fd, 400, error, "invalid_request_error");
+	debug_json_value(options, "client request", request);
 	if (as_chat) {
 		upstream_request = json_chat_to_responses(request, error, sizeof(error));
 		if (upstream_request == NULL) {
@@ -777,6 +1013,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		json_decref(request);
 		return send_error(fd, 500, error, "server_error");
 	}
+	debug_json_value(options, "Codex request", upstream_request);
 	request_text = json_dump_compact(upstream_request);
 	json_decref(upstream_request);
 	if (request_text == NULL) {
@@ -918,6 +1155,8 @@ handle_image(int fd, const struct proxy_options *options,
 		return send_error(fd, prepared_result == IMAGE_RESULT_NOMEM ?
 		    500 : 400, error, prepared_result == IMAGE_RESULT_NOMEM ?
 		    "server_error" : "invalid_request_error");
+	debug_json_text(options, edit ? "Codex image edit request" :
+	    "Codex image generation request", prepared);
 	url = upstream_url(options, edit ? "images/edits" :
 	    "images/generations");
 	if (url == NULL) {
@@ -1002,8 +1241,11 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	size_t		workers;
 	struct sigaction	action;
 	struct request	request;
+	struct auth_session session;
+	struct model_catalog catalog;
 	const char	*host;
 	const char	*port;
+	const char	*auth_file;
 	char		*codex_version;
 	struct proxy_options	effective_options;
 
@@ -1052,8 +1294,40 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	}
 	effective_options = *options;
 	effective_options.codex_version = codex_version;
-	(void)fprintf(stderr, "OpenAI-compatible endpoint ready at http://%s:%s/v1\n",
-	    host, port);
+	memset(&catalog, 0, sizeof(catalog));
+	if (options->models == NULL) {
+		auth_file = options->auth_file == NULL ? auth_default_file() :
+		    options->auth_file;
+		if (auth_file == NULL || auth_load(auth_file, &session, error,
+		    length) == -1) {
+			close(listen_fd);
+			free(codex_version);
+			return -1;
+		}
+		if (auth_session_needs_refresh(&session) && auth_refresh(auth_file,
+		    options->client_id, options->token_url, &session, error,
+		    length) == -1) {
+			auth_session_free(&session);
+			close(listen_fd);
+			free(codex_version);
+			return -1;
+		}
+		if (load_model_catalog(&effective_options, &session, &catalog, error,
+		    length) == -1) {
+			auth_session_free(&session);
+			close(listen_fd);
+			free(codex_version);
+			return -1;
+		}
+		auth_session_free(&session);
+	}
+	if (announce_startup(host, port, &effective_options, &catalog) == -1) {
+		model_catalog_free(&catalog);
+		close(listen_fd);
+		free(codex_version);
+		set_error(error, length, "could not write startup message");
+		return -1;
+	}
 	workers = 0;
 	for (;;) {
 		while (waitpid(-1, NULL, WNOHANG) > 0) {
@@ -1081,10 +1355,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			continue;
 		}
 		if (pid == 0) {
-			struct model_catalog catalog;
-
 			close(listen_fd);
-			memset(&catalog, 0, sizeof(catalog));
 			if (read_request(client_fd, &request) == -1)
 				(void)send_error(client_fd, 400,
 				    "Malformed HTTP request.",
@@ -1103,6 +1374,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		close(client_fd);
 	}
 	close(listen_fd);
+	model_catalog_free(&catalog);
 	free(codex_version);
 	set_error(error, length, "server accept failed: %s", strerror(errno));
 	return -1;

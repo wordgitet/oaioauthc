@@ -1,6 +1,7 @@
 #include "util.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -291,14 +292,17 @@ int
 main(void)
 {
 	char	path[] = "/tmp/oaioauthc-proxy-XXXXXX";
+	char	debug_path[] = "/tmp/oaioauthc-debug-XXXXXX";
 	char	base_url[128];
 	char	mock_port[16];
 	char	port[16];
 	char	response[16384];
 	const char	*edit_body;
+	struct buffer	debug_output;
 	pid_t	mock_pid;
 	pid_t	pid;
 	int	fd;
+	int	debug_fd;
 	int	result;
 	int	slow_fd;
 	int	status;
@@ -306,13 +310,19 @@ main(void)
 	pid = -1;
 	mock_pid = -1;
 	slow_fd = -1;
+	debug_fd = -1;
 	result = 1;
+	buffer_init(&debug_output);
 	fd = mkstemp(path);
 	REQUIRE(fd != -1);
 	REQUIRE(close(fd) == 0);
 	REQUIRE(write_private_file(path,
 	    "{\"tokens\":{\"access_token\":\"access\","
 	    "\"account_id\":\"acct_1\"}}") == 0);
+	debug_fd = mkstemp(debug_path);
+	REQUIRE(debug_fd != -1);
+	REQUIRE(close(debug_fd) == 0);
+	debug_fd = -1;
 	REQUIRE(reserve_port(port, sizeof(port)) == 0);
 	REQUIRE(reserve_port(mock_port, sizeof(mock_port)) == 0);
 	REQUIRE(snprintf(base_url, sizeof(base_url), "http://127.0.0.1:%s",
@@ -324,9 +334,14 @@ main(void)
 	pid = fork();
 	REQUIRE(pid != -1);
 	if (pid == 0) {
+		debug_fd = open(debug_path, O_WRONLY | O_APPEND);
+		if (debug_fd == -1 ||
+		    dup2(debug_fd, STDERR_FILENO) == -1)
+			_exit(126);
+		close(debug_fd);
 		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
 		    "--oauth-file", path, "--base-url", base_url,
-		    "--codex-version", "9.9.9", (char *)NULL);
+		    "--codex-version", "9.9.9", "--debug-json", (char *)NULL);
 		_exit(127);
 	}
 	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
@@ -342,8 +357,8 @@ main(void)
 	    "Host: localhost\r\n\r\n", response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"id\":\"gpt-test\"") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
-	    "{\"model\":\"gpt-test\",\"input\":\"hi\"}", response,
-	    sizeof(response)) == 0);
+	    "{\"model\":\"gpt-test\",\"input\":\"hi\","
+	    "\"access_token\":\"debug-secret\"}", response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"status\":\"completed\"") != NULL);
 	REQUIRE(strstr(response, "\"text\":\"hello\"") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
@@ -358,7 +373,9 @@ main(void)
 	REQUIRE(strstr(response, "\"cached_tokens\":1") != NULL);
 	REQUIRE(request_json(port, "/v1/chat/completions",
 	    "{\"model\":\"gpt-test\",\"messages\":[{\"role\":\"user\","
-	    "\"content\":\"hi\"}],\"stream\":true}", response,
+	    "\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":"
+	    "\"hello\"},{\"role\":\"user\",\"content\":\"continue\"}],"
+	    "\"stream\":true}", response,
 	    sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"content\":\"hello\"") != NULL);
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
@@ -401,9 +418,56 @@ main(void)
 	    "2;test=yes\r\n{}\r\n0\r\nX-Test: yes\r\n\r\n", response,
 	    sizeof(response)) == 0);
 	REQUIRE(strstr(response, "404 Error") != NULL);
+	REQUIRE(read_file(debug_path, &debug_output) == 0);
+	REQUIRE(strstr(debug_output.data, "oaioauthc ready\n") != NULL);
+	REQUIRE(strstr(debug_output.data, "Models (1): gpt-test") != NULL);
+	REQUIRE(strstr(debug_output.data, "client request") != NULL);
+	REQUIRE(strstr(debug_output.data, "Codex request") != NULL);
+	REQUIRE(strstr(debug_output.data, "client request: {\"model\"") != NULL);
+	REQUIRE(strstr(debug_output.data, "\"type\":\"output_text\"") != NULL);
+	REQUIRE(strstr(debug_output.data, "[redacted data URL:") != NULL);
+	REQUIRE(strstr(debug_output.data, "data:image/png;base64,YWJj") == NULL);
+	REQUIRE(strstr(debug_output.data, "\"access_token\":\"[redacted]\"") !=
+	    NULL);
+	REQUIRE(strstr(debug_output.data, "debug-secret") == NULL);
+	REQUIRE(strstr(debug_output.data, "acct_1") == NULL);
+	REQUIRE(kill(pid, SIGTERM) == 0);
+	REQUIRE(waitpid(pid, &status, 0) == pid);
+	pid = -1;
+	buffer_free(&debug_output);
+	buffer_init(&debug_output);
+	debug_fd = open(debug_path, O_WRONLY | O_TRUNC);
+	REQUIRE(debug_fd != -1);
+	REQUIRE(close(debug_fd) == 0);
+	debug_fd = -1;
+	REQUIRE(reserve_port(port, sizeof(port)) == 0);
+	pid = fork();
+	REQUIRE(pid != -1);
+	if (pid == 0) {
+		debug_fd = open(debug_path, O_WRONLY | O_APPEND);
+		if (debug_fd == -1 ||
+		    dup2(debug_fd, STDERR_FILENO) == -1)
+			_exit(126);
+		close(debug_fd);
+		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
+		    "--oauth-file", path, "--base-url", base_url,
+		    "--codex-version", "9.9.9", "--debug-json=pretty",
+		    (char *)NULL);
+		_exit(127);
+	}
+	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
+	REQUIRE(request_json(port, "/v1/responses",
+	    "{\"model\":\"gpt-test\",\"input\":\"pretty\"}", response,
+	    sizeof(response)) == 0);
+	REQUIRE(read_file(debug_path, &debug_output) == 0);
+	REQUIRE(strstr(debug_output.data,
+	    "client request: {\n  \"model\": \"gpt-test\"") != NULL);
 	result = 0;
 
 cleanup:
+	buffer_free(&debug_output);
+	if (debug_fd != -1)
+		close(debug_fd);
 	if (slow_fd != -1)
 		close(slow_fd);
 	if (pid > 0) {
@@ -415,5 +479,6 @@ cleanup:
 		(void)waitpid(mock_pid, &status, 0);
 	}
 	(void)unlink(path);
+	(void)unlink(debug_path);
 	return result;
 }
