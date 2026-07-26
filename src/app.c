@@ -104,6 +104,8 @@ static char
 	query = strchr(target, '?');
 	if (query == NULL)
 		return NULL;
+	end = NULL;
+	equal = NULL;
 	cursor = query + 1;
 	while (*cursor != '\0') {
 		end = strchr(cursor, '&');
