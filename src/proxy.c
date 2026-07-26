@@ -367,15 +367,15 @@ handle_responses(int fd, const struct proxy_options *options,
 			    "choices"), 0), "message");
 			chunk = json_pack("{s:s,s:s,s:i,s:s,s:[{s:i,s:{s:s,s:o},s:n}]}",
 			    "id", "chatcmpl_local", "object", "chat.completion.chunk",
-			    "created", 0, "model", json_string_value(json_object_get(request,
-			    "model")) == NULL ? "" : json_string_value(json_object_get(request,
+			    "created", 0, "model", json_string_value(json_object_get(chat,
+			    "model")) == NULL ? "" : json_string_value(json_object_get(chat,
 			    "model")), "choices", "index", 0, "delta", "role", "assistant",
 			    "content", json_deep_copy(json_object_get(message, "content")),
 			    "finish_reason");
 			final_chunk = json_pack("{s:s,s:s,s:i,s:s,s:[{s:i,s:{},s:s}]}",
 			    "id", "chatcmpl_local", "object", "chat.completion.chunk",
-			    "created", 0, "model", json_string_value(json_object_get(request,
-			    "model")) == NULL ? "" : json_string_value(json_object_get(request,
+			    "created", 0, "model", json_string_value(json_object_get(chat,
+			    "model")) == NULL ? "" : json_string_value(json_object_get(chat,
 			    "model")), "choices", "index", 0, "delta", "finish_reason", "stop");
 			buffer_init(&stream);
 			text = json_dump_compact(chunk);
