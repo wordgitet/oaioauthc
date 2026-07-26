@@ -225,10 +225,27 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 		number[line_length] = '\0';
 		errno = 0;
 		chunk_length = strtoull(number, &end, 16);
-		if (errno != 0 || end == number || *end != '\0' ||
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (errno != 0 || end == number ||
+		    (*end != '\0' && *end != ';') ||
 		    chunk_length > MAX_REQUEST_SIZE - body.len)
 			goto fail;
 		cursor = (size_t)(line_end - raw->data) + 2;
+		if (chunk_length == 0) {
+			for (;;) {
+				if (raw->len - cursor >= 2 &&
+				    raw->data[cursor] == '\r' &&
+				    raw->data[cursor + 1] == '\n')
+					break;
+				if (strstr(raw->data + cursor,
+				    "\r\n\r\n") != NULL)
+					break;
+				if (read_more(fd, raw) == -1)
+					goto fail;
+			}
+			break;
+		}
 		while (raw->len - cursor < (size_t)chunk_length + 2) {
 			if (read_more(fd, raw) == -1)
 				goto fail;
@@ -240,8 +257,6 @@ read_chunked_body(int fd, struct buffer *raw, size_t cursor,
 		    (size_t)chunk_length) == -1)
 			goto fail;
 		cursor += (size_t)chunk_length + 2;
-		if (chunk_length == 0)
-			break;
 	}
 	request->body = buffer_steal(&body);
 	return request->body == NULL ? -1 : 0;

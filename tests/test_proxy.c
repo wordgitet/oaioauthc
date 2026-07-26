@@ -335,7 +335,8 @@ main(void)
 	REQUIRE(strstr(response, "404 Error") != NULL);
 	REQUIRE(request_port(port, "POST /missing HTTP/1.1\r\n"
 	    "Host: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-	    "2\r\n{}\r\n0\r\n\r\n", response, sizeof(response)) == 0);
+	    "2;test=yes\r\n{}\r\n0\r\nX-Test: yes\r\n\r\n", response,
+	    sizeof(response)) == 0);
 	REQUIRE(strstr(response, "404 Error") != NULL);
 	result = 0;
 
