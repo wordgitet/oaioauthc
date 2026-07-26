@@ -86,6 +86,11 @@ json_normalize_response_request(json_t *request, int force_stream,
 		set_error(error, length, "request body must be a JSON object");
 		return -1;
 	}
+	if (!json_is_string(json_object_get(request, "model")) ||
+	    json_string_length(json_object_get(request, "model")) == 0) {
+		set_error(error, length, "`model` must be a non-empty string");
+		return -1;
+	}
 	input = json_object_get(request, "input");
 	if (json_is_string(input)) {
 		content = json_pack("[{s:s,s:s}]", "type", "input_text", "text",
@@ -281,6 +286,11 @@ json_t
 	size_t	index;
 
 	messages = json_object_get(chat, "messages");
+	if (!json_is_string(json_object_get(chat, "model")) ||
+	    json_string_length(json_object_get(chat, "model")) == 0) {
+		set_error(error, length, "`model` must be a non-empty string");
+		return NULL;
+	}
 	if (!json_is_array(messages)) {
 		set_error(error, length, "`messages` must be an array");
 		return NULL;
@@ -336,10 +346,7 @@ json_t
 		}
 	}
 	result = json_pack("{s:o}", "input", input);
-	if (json_is_string(json_object_get(chat, "model")))
-		json_object_set(result, "model", json_object_get(chat, "model"));
-	else
-		json_object_set_new(result, "model", json_string("gpt-5.2"));
+	json_object_set(result, "model", json_object_get(chat, "model"));
 	if (json_is_boolean(json_object_get(chat, "stream")))
 		json_object_set(result, "stream", json_object_get(chat, "stream"));
 	if (json_is_integer(json_object_get(chat, "max_tokens")))

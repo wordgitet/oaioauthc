@@ -79,5 +79,12 @@ main(void)
 	    "tool_choice"), "name")), "lookup") == 0);
 	json_decref(converted);
 	json_decref(chat);
+
+	chat = json_load_string_checked(
+	    "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}",
+	    error, sizeof(error));
+	CHECK(chat != NULL);
+	CHECK(json_chat_to_responses(chat, error, sizeof(error)) == NULL);
+	json_decref(chat);
 	return 0;
 }
