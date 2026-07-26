@@ -477,6 +477,7 @@ main(void)
 	pid = fork();
 	REQUIRE(pid != -1);
 	if (pid == 0) {
+		close(STDERR_FILENO);
 		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
 		    "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", (char *)NULL);

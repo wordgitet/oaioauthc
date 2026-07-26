@@ -1320,13 +1320,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			auth_session_free(&session);
 		}
 	}
-	if (announce_startup(host, port, &effective_options, &catalog) == -1) {
-		model_catalog_free(&catalog);
-		close(listen_fd);
-		free(codex_version);
-		set_error(error, length, "could not write startup message");
-		return -1;
-	}
+	(void)announce_startup(host, port, &effective_options, &catalog);
 	workers = 0;
 	for (;;) {
 		while (waitpid(-1, NULL, WNOHANG) > 0) {
