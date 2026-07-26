@@ -918,7 +918,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	    host, port);
 	workers = 0;
 	for (;;) {
-		while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+		while (waitpid(-1, NULL, WNOHANG) > 0) {
 			if (workers > 0)
 				workers--;
 		}
