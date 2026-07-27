@@ -408,7 +408,7 @@ main(void)
 		if (debug_fd == -1 || dup2(debug_fd, STDERR_FILENO) == -1)
 			_exit(126);
 		close(debug_fd);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
+		execl("../src/oaioauthc", "oaioauthc", "serve", "-p", port,
 		    "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", "--debug-json", (char *)NULL);
 		_exit(127);

@@ -25,6 +25,7 @@ make check
 
 The server binds to `127.0.0.1:10531` by default. Credentials are read from
 `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, unless `--oauth-file` is set.
+Use `-p PORT` or `--port PORT` to select a different local listener port.
 Use `/v1/models` to discover the account's current models; Responses and Chat
 Completions requests must specify one explicitly. The Codex client version is
 discovered automatically at startup; use `--codex-version` to provide an

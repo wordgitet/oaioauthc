@@ -30,6 +30,7 @@
 
 #include "app.h"
 #include "auth.h"
+#include "config.h"
 #include "proxy.h"
 #include "util.h"
 
@@ -39,11 +40,39 @@ usage(FILE *stream)
 {
 	(void)fprintf(stream,
 	    "Usage:\n"
-	    "  oaioauthc serve [--host HOST] [--port PORT] [--models IDS]\n"
+	    "  oaioauthc serve [-p PORT] [--host HOST] [--models IDS]\n"
 	    "                  [--codex-version VERSION] [--base-url URL]\n"
 	    "                  [--oauth-file PATH]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
-	    "  oaioauthc login [--oauth-file PATH] [--no-open]\n");
+	    "  oaioauthc login [--oauth-file PATH] [--open|--no-open]\n"
+	    "  oaioauthc --help\n"
+	    "  oaioauthc --version\n");
+}
+
+/* Parse one positive decimal command-line value within maximum. */
+static int
+parse_positive_number(const char *value, unsigned long maximum,
+    unsigned long *number)
+{
+	const unsigned char *cursor;
+	unsigned long	     digit;
+	unsigned long	     result;
+
+	if (value == NULL || value[0] == '\0')
+		return -1;
+	result = 0;
+	for (cursor = (const unsigned char *)value; *cursor != '\0'; cursor++) {
+		if (*cursor < '0' || *cursor > '9')
+			return -1;
+		digit = (unsigned long)(*cursor - '0');
+		if (result > (maximum - digit) / 10)
+			return -1;
+		result = result * 10 + digit;
+	}
+	if (result == 0)
+		return -1;
+	*number = result;
+	return 0;
 }
 
 /*
@@ -354,6 +383,7 @@ app_main(int argc, char **argv)
 	int		     index;
 	int		     open;
 	char		     error[256];
+	unsigned long	     port_number;
 
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
 		(void)fprintf(stderr, "could not ignore SIGPIPE: %s\n",
@@ -370,9 +400,12 @@ app_main(int argc, char **argv)
 		if (strcmp(argv[index], "--host") == 0)
 			options.host =
 			    option_value(&index, argc, argv, "--host");
-		else if (strcmp(argv[index], "--port") == 0)
+		else if (strcmp(argv[index], "--port") == 0 ||
+		    strcmp(argv[index], "-p") == 0)
 			options.port =
 			    option_value(&index, argc, argv, "--port");
+		else if (strncmp(argv[index], "--port=", 7) == 0)
+			options.port = argv[index] + 7;
 		else if (strcmp(argv[index], "--models") == 0)
 			options.models =
 			    option_value(&index, argc, argv, "--models");
@@ -402,10 +435,16 @@ app_main(int argc, char **argv)
 			    "invalid --debug-json format: %s\n",
 			    argv[index] + 13);
 			return 1;
-		} else if (strcmp(argv[index], "--no-open") == 0)
+		} else if (strcmp(argv[index], "--open") == 0)
+			open = 1;
+		else if (strcmp(argv[index], "--no-open") == 0)
 			open = 0;
-		else if (strcmp(argv[index], "--help") == 0) {
+		else if (strcmp(argv[index], "--help") == 0 ||
+		    strcmp(argv[index], "-h") == 0) {
 			usage(stdout);
+			return 0;
+		} else if (strcmp(argv[index], "--version") == 0) {
+			(void)printf("%s\n", PACKAGE_VERSION);
 			return 0;
 		} else {
 			usage(stderr);
@@ -413,6 +452,13 @@ app_main(int argc, char **argv)
 		}
 		if (index >= argc || argv[index] == NULL)
 			return 1;
+	}
+	if (options.port != NULL &&
+	    parse_positive_number(options.port, 65535UL, &port_number) == -1) {
+		(void)fprintf(stderr,
+		    "invalid port \"%s\" (expected a number from 1 to 65535)\n",
+		    options.port);
+		return 1;
 	}
 	if (strcmp(command, "login") == 0)
 		return run_login(&options, open);
