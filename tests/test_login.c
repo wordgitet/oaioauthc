@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,8 +23,8 @@
 
 /* Run one login child, optionally cancelling it after startup. */
 static int
-run_login_child(const char *timeout, int cancel_signal, char *output,
-    size_t output_length)
+run_login_child(const char *timeout, int cancel_signal, const char *auth_path,
+    const char *expected, char *output, size_t output_length)
 {
 	struct timespec delay;
 	char	       *cursor;
@@ -48,8 +49,8 @@ run_login_child(const char *timeout, int cancel_signal, char *output,
 			_exit(126);
 		close(output_pipe[1]);
 		execl("../src/oaioauthc", "oaioauthc", "login", "--no-open",
-		    "--login-timeout-ms", timeout, "--oauth-file",
-		    "/tmp/oaioauthc-login-test-missing.json", (char *)NULL);
+		    "--login-timeout-ms", timeout, "--oauth-file", auth_path,
+		    (char *)NULL);
 		_exit(127);
 	}
 	close(output_pipe[1]);
@@ -82,7 +83,7 @@ run_login_child(const char *timeout, int cancel_signal, char *output,
 	output[used] = '\0';
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 1)
 		return -1;
-	cursor = strstr(output, cancel_signal == 0 ? "timed out" : "cancelled");
+	cursor = strstr(output, expected);
 	return cursor == NULL ? -1 : 0;
 }
 
@@ -90,9 +91,27 @@ run_login_child(const char *timeout, int cancel_signal, char *output,
 int
 main(void)
 {
+	char auth_path[128];
+	char existing_path[128];
 	char output[4096];
+	int  fd;
 
-	CHECK(run_login_child("100", 0, output, sizeof(output)) == 0);
-	CHECK(run_login_child("5000", SIGTERM, output, sizeof(output)) == 0);
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-test-missing-%ld.json", (long)getpid());
+	(void)snprintf(existing_path, sizeof(existing_path),
+	    "/tmp/oaioauthc-login-test-existing-%ld.json", (long)getpid());
+	(void)unlink(auth_path);
+	(void)unlink(existing_path);
+
+	CHECK(run_login_child("100", 0, auth_path, "timed out", output,
+		  sizeof(output)) == 0);
+	CHECK(run_login_child("5000", SIGTERM, auth_path, "cancelled", output,
+		  sizeof(output)) == 0);
+	fd = open(existing_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	CHECK(fd != -1);
+	CHECK(close(fd) == 0);
+	CHECK(run_login_child("5000", 0, existing_path, "interactive terminal",
+		  output, sizeof(output)) == 0);
+	CHECK(unlink(existing_path) == 0);
 	return 0;
 }

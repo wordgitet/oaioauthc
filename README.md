@@ -30,6 +30,8 @@ Use `-p PORT` or `--port PORT` to select a different local listener port.
 `--login-timeout-ms MS` to select a positive timeout. `--no-open` keeps the
 browser closed, while `--open` requests the default desktop opener. Use
 `--help` or `--version` to inspect the command-line interface.
+When the target auth file already exists, login requires an interactive
+confirmation before replacing it; non-interactive invocations are refused.
 Use `/v1/models` to discover the account's current models; Responses and Chat
 Completions requests must specify one explicitly. The Codex client version is
 discovered automatically at startup; use `--codex-version` to provide an

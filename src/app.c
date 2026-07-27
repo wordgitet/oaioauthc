@@ -8,10 +8,10 @@
 ** the returned state, exchanges the code, and stores the resulting Codex
 ** auth.json session.
 **
-** The callback listener is deliberately restricted to 127.0.0.1:1455 and
-** accepts exactly one request.  Its parser recognizes only the request line
-** and query parameters needed for the OAuth redirect.  Public HTTP parsing,
-** request limits, and route dispatch belong to proxy.c instead.
+** The callback listener is restricted to the IPv4 and IPv6 loopback addresses
+** on port 1455 and accepts exactly one request.  Its parser recognizes only
+** the request line and query parameters needed for the OAuth redirect. Public
+** HTTP parsing, request limits, and route dispatch belong to proxy.c instead.
 */
 
 #include <sys/types.h>
@@ -35,6 +35,10 @@
 #include "config.h"
 #include "proxy.h"
 #include "util.h"
+
+#define CALLBACK_PORT	   1455
+#define CALLBACK_LISTENERS 2
+#define CALLBACK_URI	   "http://localhost:1455/auth/callback"
 
 /* Set by the short-lived login signal handlers; read by the main thread. */
 static volatile sig_atomic_t login_signal_received;
@@ -120,6 +124,50 @@ open_browser(const char *url)
 	return 0;
 }
 
+/*
+** Refuse to overwrite credentials silently.
+**
+** A login exchange returns bearer credentials, so replacing an existing
+** auth.json is a destructive security operation even though auth_save uses an
+** atomic rename.  Non-interactive callers cannot answer safely and must opt
+** into the replacement from a terminal.
+*/
+static int
+confirm_auth_overwrite(const char *path)
+{
+	char answer[32];
+
+	if (access(path, F_OK) == -1) {
+		if (errno == ENOENT)
+			return 0;
+		(void)fprintf(stderr, "could not inspect auth file %s: %s\n",
+		    path, strerror(errno));
+		return -1;
+	}
+	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+		(void)fprintf(stderr,
+		    "OpenAI OAuth credentials already exist at %s.\n"
+		    "Run login in an interactive terminal to confirm overwrite.\n",
+		    path);
+		return -1;
+	}
+	(void)fprintf(stdout,
+	    "OpenAI OAuth credentials already exist at %s.\n"
+	    "Sign in with ChatGPT again and overwrite them? [y/N] ",
+	    path);
+	if (fflush(stdout) == EOF ||
+	    fgets(answer, sizeof(answer), stdin) == NULL) {
+		(void)fprintf(stderr,
+		    "could not read overwrite confirmation\n");
+		return -1;
+	}
+	if (answer[0] != 'y' && answer[0] != 'Y') {
+		(void)fprintf(stdout, "Login cancelled.\n");
+		return 1;
+	}
+	return 0;
+}
+
 /* Record interruption without calling non-async-signal-safe functions. */
 static void
 login_signal_handler(int signal_number)
@@ -157,33 +205,102 @@ restore_login_signals(const struct sigaction *old_interrupt,
 }
 
 /*
-** Open the fixed loopback listener used by the OAuth redirect URI.
+** Open loopback listeners used by the OAuth redirect URI.
 **
-** Binding INADDR_LOOPBACK, rather than all interfaces, prevents another host
-** from submitting an authorization code to a local login attempt.
+** The redirect uses the hostname "localhost", whose address-family choice is
+** controlled by the browser and resolver.  Bind both IPv6 and IPv4 loopback
+** addresses so a successful authorization cannot fail solely because one
+** family was preferred.  A listener is never exposed on a non-loopback
+** interface.
 */
 static int
-listen_callback(void)
+listen_callback(int listeners[CALLBACK_LISTENERS])
 {
-	struct sockaddr_in address;
-	int		   fd;
-	int		   one;
+	struct sockaddr_in  address4;
+	struct sockaddr_in6 address6;
+	int		    count;
+	int		    fd;
+	int		    one;
+	int		    saved_errno;
+
+	listeners[0] = -1;
+	listeners[1] = -1;
+	count = 0;
+	saved_errno = EAFNOSUPPORT;
+	fd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (fd != -1) {
+		one = 1;
+		(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one,
+		    sizeof(one));
+#ifdef IPV6_V6ONLY
+		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one,
+		    sizeof(one));
+#endif
+		memset(&address6, 0, sizeof(address6));
+		address6.sin6_family = AF_INET6;
+		address6.sin6_addr = in6addr_loopback;
+		address6.sin6_port = htons(CALLBACK_PORT);
+		if (bind(fd, (struct sockaddr *)&address6, sizeof(address6)) ==
+			-1 ||
+		    listen(fd, 1) == -1) {
+			saved_errno = errno;
+			close(fd);
+			if (saved_errno != EAFNOSUPPORT &&
+			    saved_errno != EPROTONOSUPPORT &&
+			    saved_errno != EADDRNOTAVAIL)
+				goto fail;
+		} else {
+			listeners[count++] = fd;
+		}
+	} else {
+		saved_errno = errno;
+		if (saved_errno != EAFNOSUPPORT &&
+		    saved_errno != EPROTONOSUPPORT)
+			goto fail;
+	}
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd == -1)
-		return -1;
+	if (fd == -1) {
+		saved_errno = errno;
+		goto fail;
+	}
 	one = 1;
 	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	memset(&address, 0, sizeof(address));
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	address.sin_port = htons(1455);
-	if (bind(fd, (struct sockaddr *)&address, sizeof(address)) == -1 ||
+	memset(&address4, 0, sizeof(address4));
+	address4.sin_family = AF_INET;
+	address4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	address4.sin_port = htons(CALLBACK_PORT);
+	if (bind(fd, (struct sockaddr *)&address4, sizeof(address4)) == -1 ||
 	    listen(fd, 1) == -1) {
+		saved_errno = errno;
 		close(fd);
-		return -1;
+		goto fail;
 	}
-	return fd;
+	listeners[count++] = fd;
+	return count;
+
+fail:
+	while (count > 0)
+		close(listeners[--count]);
+	errno = saved_errno;
+	return -1;
+}
+
+/* Close every callback listener while retaining the caller's errno. */
+static void
+close_callback_listeners(int listeners[CALLBACK_LISTENERS])
+{
+	int index;
+	int saved_errno;
+
+	saved_errno = errno;
+	for (index = 0; index < CALLBACK_LISTENERS; index++) {
+		if (listeners[index] != -1) {
+			close(listeners[index]);
+			listeners[index] = -1;
+		}
+	}
+	errno = saved_errno;
 }
 
 /* Return one hexadecimal digit's numeric value, or -1 for invalid input. */
@@ -299,9 +416,11 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 {
 	struct sigaction     old_interrupt;
 	struct sigaction     old_terminate;
-	struct pollfd	     descriptor;
+	struct pollfd	     descriptors[CALLBACK_LISTENERS];
 	int		     client_fd;
-	int		     listen_fd;
+	int		     listener_count;
+	int		     listeners[CALLBACK_LISTENERS];
+	int		     listener_index;
 	int		     poll_result;
 	int		     signals_installed;
 	char		     request[8192];
@@ -317,6 +436,7 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	char		     error[256];
 	const char	    *path;
 	const char	    *body;
+	int		     overwrite;
 	int		     result;
 
 	/*
@@ -327,20 +447,35 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	memset(&oauth, 0, sizeof(oauth));
 	memset(&session, 0, sizeof(session));
 	client_fd = -1;
-	listen_fd = -1;
+	listeners[0] = -1;
+	listeners[1] = -1;
 	code = NULL;
 	state = NULL;
 	signals_installed = 0;
 	result = 1;
-	listen_fd = listen_callback();
-	if (listen_fd == -1) {
-		(void)fprintf(stderr,
-		    "login needs http://localhost:1455/auth/callback: %s\n",
-		    strerror(errno));
+	path = options->auth_file == NULL ? auth_default_file()
+					  : options->auth_file;
+	if (path == NULL) {
+		(void)fprintf(stderr, "could not determine auth file path\n");
 		return 1;
 	}
-	if (oauth_request_create("http://localhost:1455/auth/callback",
-		options->client_id, &oauth, error, sizeof(error)) == -1) {
+	overwrite = confirm_auth_overwrite(path);
+	if (overwrite != 0)
+		return overwrite < 0 ? 1 : 0;
+	listener_count = listen_callback(listeners);
+	if (listener_count == -1) {
+		if (errno == EADDRINUSE)
+			(void)fprintf(stderr,
+			    "OAuth callback port %d is already in use\n",
+			    CALLBACK_PORT);
+		else
+			(void)fprintf(stderr,
+			    "login needs http://localhost:%d/auth/callback: %s\n",
+			    CALLBACK_PORT, strerror(errno));
+		return 1;
+	}
+	if (oauth_request_create(CALLBACK_URI, options->client_id, &oauth,
+		error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		goto done;
 	}
@@ -355,11 +490,15 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	    oauth.authorization_url);
 	if (should_open)
 		(void)open_browser(oauth.authorization_url);
-	descriptor.fd = listen_fd;
-	descriptor.events = POLLIN;
-	descriptor.revents = 0;
+	for (listener_index = 0; listener_index < listener_count;
+	    listener_index++) {
+		descriptors[listener_index].fd = listeners[listener_index];
+		descriptors[listener_index].events = POLLIN;
+		descriptors[listener_index].revents = 0;
+	}
 	for (;;) {
-		poll_result = poll(&descriptor, 1, timeout_ms);
+		poll_result =
+		    poll(descriptors, (nfds_t)listener_count, timeout_ms);
 		if (poll_result == -1 && errno == EINTR) {
 			if (login_signal_received != 0) {
 				(void)fprintf(stderr,
@@ -379,12 +518,17 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 			    strerror(errno));
 			goto done;
 		}
-		if ((descriptor.revents & (POLLIN | POLLERR | POLLHUP)) != 0)
+		for (listener_index = 0; listener_index < listener_count;
+		    listener_index++) {
+			if ((descriptors[listener_index].revents &
+				(POLLIN | POLLERR | POLLHUP)) != 0)
+				break;
+		}
+		if (listener_index < listener_count)
 			break;
 	}
-	client_fd = accept(listen_fd, NULL, NULL);
-	close(listen_fd);
-	listen_fd = -1;
+	client_fd = accept(listeners[listener_index], NULL, NULL);
+	close_callback_listeners(listeners);
 	if (client_fd == -1) {
 		if (login_signal_received != 0)
 			(void)fprintf(stderr, "OAuth login cancelled\n");
@@ -446,9 +590,9 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	    body);
 	close(client_fd);
 	client_fd = -1;
-	result = oauth_exchange_code(code, oauth.code_verifier,
-	    "http://localhost:1455/auth/callback", options->client_id,
-	    options->token_url, &session, error, sizeof(error));
+	result = oauth_exchange_code(code, oauth.code_verifier, CALLBACK_URI,
+	    options->client_id, options->token_url, &session, error,
+	    sizeof(error));
 	free(code);
 	code = NULL;
 	free(state);
@@ -459,8 +603,6 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		auth_session_free(&session);
 		goto done;
 	}
-	path = options->auth_file == NULL ? auth_default_file()
-					  : options->auth_file;
 	if (auth_save(path, &session, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
@@ -475,8 +617,7 @@ done:
 	free(state);
 	if (client_fd != -1)
 		close(client_fd);
-	if (listen_fd != -1)
-		close(listen_fd);
+	close_callback_listeners(listeners);
 	oauth_request_free(&oauth);
 	auth_session_free(&session);
 	if (signals_installed)
