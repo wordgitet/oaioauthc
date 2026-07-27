@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "app.h"
@@ -134,10 +135,11 @@ open_browser(const char *url)
 ** into the replacement from a terminal.
 */
 static int
-confirm_auth_overwrite(const char *path)
+confirm_auth_overwrite(const char *path, int *replace)
 {
 	char answer[32];
 
+	*replace = 0;
 	if (access(path, F_OK) == -1) {
 		if (errno == ENOENT)
 			return 0;
@@ -166,6 +168,7 @@ confirm_auth_overwrite(const char *path)
 		(void)fprintf(stdout, "Login cancelled.\n");
 		return 1;
 	}
+	*replace = 1;
 	return 0;
 }
 
@@ -174,6 +177,46 @@ static void
 login_signal_handler(int signal_number)
 {
 	login_signal_received = signal_number;
+}
+
+/* Let synchronous helpers observe cancellation without accessing globals. */
+static int
+login_cancel_requested(void *argument)
+{
+	(void)argument;
+	return login_signal_received != 0;
+}
+
+/*
+** Return the milliseconds left in a timeout measured from monotonic start.
+**
+** The timeout is bounded by INT_MAX, so checking whole seconds before the
+** multiplication keeps elapsed arithmetic within signed long long.
+*/
+static int
+remaining_timeout_ms(const struct timespec *start, int timeout_ms)
+{
+	struct timespec now;
+	long long	elapsed;
+	time_t		seconds;
+	long		nanoseconds;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+		return -1;
+	seconds = now.tv_sec - start->tv_sec;
+	nanoseconds = now.tv_nsec - start->tv_nsec;
+	if (nanoseconds < 0) {
+		seconds--;
+		nanoseconds += 1000000000L;
+	}
+	if (seconds < 0)
+		return timeout_ms;
+	if (seconds > (time_t)(timeout_ms / 1000 + 1))
+		return 0;
+	elapsed = (long long)seconds * 1000 + nanoseconds / 1000000L;
+	if (elapsed >= timeout_ms)
+		return 0;
+	return timeout_ms - (int)elapsed;
 }
 
 /* Install the cancellation handlers used only during one login attempt. */
@@ -418,18 +461,22 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	struct sigaction     old_interrupt;
 	struct sigaction     old_terminate;
 	struct pollfd	     descriptors[CALLBACK_LISTENERS];
+	struct timespec	     callback_started;
+	struct timespec	     request_started;
+	struct timeval	     receive_timeout;
+	struct oauth_request oauth;
+	struct auth_session  session;
 	int		     client_fd;
 	int		     listener_count;
 	int		     listeners[CALLBACK_LISTENERS];
 	int		     listener_index;
 	int		     poll_result;
+	int		     remaining_ms;
+	int		     replace_auth;
 	int		     signals_installed;
-	struct timeval	     receive_timeout;
 	char		     request[8192];
 	ssize_t		     count;
 	size_t		     used;
-	struct oauth_request oauth;
-	struct auth_session  session;
 	char		    *code;
 	char		    *method;
 	char		    *state;
@@ -461,7 +508,7 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		(void)fprintf(stderr, "could not determine auth file path\n");
 		return 1;
 	}
-	overwrite = confirm_auth_overwrite(path);
+	overwrite = confirm_auth_overwrite(path, &replace_auth);
 	if (overwrite != 0)
 		return overwrite < 0 ? 1 : 0;
 	listener_count = listen_callback(listeners);
@@ -498,15 +545,33 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		descriptors[listener_index].events = POLLIN;
 		descriptors[listener_index].revents = 0;
 	}
+	if (clock_gettime(CLOCK_MONOTONIC, &callback_started) == -1) {
+		(void)fprintf(stderr,
+		    "could not start OAuth callback timeout: %s\n",
+		    strerror(errno));
+		goto done;
+	}
 	for (;;) {
+		if (login_signal_received != 0) {
+			(void)fprintf(stderr, "OAuth login cancelled\n");
+			goto done;
+		}
+		remaining_ms =
+		    remaining_timeout_ms(&callback_started, timeout_ms);
+		if (remaining_ms == -1) {
+			(void)fprintf(stderr,
+			    "could not update OAuth callback timeout: %s\n",
+			    strerror(errno));
+			goto done;
+		}
+		if (remaining_ms == 0) {
+			(void)fprintf(stderr,
+			    "OAuth login timed out waiting for callback\n");
+			goto done;
+		}
 		poll_result =
-		    poll(descriptors, (nfds_t)listener_count, timeout_ms);
+		    poll(descriptors, (nfds_t)listener_count, remaining_ms);
 		if (poll_result == -1 && errno == EINTR) {
-			if (login_signal_received != 0) {
-				(void)fprintf(stderr,
-				    "OAuth login cancelled\n");
-				goto done;
-			}
 			continue;
 		}
 		if (poll_result == 0) {
@@ -529,6 +594,11 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		if (listener_index < listener_count)
 			break;
 	}
+	if (login_signal_received != 0) {
+		(void)fprintf(stderr, "OAuth login cancelled\n");
+		result = 1;
+		goto done;
+	}
 	if ((descriptors[listener_index].revents & POLLNVAL) != 0) {
 		(void)fprintf(stderr,
 		    "OAuth callback listener became invalid\n");
@@ -545,23 +615,47 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 			    strerror(errno));
 		goto done;
 	}
-	receive_timeout.tv_sec = timeout_ms / 1000;
-	receive_timeout.tv_usec = (timeout_ms % 1000) * 1000;
-	if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
-		sizeof(receive_timeout)) == -1) {
+	if (clock_gettime(CLOCK_MONOTONIC, &request_started) == -1) {
 		(void)fprintf(stderr,
-		    "could not limit OAuth callback request: %s\n",
+		    "could not start OAuth callback request timeout: %s\n",
 		    strerror(errno));
 		goto done;
 	}
 	used = 0;
 	while (used + 1 < sizeof(request)) {
+		if (login_signal_received != 0)
+			break;
+		remaining_ms =
+		    remaining_timeout_ms(&request_started, timeout_ms);
+		if (remaining_ms == -1) {
+			(void)fprintf(stderr,
+			    "could not update OAuth callback request timeout: %s\n",
+			    strerror(errno));
+			goto done;
+		}
+		if (remaining_ms == 0) {
+			(void)fprintf(stderr,
+			    "OAuth login timed out reading callback request\n");
+			goto done;
+		}
+		receive_timeout.tv_sec = remaining_ms / 1000;
+		receive_timeout.tv_usec = (remaining_ms % 1000) * 1000;
+		if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+			&receive_timeout, sizeof(receive_timeout)) == -1) {
+			(void)fprintf(stderr,
+			    "could not limit OAuth callback request: %s\n",
+			    strerror(errno));
+			goto done;
+		}
 		count =
 		    read(client_fd, request + used, sizeof(request) - used - 1);
-		if (count == -1 && errno == EINTR && login_signal_received == 0)
-			continue;
 		if (count == -1 && errno == EINTR)
-			break;
+			continue;
+		if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			(void)fprintf(stderr,
+			    "OAuth login timed out reading callback request\n");
+			goto done;
+		}
 		if (count <= 0)
 			break;
 		used += (size_t)count;
@@ -606,22 +700,38 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	    body);
 	close(client_fd);
 	client_fd = -1;
+	if (login_signal_received != 0) {
+		(void)fprintf(stderr, "OAuth login cancelled\n");
+		goto done;
+	}
 	result = oauth_exchange_code(code, oauth.code_verifier, CALLBACK_URI,
-	    options->client_id, options->token_url, &session, error,
-	    sizeof(error));
+	    options->client_id, options->token_url, login_cancel_requested,
+	    NULL, &session, error, sizeof(error));
 	free(code);
 	code = NULL;
 	free(state);
 	state = NULL;
 	oauth_request_free(&oauth);
 	if (result == -1) {
-		(void)fprintf(stderr, "%s\n", error);
+		if (login_signal_received != 0)
+			(void)fprintf(stderr, "OAuth login cancelled\n");
+		else
+			(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
+		result = 1;
 		goto done;
 	}
-	if (auth_save(path, &session, error, sizeof(error)) == -1) {
+	if (login_signal_received != 0) {
+		(void)fprintf(stderr, "OAuth login cancelled\n");
+		result = 1;
+		goto done;
+	}
+	if ((replace_auth ? auth_save(path, &session, error, sizeof(error))
+			  : auth_save_new(path, &session, error,
+				sizeof(error))) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
+		result = 1;
 		goto done;
 	}
 	auth_session_free(&session);

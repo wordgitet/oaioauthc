@@ -205,20 +205,21 @@ read_file(const char *path, struct buffer *buffer)
 }
 
 /*
-** Atomically replace path with private text data.
+** Write private text through a synchronized sibling temporary file.
 **
-** The temporary file is created next to path so rename remains atomic within
-** one filesystem.  fsync makes the data durable before rename; failure removes
-** the temporary name and leaves the previous credential file untouched.
+** replace selects atomic rename over an existing destination.  A new-only
+** installation uses link instead, whose EEXIST result guarantees that a file
+** created after the caller's initial check is never replaced.
 */
-int
-write_private_file(const char *path, const char *data)
+static int
+write_private_file_internal(const char *path, const char *data, int replace)
 {
 	struct buffer temporary;
 	int	      fd;
 	int	      result;
+	int	      saved_errno;
 
-	/* Write, sync, and rename a 0600 temporary file to avoid torn credentials. */
+	/* Write and sync a 0600 temporary before exposing its complete contents. */
 	if (make_parent_directories(path) == -1)
 		return -1;
 	buffer_init(&temporary);
@@ -237,19 +238,55 @@ write_private_file(const char *path, const char *data)
 		result = fsync(fd);
 	if (close(fd) == -1)
 		result = -1;
-	if (result == 0)
-		result = rename(temporary.data, path);
+	if (result == 0) {
+		if (replace)
+			result = rename(temporary.data, path);
+		else
+			result = link(temporary.data, path);
+	}
 	if (result == -1) {
+		saved_errno = errno;
 		(void)unlink(temporary.data);
 		buffer_free(&temporary);
+		errno = saved_errno;
 		return -1;
 	}
+	/*
+	 * The destination is complete once link succeeds.  A cleanup failure may
+	 * leave a private sibling, but must not report that credentials were not
+	 * installed when path already names the synchronized inode.
+	 */
+	if (!replace)
+		(void)unlink(temporary.data);
 	buffer_free(&temporary);
 	return 0;
 
 fail:
 	buffer_free(&temporary);
 	return -1;
+}
+
+/*
+** Atomically replace path with private text data.
+**
+** Readers see the previous complete file or the synchronized replacement.
+*/
+int
+write_private_file(const char *path, const char *data)
+{
+	return write_private_file_internal(path, data, 1);
+}
+
+/*
+** Atomically install path only if it remains absent.
+**
+** link provides the no-replace operation required to keep a credential file
+** that appears during an interactive login from being overwritten silently.
+*/
+int
+write_private_file_new(const char *path, const char *data)
+{
+	return write_private_file_internal(path, data, 0);
 }
 
 /*

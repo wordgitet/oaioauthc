@@ -10,5 +10,7 @@ PKG_CHECK_MODULES([OPENSSL], [openssl])
 PKG_CHECK_MODULES([JANSSON], [jansson >= 2.14])
 AC_CHECK_HEADERS([sys/socket.h netinet/in.h arpa/inet.h netdb.h])
 AC_CHECK_FUNCS([getaddrinfo getrandom])
+AC_SEARCH_LIBS([clock_gettime], [rt], [],
+    [AC_MSG_ERROR([clock_gettime is required for login deadlines])])
 AC_CONFIG_FILES([Makefile src/Makefile tests/Makefile])
 AC_OUTPUT

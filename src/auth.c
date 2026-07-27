@@ -361,25 +361,27 @@ auth_load(const char *path, struct auth_session *session, char *error,
 }
 
 /*
-** Merge session credentials into a Codex-compatible auth.json file.
+** Serialize session credentials with caller-selected replacement behavior.
 **
-** Existing unrelated top-level and token fields survive the merge.  The final
-** serialization is installed through write_private_file, so readers see old
-** complete credentials or new complete credentials, never a partial JSON file.
+** Replacement preserves unrelated fields from an existing Codex auth.json.
+** A new-only save starts from an empty object and uses an atomic no-replace
+** installation so a concurrently created credential file remains untouched.
 */
-int
-auth_save(const char *path, const struct auth_session *session, char *error,
-    size_t length)
+static int
+auth_save_internal(const char *path, const struct auth_session *session,
+    int replace, char *error, size_t length)
 {
 	struct buffer buffer;
 	json_t	     *root;
 	json_t	     *tokens;
 	char	     *text;
+	int	      result;
 
 	/* Preserve unknown Codex fields so this remains a cooperative auth.json. */
 	buffer_init(&buffer);
-	root = read_file(path, &buffer) == 0 ? json_loads(buffer.data, 0, NULL)
-					     : NULL;
+	root = replace && read_file(path, &buffer) == 0
+	    ? json_loads(buffer.data, 0, NULL)
+	    : NULL;
 	buffer_free(&buffer);
 	if (!json_is_object(root)) {
 		json_decref(root);
@@ -406,14 +408,45 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 		    json_string(session->last_refresh));
 	text = json_dumps(root, JSON_INDENT(2));
 	json_decref(root);
-	if (text == NULL || write_private_file(path, text) == -1) {
+	if (text == NULL) {
+		set_error(error, length, "could not serialize auth file");
+		return -1;
+	}
+	result = replace ? write_private_file(path, text)
+			 : write_private_file_new(path, text);
+	if (result == -1) {
 		free(text);
-		set_error(error, length, "could not write auth file: %s",
-		    strerror(errno));
+		if (!replace && errno == EEXIST)
+			set_error(error, length,
+			    "auth file appeared during login; credentials were not replaced");
+		else
+			set_error(error, length,
+			    "could not write auth file: %s", strerror(errno));
 		return -1;
 	}
 	free(text);
 	return 0;
+}
+
+/*
+** Merge session credentials into a Codex-compatible auth.json file.
+**
+** Readers see old complete credentials or new complete credentials, never a
+** partially serialized file.
+*/
+int
+auth_save(const char *path, const struct auth_session *session, char *error,
+    size_t length)
+{
+	return auth_save_internal(path, session, 1, error, length);
+}
+
+/* Atomically install a new credential file without replacing another writer. */
+int
+auth_save_new(const char *path, const struct auth_session *session, char *error,
+    size_t length)
+{
+	return auth_save_internal(path, session, 0, error, length);
 }
 
 /*
@@ -680,6 +713,7 @@ oauth_request_free(struct oauth_request *request)
 int
 oauth_exchange_code(const char *code, const char *code_verifier,
     const char *redirect_uri, const char *client_id, const char *token_url,
+    oauth_cancel_callback cancel, void *cancel_argument,
     struct auth_session *session, char *error, size_t length)
 {
 	char		    *escaped_code;
@@ -715,7 +749,7 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 	free(escaped_redirect);
 	result =
 	    http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-		body.data, &response, error, length);
+		body.data, cancel, cancel_argument, &response, error, length);
 	buffer_free(&body);
 	if (result == -1)
 		return -1;

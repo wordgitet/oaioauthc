@@ -39,6 +39,9 @@ struct oauth_request {
 	char *code_verifier;
 };
 
+/* Return non-zero when a synchronous OAuth transfer should be cancelled. */
+typedef int (*oauth_cancel_callback)(void *);
+
 /* Return the cached default CODEX_HOME/auth.json or ~/.codex/auth.json path. */
 const char *
 auth_default_file(void);
@@ -51,6 +54,9 @@ auth_load(const char *, struct auth_session *, char *, size_t);
 /* Atomically merge session credentials into an auth.json file. */
 int
 auth_save(const char *, const struct auth_session *, char *, size_t);
+/* Install session credentials only while the destination remains absent. */
+int
+auth_save_new(const char *, const struct auth_session *, char *, size_t);
 /* Return non-zero when a refresh should precede an upstream request. */
 int
 auth_session_needs_refresh(const struct auth_session *);
@@ -68,6 +74,7 @@ oauth_request_free(struct oauth_request *);
 /* Exchange one state-validated code; session owns credentials on success. */
 int
 oauth_exchange_code(const char *, const char *, const char *, const char *,
-    const char *, struct auth_session *, char *, size_t);
+    const char *, oauth_cancel_callback, void *, struct auth_session *, char *,
+    size_t);
 
 #endif

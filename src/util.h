@@ -50,6 +50,9 @@ read_file(const char *, struct buffer *);
 /* Atomically write mode-0600 text and create private parent directories. */
 int
 write_private_file(const char *, const char *);
+/* Install private text only when the destination does not already exist. */
+int
+write_private_file_new(const char *, const char *);
 int
 make_parent_directories(const char *);
 /* Return HOME or a current-directory fallback when HOME is unavailable. */

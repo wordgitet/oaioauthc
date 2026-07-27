@@ -39,6 +39,12 @@ struct write_context {
 	void		     *argument;
 };
 
+/* Per-transfer cancellation callback passed through libcurl progress checks. */
+struct cancel_context {
+	http_cancel_callback callback;
+	void		    *argument;
+};
+
 /* Populate an optional caller diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
@@ -156,6 +162,21 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 	return length;
 }
 
+/* Abort a synchronous transfer after the caller records cancellation. */
+static int
+transfer_progress(void *argument, curl_off_t download_total,
+    curl_off_t download_now, curl_off_t upload_total, curl_off_t upload_now)
+{
+	struct cancel_context *context;
+
+	(void)download_total;
+	(void)download_now;
+	(void)upload_total;
+	(void)upload_now;
+	context = argument;
+	return context->callback(context->argument) != 0;
+}
+
 /*
 ** Perform one synchronous HTTP exchange.
 **
@@ -169,13 +190,15 @@ static int
 request(const char *url, const char *method, const char *body,
     const char *authorization, const char *account_id, const char *extra_header,
     const char *content_type, http_write_callback callback, void *argument,
+    http_cancel_callback cancel, void *cancel_argument,
     struct http_response *response, char *error, size_t error_length)
 {
-	CURL		    *curl;
-	CURLcode	     code;
-	struct curl_slist   *headers;
-	struct buffer	     response_body;
-	struct write_context context;
+	CURL		     *curl;
+	CURLcode	      code;
+	struct cancel_context cancel_context;
+	struct curl_slist    *headers;
+	struct buffer	      response_body;
+	struct write_context  context;
 
 	/*
 	 * response is reset before work begins.  On success its body is owned by
@@ -187,6 +210,8 @@ request(const char *url, const char *method, const char *body,
 	context.body = &response_body;
 	context.callback = callback;
 	context.argument = argument;
+	cancel_context.callback = cancel;
+	cancel_context.argument = cancel_argument;
 	headers = NULL;
 	curl = curl_easy_init();
 	if (curl == NULL) {
@@ -224,6 +249,12 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);
+	if (cancel != NULL) {
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+		    transfer_progress);
+		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &cancel_context);
+	}
 	if (body != NULL)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 	if (body != NULL)
@@ -261,7 +292,8 @@ http_post_json(const char *url, const char *body, const char *authorization,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, authorization, account_id,
-	    extra_header, NULL, NULL, NULL, response, error, error_length);
+	    extra_header, NULL, NULL, NULL, NULL, NULL, response, error,
+	    error_length);
 }
 
 /* POST JSON and deliver successful response fragments to callback. */
@@ -272,18 +304,19 @@ http_post_json_stream(const char *url, const char *body,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, authorization, account_id,
-	    extra_header, NULL, callback, argument, response, error,
+	    extra_header, NULL, callback, argument, NULL, NULL, response, error,
 	    error_length);
 }
 
 /* POST an OAuth URL-encoded body without Codex authorization headers. */
 int
-http_post_form(const char *url, const char *body,
-    struct http_response *response, char *error, size_t error_length)
+http_post_form(const char *url, const char *body, http_cancel_callback cancel,
+    void *cancel_argument, struct http_response *response, char *error,
+    size_t error_length)
 {
 	return request(url, "POST", body, NULL, NULL, NULL,
 	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL,
-	    response, error, error_length);
+	    cancel, cancel_argument, response, error, error_length);
 }
 
 /* GET an authenticated Codex resource into a bounded buffered response. */
@@ -292,7 +325,7 @@ http_get(const char *url, const char *authorization, const char *account_id,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "GET", NULL, authorization, account_id, NULL, NULL,
-	    NULL, NULL, response, error, error_length);
+	    NULL, NULL, NULL, NULL, response, error, error_length);
 }
 
 /* Release both response allocations and reset the structure for safe reuse. */

@@ -26,6 +26,8 @@ struct http_response {
 ** transfer and causes the corresponding HTTP helper to fail.
 */
 typedef int (*http_write_callback)(const void *, size_t, void *);
+/* Return non-zero when a synchronous transfer should stop promptly. */
+typedef int (*http_cancel_callback)(void *);
 
 /* POST one JSON body with optional Codex bearer/account/feature headers. */
 int
@@ -38,8 +40,8 @@ http_post_json_stream(const char *, const char *, const char *, const char *,
     size_t);
 /* POST an OAuth form body without Codex authorization headers. */
 int
-http_post_form(const char *, const char *, struct http_response *, char *,
-    size_t);
+http_post_form(const char *, const char *, http_cancel_callback, void *,
+    struct http_response *, char *, size_t);
 /* GET an authenticated Codex endpoint into a bounded response. */
 int
 http_get(const char *, const char *, const char *, struct http_response *,
