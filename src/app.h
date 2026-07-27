@@ -9,6 +9,7 @@
 #define OAIOAUTHC_APP_H
 
 /* Return a conventional process status after handling one complete command. */
-int	app_main(int, char **);
+int
+app_main(int, char **);
 
 #endif

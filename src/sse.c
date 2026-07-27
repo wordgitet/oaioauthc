@@ -14,21 +14,21 @@
 ** the conversion because clients must not receive a malformed partial stream.
 */
 
-#include "sse.h"
-#include "util.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "sse.h"
+#include "util.h"
+
 #define MAX_EVENT_SIZE (1024 * 1024)
 
 /* One Codex function-call item and its Chat Completions array position. */
 struct sse_tool {
-	char	*item_id;
-	size_t	index;
-	int	arguments_seen;
+	char  *item_id;
+	size_t index;
+	int    arguments_seen;
 };
 
 /*
@@ -40,16 +40,16 @@ struct sse_tool {
 ** The callback and argument are borrowed for the stream lifetime.
 */
 struct sse_chat_stream {
-	struct buffer		pending;
-	char			*model;
-	char			*id;
-	struct sse_tool		*tools;
-	size_t			tool_count;
-	sse_write_callback	write;
-	void			*argument;
-	time_t			created;
-	int			role_sent;
-	int			done;
+	struct buffer	   pending;
+	char		  *model;
+	char		  *id;
+	struct sse_tool	  *tools;
+	size_t		   tool_count;
+	sse_write_callback write;
+	void		  *argument;
+	time_t		   created;
+	int		   role_sent;
+	int		   done;
 };
 
 /* Set a short parse diagnostic in the caller-owned error buffer. */
@@ -70,11 +70,11 @@ set_error(char *error, size_t length, const char *message)
 static int
 collect_output_item(json_t *items, json_t *item)
 {
-	const char	*id;
-	const char	*existing_id;
-	json_t		*copy;
-	json_t		*existing;
-	size_t		index;
+	const char *id;
+	const char *existing_id;
+	json_t	   *copy;
+	json_t	   *existing;
+	size_t	    index;
 
 	if (!json_is_object(item))
 		return 0;
@@ -84,8 +84,10 @@ collect_output_item(json_t *items, json_t *item)
 	copy = json_deep_copy(item);
 	if (copy == NULL)
 		return -1;
-	json_array_foreach(items, index, existing) {
-		existing_id = json_string_value(json_object_get(existing, "id"));
+	json_array_foreach(items, index, existing)
+	{
+		existing_id = json_string_value(
+		    json_object_get(existing, "id"));
 		if (existing_id != NULL && strcmp(existing_id, id) == 0)
 			return json_array_set_new(items, index, copy);
 	}
@@ -96,9 +98,9 @@ collect_output_item(json_t *items, json_t *item)
 static int
 emit_json(struct sse_chat_stream *stream, json_t *value)
 {
-	struct buffer	line;
-	char		*text;
-	int		result;
+	struct buffer line;
+	char	     *text;
+	int	      result;
 
 	text = json_dumps(value, JSON_COMPACT);
 	if (text == NULL)
@@ -121,23 +123,22 @@ static int
 emit_chunk(struct sse_chat_stream *stream, json_t *delta,
     const char *finish_reason)
 {
-	json_t	*choice;
-	json_t	*choices;
-	json_t	*chunk;
-	json_t	*finish;
+	json_t *choice;
+	json_t *choices;
+	json_t *chunk;
+	json_t *finish;
 	int	result;
 
-	finish = finish_reason == NULL ? json_null() :
-	    json_string(finish_reason);
+	finish = finish_reason == NULL ? json_null()
+				       : json_string(finish_reason);
 	choice = json_pack("{s:i,s:O,s:o}", "index", 0, "delta", delta,
 	    "finish_reason", finish);
 	if (choice == NULL)
 		return -1;
 	choices = json_pack("[o]", choice);
-	chunk = json_pack("{s:s,s:s,s:I,s:s,s:o}", "id", stream->id,
-	    "object", "chat.completion.chunk", "created",
-	    (json_int_t)stream->created, "model", stream->model, "choices",
-	    choices);
+	chunk = json_pack("{s:s,s:s,s:I,s:s,s:o}", "id", stream->id, "object",
+	    "chat.completion.chunk", "created", (json_int_t)stream->created,
+	    "model", stream->model, "choices", choices);
 	if (chunk == NULL)
 		return -1;
 	result = emit_json(stream, chunk);
@@ -149,7 +150,7 @@ emit_chunk(struct sse_chat_stream *stream, json_t *delta,
 static int
 emit_role(struct sse_chat_stream *stream)
 {
-	json_t	*delta;
+	json_t *delta;
 	int	result;
 
 	if (stream->role_sent)
@@ -168,7 +169,7 @@ emit_role(struct sse_chat_stream *stream)
 static struct sse_tool *
 find_tool(struct sse_chat_stream *stream, const char *item_id)
 {
-	size_t	index;
+	size_t index;
 
 	if (item_id == NULL)
 		return NULL;
@@ -188,13 +189,13 @@ find_tool(struct sse_chat_stream *stream, const char *item_id)
 static int
 emit_tool_start(struct sse_chat_stream *stream, json_t *item)
 {
-	struct sse_tool	*next;
-	struct sse_tool	*tool;
+	struct sse_tool *next;
+	struct sse_tool *tool;
 	const char	*item_id;
 	const char	*call_id;
 	const char	*name;
 	json_t		*delta;
-	int		result;
+	int		 result;
 
 	item_id = json_string_value(json_object_get(item, "id"));
 	call_id = json_string_value(json_object_get(item, "call_id"));
@@ -214,9 +215,9 @@ emit_tool_start(struct sse_chat_stream *stream, json_t *item)
 		return -1;
 	tool->index = stream->tool_count++;
 	tool->arguments_seen = 0;
-	delta = json_pack("{s:[{s:I,s:s,s:s,s:{s:s,s:s}}]}",
-	    "tool_calls", "index", (json_int_t)tool->index, "id", call_id,
-	    "type", "function", "function", "name", name, "arguments", "");
+	delta = json_pack("{s:[{s:I,s:s,s:s,s:{s:s,s:s}}]}", "tool_calls",
+	    "index", (json_int_t)tool->index, "id", call_id, "type", "function",
+	    "function", "name", name, "arguments", "");
 	if (delta == NULL)
 		return -1;
 	result = emit_role(stream);
@@ -231,9 +232,9 @@ static int
 emit_tool_arguments(struct sse_chat_stream *stream, const char *item_id,
     const char *arguments)
 {
-	struct sse_tool	*tool;
+	struct sse_tool *tool;
 	json_t		*delta;
-	int		result;
+	int		 result;
 
 	tool = find_tool(stream, item_id);
 	if (tool == NULL || arguments == NULL || arguments[0] == '\0')
@@ -253,10 +254,10 @@ emit_tool_arguments(struct sse_chat_stream *stream, const char *item_id,
 static int
 emit_usage(struct sse_chat_stream *stream, json_t *response)
 {
-	json_t	*upstream;
-	json_t	*details;
-	json_t	*usage;
-	json_t	*chunk;
+	json_t *upstream;
+	json_t *details;
+	json_t *usage;
+	json_t *chunk;
 	int	result;
 
 	upstream = json_object_get(response, "usage");
@@ -272,12 +273,12 @@ emit_usage(struct sse_chat_stream *stream, json_t *response)
 	if (json_is_integer(json_object_get(details, "cached_tokens")))
 		json_object_set_new(usage, "prompt_tokens_details",
 		    json_pack("{s:O}", "cached_tokens",
-		    json_object_get(details, "cached_tokens")));
+			json_object_get(details, "cached_tokens")));
 	details = json_object_get(upstream, "output_tokens_details");
 	if (json_is_integer(json_object_get(details, "reasoning_tokens")))
 		json_object_set_new(usage, "completion_tokens_details",
 		    json_pack("{s:O}", "reasoning_tokens",
-		    json_object_get(details, "reasoning_tokens")));
+			json_object_get(details, "reasoning_tokens")));
 	chunk = json_pack("{s:s,s:s,s:I,s:s,s:[],s:o}", "id", stream->id,
 	    "object", "chat.completion.chunk", "created",
 	    (json_int_t)stream->created, "model", stream->model, "choices",
@@ -298,7 +299,7 @@ emit_usage(struct sse_chat_stream *stream, json_t *response)
 static int
 finish_chat_stream(struct sse_chat_stream *stream, json_t *response)
 {
-	json_t	*delta;
+	json_t *delta;
 	int	result;
 
 	if (stream->done)
@@ -308,13 +309,14 @@ finish_chat_stream(struct sse_chat_stream *stream, json_t *response)
 	if (result == 0 && delta == NULL)
 		result = -1;
 	if (result == 0)
-		result = emit_chunk(stream, delta, stream->tool_count > 0 ?
-		    "tool_calls" : "stop");
+		result = emit_chunk(stream, delta,
+		    stream->tool_count > 0 ? "tool_calls" : "stop");
 	json_decref(delta);
 	if (result == 0 && response != NULL)
 		result = emit_usage(stream, response);
 	if (result == 0)
-		result = stream->write("data: [DONE]\n\n", 14, stream->argument);
+		result =
+		    stream->write("data: [DONE]\n\n", 14, stream->argument);
 	if (result == 0)
 		stream->done = 1;
 	return result;
@@ -333,12 +335,12 @@ process_event(struct sse_chat_stream *stream, const char *data)
 	const char	*type;
 	const char	*item_id;
 	const char	*delta_text;
-	json_error_t	error;
+	json_error_t	 error;
 	json_t		*event;
 	json_t		*item;
 	json_t		*response;
-	struct sse_tool	*tool;
-	int		result;
+	struct sse_tool *tool;
+	int		 result;
 
 	/* One complete Codex event may produce zero, one, or several chat chunks. */
 	if (strcmp(data, "[DONE]") == 0)
@@ -384,9 +386,10 @@ process_event(struct sse_chat_stream *stream, const char *data)
 		}
 	} else if (type != NULL &&
 	    strcmp(type, "response.output_item.added") == 0 &&
-	    strcmp(json_string_value(json_object_get(item, "type")) == NULL ?
-	    "" : json_string_value(json_object_get(item, "type")),
-	    "function_call") == 0) {
+	    strcmp(json_string_value(json_object_get(item, "type")) == NULL
+		    ? ""
+		    : json_string_value(json_object_get(item, "type")),
+		"function_call") == 0) {
 		result = emit_tool_start(stream, item);
 	} else if (type != NULL &&
 	    strcmp(type, "response.function_call_arguments.delta") == 0) {
@@ -401,9 +404,9 @@ process_event(struct sse_chat_stream *stream, const char *data)
 		tool = find_tool(stream, item_id);
 		if (result == 0 && tool != NULL && !tool->arguments_seen)
 			result = emit_tool_arguments(stream, item_id,
-			    json_string_value(json_object_get(item, "arguments")));
-	} else if (type != NULL &&
-	    strcmp(type, "response.completed") == 0) {
+			    json_string_value(
+				json_object_get(item, "arguments")));
+	} else if (type != NULL && strcmp(type, "response.completed") == 0) {
 		result = finish_chat_stream(stream, response);
 	}
 	json_decref(event);
@@ -414,8 +417,8 @@ process_event(struct sse_chat_stream *stream, const char *data)
 static int
 process_block(struct sse_chat_stream *stream, char *block)
 {
-	char	*line;
-	char	*next;
+	char *line;
+	char *next;
 
 	line = block;
 	while (line != NULL) {
@@ -444,7 +447,7 @@ struct sse_chat_stream *
 sse_chat_stream_new(const char *model, sse_write_callback callback,
     void *argument)
 {
-	struct sse_chat_stream	*stream;
+	struct sse_chat_stream *stream;
 
 	stream = calloc(1, sizeof(*stream));
 	if (stream == NULL)
@@ -473,10 +476,10 @@ int
 sse_chat_stream_feed(struct sse_chat_stream *stream, const void *data,
     size_t length)
 {
-	const char	*source;
-	char		*separator;
-	size_t		index;
-	size_t		consumed;
+	const char *source;
+	char	   *separator;
+	size_t	    index;
+	size_t	    consumed;
 
 	/* Transport writes may split any SSE line, so retain an incomplete block. */
 	source = data;
@@ -522,7 +525,7 @@ sse_chat_stream_finish(struct sse_chat_stream *stream)
 void
 sse_chat_stream_free(struct sse_chat_stream *stream)
 {
-	size_t	index;
+	size_t index;
 
 	if (stream == NULL)
 		return;
@@ -542,16 +545,16 @@ sse_chat_stream_free(struct sse_chat_stream *stream)
 ** output array when Codex delivered the items separately.  The caller owns the
 ** returned reference; a missing completed response sets error and returns NULL.
 */
-json_t
-*sse_collect_completed_response(const char *stream, char *error, size_t length)
+json_t *
+sse_collect_completed_response(const char *stream, char *error, size_t length)
 {
-	char	*copy;
-	char	*cursor;
-	char	*block;
-	char	*source;
-	char	*destination;
-	json_t	*items;
-	json_t	*latest;
+	char   *copy;
+	char   *cursor;
+	char   *block;
+	char   *source;
+	char   *destination;
+	json_t *items;
+	json_t *latest;
 
 	/* Non-streaming Codex replies use SSE too; retain only the final response. */
 	copy = oaio_strdup(stream);
@@ -571,12 +574,12 @@ json_t
 	latest = NULL;
 	cursor = copy;
 	while (cursor != NULL) {
-		char *data;
-		char *next;
+		char	    *data;
+		char	    *next;
 		json_error_t json_error;
-		json_t *event;
-		json_t *item;
-		json_t *response;
+		json_t	    *event;
+		json_t	    *item;
+		json_t	    *response;
 
 		next = strstr(cursor, "\n\n");
 		if (next != NULL)
@@ -609,7 +612,8 @@ json_t
 	}
 	free(copy);
 	if (latest == NULL) {
-		set_error(error, length, "no completed response found in SSE stream");
+		set_error(error, length,
+		    "no completed response found in SSE stream");
 	} else if (json_array_size(items) > 0 &&
 	    json_array_size(json_object_get(latest, "output")) == 0) {
 		if (json_object_set(latest, "output", items) == -1) {

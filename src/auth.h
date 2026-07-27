@@ -20,11 +20,11 @@
 ** last_refresh supports conservative renewal for opaque access tokens.
 */
 struct auth_session {
-	char	*access_token;
-	char	*refresh_token;
-	char	*id_token;
-	char	*account_id;
-	char	*last_refresh;
+	char *access_token;
+	char *refresh_token;
+	char *id_token;
+	char *account_id;
+	char *last_refresh;
 };
 
 /*
@@ -34,31 +34,40 @@ struct auth_session {
 ** only until the authorization code exchange completes.
 */
 struct oauth_request {
-	char	*authorization_url;
-	char	*state;
-	char	*code_verifier;
+	char *authorization_url;
+	char *state;
+	char *code_verifier;
 };
 
 /* Return the cached default CODEX_HOME/auth.json or ~/.codex/auth.json path. */
-const char	*auth_default_file(void);
+const char *
+auth_default_file(void);
 /* Release every auth_session allocation and reset all members to NULL. */
-void	auth_session_free(struct auth_session *);
+void
+auth_session_free(struct auth_session *);
 /* Load usable Codex credentials; session owns results on success. */
-int	auth_load(const char *, struct auth_session *, char *, size_t);
+int
+auth_load(const char *, struct auth_session *, char *, size_t);
 /* Atomically merge session credentials into an auth.json file. */
-int	auth_save(const char *, const struct auth_session *, char *, size_t);
+int
+auth_save(const char *, const struct auth_session *, char *, size_t);
 /* Return non-zero when a refresh should precede an upstream request. */
-int	auth_session_needs_refresh(const struct auth_session *);
+int
+auth_session_needs_refresh(const struct auth_session *);
 /* Refresh session through OAuth and persist it to path on success. */
-int	auth_refresh(const char *, const char *, const char *,
-	    struct auth_session *, char *, size_t);
+int
+auth_refresh(const char *, const char *, const char *, struct auth_session *,
+    char *, size_t);
 /* Build a PKCE authorization request; request owns all outputs on success. */
-int	oauth_request_create(const char *, const char *, struct oauth_request *,
-	    char *, size_t);
+int
+oauth_request_create(const char *, const char *, struct oauth_request *, char *,
+    size_t);
 /* Release all oauth_request allocations and reset its members. */
-void	oauth_request_free(struct oauth_request *);
+void
+oauth_request_free(struct oauth_request *);
 /* Exchange one state-validated code; session owns credentials on success. */
-int	oauth_exchange_code(const char *, const char *, const char *, const char *,
-	    const char *, struct auth_session *, char *, size_t);
+int
+oauth_exchange_code(const char *, const char *, const char *, const char *,
+    const char *, struct auth_session *, char *, size_t);
 
 #endif

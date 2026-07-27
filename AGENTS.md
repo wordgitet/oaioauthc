@@ -30,6 +30,42 @@ These instructions apply to the entire repository.
 - Keep parsing length-aware. Do not use string functions on untrusted binary
   request bodies.
 
+### Rules outside clang-format
+
+`.clang-format` handles whitespace and layout only. Apply these rules during
+review because a formatter cannot determine their intent:
+
+- Keep all implementation code ISO C99. Do not introduce C11/C23 features,
+  compiler extensions, or GNU-only syntax.
+- Use lower-case `snake_case` for identifiers. Use upper-case names for
+  manifest constants, unsafe macros, and enumeration values. Expression-like
+  macros must parenthesize their arguments and expansion.
+- Include headers in KNF groups: kernel/system headers first, network headers
+  next, other system headers alphabetically, and local headers last. Keep one
+  blank line between groups.
+- Declare variables before statements in every block. Order local variables
+  by size and then alphabetically; order structure members by use, size, and
+  then alphabetically. Align member names and trailing comments where the
+  declaration remains readable.
+- Put a function's return type on its own line and its opening brace on the
+  following line. Use ANSI prototypes and keep private prototypes `static`.
+- Use `NULL` for null pointers, `bool` with `true` and `false` for booleans,
+  and parenthesize values in `return` statements. Do not use K&R declarations
+  or definitions.
+- Keep comments as complete, filled sentences. Every source file needs a
+  header comment explaining its responsibility, invariants, ownership, and
+  externally visible behavior. Major routines need comments that explain
+  their contract and non-obvious failure paths.
+- Keep diagnostic and protocol strings on one logical line when possible;
+  callers and tests may grep them. Do not split strings merely to satisfy
+  the column limit.
+- Treat clang-format output as a first pass, not as an authority over KNF.
+  Review declaration columns, continuation indentation, and comment blocks
+  before accepting an in-place formatting change.
+- Check allocation, integer bounds, I/O results, cleanup ownership, and
+  authentication failure paths on every new branch. Add deterministic tests
+  for malformed, truncated, binary, and boundary inputs.
+
 ## Development workflow
 
 1. Inspect `git status` and the relevant code before editing.

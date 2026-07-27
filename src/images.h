@@ -14,8 +14,8 @@
 
 /* Codex OAuth compatibility and bounded-parser limits for image editing. */
 #define IMAGE_MAX_REFERENCE_IMAGES 5
-#define IMAGE_MAX_REFERENCE_BYTES ((size_t)50 * 1024 * 1024)
-#define IMAGE_MAX_EDIT_BODY ((size_t)256 * 1024 * 1024)
+#define IMAGE_MAX_REFERENCE_BYTES  ((size_t)50 * 1024 * 1024)
+#define IMAGE_MAX_EDIT_BODY	   ((size_t)256 * 1024 * 1024)
 
 enum image_result {
 	IMAGE_RESULT_NOMEM = -1,
@@ -24,10 +24,10 @@ enum image_result {
 };
 
 /* Normalize a JSON image generation request to the supported Codex subset. */
-int	image_prepare_generation(const void *, size_t, char **, char *,
-	    size_t);
+int
+image_prepare_generation(const void *, size_t, char **, char *, size_t);
 /* Parse and normalize multipart image editing into JSON data URLs. */
-int	image_prepare_edit(const char *, const void *, size_t, char **, char *,
-	    size_t);
+int
+image_prepare_edit(const char *, const void *, size_t, char **, char *, size_t);
 
 #endif

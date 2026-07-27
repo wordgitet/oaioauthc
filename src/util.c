@@ -13,16 +13,17 @@
 ** directories are created with mode 0700 only as needed for that path.
 */
 
-#include "util.h"
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
+
+#include "util.h"
 
 /*
 ** Initialize buffer for first use.  No allocation occurs here, and the result
@@ -54,9 +55,9 @@ buffer_free(struct buffer *buffer)
 int
 buffer_append(struct buffer *buffer, const void *data, size_t length)
 {
-	size_t	needed;
-	size_t	cap;
-	char	*next;
+	size_t needed;
+	size_t cap;
+	char  *next;
 
 	/* Reserve one trailing NUL while keeping len valid for binary callers. */
 	if (length > (size_t)-1 - buffer->len - 1)
@@ -94,10 +95,10 @@ buffer_append_string(struct buffer *buffer, const char *string)
 ** Empty buffers still return an allocated empty string.  This avoids forcing
 ** every caller that hands a buffer to a string API to special-case NULL.
 */
-char
-*buffer_steal(struct buffer *buffer)
+char *
+buffer_steal(struct buffer *buffer)
 {
-	char	*data;
+	char *data;
 
 	if (buffer->data == NULL) {
 		data = oaio_strdup("");
@@ -109,11 +110,11 @@ char
 }
 
 /* Allocate and copy one NUL-terminated string, or return NULL on allocation. */
-char
-*oaio_strdup(const char *string)
+char *
+oaio_strdup(const char *string)
 {
-	size_t	length;
-	char	*copy;
+	size_t length;
+	char  *copy;
 
 	length = strlen(string) + 1;
 	copy = malloc(length);
@@ -129,15 +130,15 @@ char
 ** paths: preserving the supplied fragments is important for user-selected
 ** credential locations and avoids changing symlink resolution semantics.
 */
-char
-*oaio_join_path(const char *left, const char *right)
+char *
+oaio_join_path(const char *left, const char *right)
 {
-	struct buffer	buffer;
+	struct buffer buffer;
 
 	buffer_init(&buffer);
 	if (buffer_append_string(&buffer, left) == -1 ||
 	    (left[0] != '\0' && left[strlen(left) - 1] != '/' &&
-	     buffer_append_string(&buffer, "/") == -1) ||
+		buffer_append_string(&buffer, "/") == -1) ||
 	    buffer_append_string(&buffer, right) == -1) {
 		buffer_free(&buffer);
 		return NULL;
@@ -154,8 +155,8 @@ char
 int
 write_all(int fd, const void *data, size_t length)
 {
-	const char	*cursor;
-	ssize_t	written;
+	const char *cursor;
+	ssize_t	    written;
 
 	cursor = data;
 	while (length > 0) {
@@ -182,7 +183,7 @@ int
 read_file(const char *path, struct buffer *buffer)
 {
 	char	chunk[4096];
-	ssize_t	count;
+	ssize_t count;
 	int	fd;
 
 	fd = open(path, O_RDONLY);
@@ -213,9 +214,9 @@ read_file(const char *path, struct buffer *buffer)
 int
 write_private_file(const char *path, const char *data)
 {
-	struct buffer	temporary;
-	int		fd;
-	int		result;
+	struct buffer temporary;
+	int	      fd;
+	int	      result;
 
 	/* Write, sync, and rename a 0600 temporary file to avoid torn credentials. */
 	if (make_parent_directories(path) == -1)
@@ -261,9 +262,9 @@ fail:
 int
 make_parent_directories(const char *path)
 {
-	char	*copy;
-	char	*cursor;
-	int	result;
+	char *copy;
+	char *cursor;
+	int   result;
 
 	copy = oaio_strdup(path);
 	if (copy == NULL)
@@ -284,10 +285,10 @@ make_parent_directories(const char *path)
 }
 
 /* Return HOME when available, otherwise the relative "." fallback. */
-const char
-*oaio_home_dir(void)
+const char *
+oaio_home_dir(void)
 {
-	const char	*home;
+	const char *home;
 
 	home = getenv("HOME");
 	return home != NULL && home[0] != '\0' ? home : ".";

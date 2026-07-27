@@ -17,33 +17,33 @@
 ** remains the authority that validates the bearer token.
 */
 
+#include <sys/stat.h>
+
+#include <errno.h>
+#include <jansson.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
 #include "auth.h"
 #include "http.h"
 #include "json.h"
 #include "util.h"
 
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-
-#include <errno.h>
-#include <jansson.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <time.h>
-
 #define DEFAULT_CLIENT_ID "app_EMoamEEZ73f0CkXaXp7hrann"
-#define DEFAULT_ISSUER "https://auth.openai.com"
+#define DEFAULT_ISSUER	  "https://auth.openai.com"
 #define DEFAULT_TOKEN_URL "https://auth.openai.com/oauth/token"
-#define REFRESH_INTERVAL 3300
+#define REFRESH_INTERVAL  3300
 
 /* Format an optional caller-owned diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
-	va_list	ap;
+	va_list ap;
 
 	if (error == NULL || length == 0)
 		return;
@@ -58,12 +58,12 @@ set_error(char *error, size_t length, const char *format, ...)
 ** The result is standard Base64 with URL-safe substitutions and no trailing
 ** padding.  The caller owns the result.  Callers pass small bounded lengths.
 */
-static char
-*base64url(const unsigned char *data, size_t length)
+static char *
+base64url(const unsigned char *data, size_t length)
 {
-	char	*encoded;
-	int	encoded_length;
-	size_t	index;
+	char  *encoded;
+	int    encoded_length;
+	size_t index;
 
 	encoded_length = 4 * ((int)length + 2) / 3;
 	encoded = malloc((size_t)encoded_length + 1);
@@ -81,11 +81,11 @@ static char
 }
 
 /* Obtain cryptographically random bytes, then return their Base64url form. */
-static char
-*random_urlsafe(size_t length)
+static char *
+random_urlsafe(size_t length)
 {
-	unsigned char	*bytes;
-	char		*encoded;
+	unsigned char *bytes;
+	char	      *encoded;
 
 	bytes = malloc(length);
 	if (bytes == NULL)
@@ -100,12 +100,12 @@ static char
 }
 
 /* Return the current UTC time in the auth.json RFC 3339 form. */
-static char
-*current_timestamp(void)
+static char *
+current_timestamp(void)
 {
-	char		buffer[32];
-	struct tm	*utc;
-	time_t		now;
+	char	   buffer[32];
+	struct tm *utc;
+	time_t	   now;
 
 	now = time(NULL);
 	utc = gmtime(&now);
@@ -125,18 +125,18 @@ static char
 static long long
 days_from_civil(int year, unsigned int month, unsigned int day)
 {
-	int		era;
-	unsigned int	day_of_era;
-	unsigned int	day_of_year;
-	unsigned int	year_of_era;
+	int	     era;
+	unsigned int day_of_era;
+	unsigned int day_of_year;
+	unsigned int year_of_era;
 
 	year -= month <= 2;
 	era = (year >= 0 ? year : year - 399) / 400;
 	year_of_era = (unsigned int)(year - era * 400);
-	day_of_year = (153 * (month + (month > 2 ? -3U : 9U)) + 2) / 5 +
-	    day - 1;
-	day_of_era = year_of_era * 365 + year_of_era / 4 -
-	    year_of_era / 100 + day_of_year;
+	day_of_year = (153 * (month + (month > 2 ? -3U : 9U)) + 2) / 5 + day -
+	    1;
+	day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 +
+	    day_of_year;
 	return (long long)era * 146097 + day_of_era - 719468;
 }
 
@@ -149,29 +149,28 @@ days_from_civil(int year, unsigned int month, unsigned int day)
 static int
 parse_timestamp(const char *text, time_t *result)
 {
-	static const unsigned int month_days[] = {
-		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
-	};
-	char		tail;
-	long long	seconds;
-	time_t		value;
-	int		year;
-	unsigned int	day;
-	unsigned int	days;
-	unsigned int	hour;
-	unsigned int	minute;
-	unsigned int	month;
-	unsigned int	second;
+	static const unsigned int month_days[] = { 31, 28, 31, 30, 31, 30, 31,
+		31, 30, 31, 30, 31 };
+	char			  tail;
+	long long		  seconds;
+	time_t			  value;
+	int			  year;
+	unsigned int		  day;
+	unsigned int		  days;
+	unsigned int		  hour;
+	unsigned int		  minute;
+	unsigned int		  month;
+	unsigned int		  second;
 
-	if (text == NULL || sscanf(text, "%4d-%2u-%2uT%2u:%2u:%2uZ%c",
-	    &year, &month, &day, &hour, &minute, &second, &tail) != 6)
+	if (text == NULL ||
+	    sscanf(text, "%4d-%2u-%2uT%2u:%2u:%2uZ%c", &year, &month, &day,
+		&hour, &minute, &second, &tail) != 6)
 		return -1;
-	if (month < 1 || month > 12 || hour > 23 || minute > 59 ||
-	    second > 60)
+	if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60)
 		return -1;
 	days = month_days[month - 1];
-	if (month == 2 && (year % 4 == 0 &&
-	    (year % 100 != 0 || year % 400 == 0)))
+	if (month == 2 &&
+	    (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
 		days++;
 	if (day < 1 || day > days)
 		return -1;
@@ -190,21 +189,21 @@ parse_timestamp(const char *text, time_t *result)
 ** The returned string is owned by the caller.  Invalid JWT syntax, invalid
 ** Base64url, missing JSON, or a missing string claim all return NULL.
 */
-static char
-*jwt_account_id(const char *token)
+static char *
+jwt_account_id(const char *token)
 {
-	const char		*first;
-	const char		*second;
-	char		*payload;
-	unsigned char	*decoded;
-	int		decoded_length;
-	size_t		payload_length;
-	size_t		padding;
-	json_error_t	json_error;
-	json_t		*claims;
-	json_t		*auth;
-	json_t		*account;
-	char		*result;
+	const char    *first;
+	const char    *second;
+	char	      *payload;
+	unsigned char *decoded;
+	int	       decoded_length;
+	size_t	       payload_length;
+	size_t	       padding;
+	json_error_t   json_error;
+	json_t	      *claims;
+	json_t	      *auth;
+	json_t	      *account;
+	char	      *result;
 
 	/*
 	 * This extracts routing metadata from a token already obtained through
@@ -252,10 +251,12 @@ static char
 	if (claims == NULL)
 		return NULL;
 	auth = json_object_get(claims, "https://api.openai.com/auth");
-	account = json_is_object(auth) ? json_object_get(auth,
-	    "chatgpt_account_id") : json_object_get(claims, "chatgpt_account_id");
-	result = json_is_string(account) ?
-	    oaio_strdup(json_string_value(account)) : NULL;
+	account = json_is_object(auth)
+	    ? json_object_get(auth, "chatgpt_account_id")
+	    : json_object_get(claims, "chatgpt_account_id");
+	result = json_is_string(account)
+	    ? oaio_strdup(json_string_value(account))
+	    : NULL;
 	json_decref(claims);
 	return result;
 }
@@ -267,12 +268,12 @@ static char
 ** The returned allocation has process lifetime because configuration is read
 ** repeatedly by forked workers and never needs a mutable global path.
 */
-const char
-*auth_default_file(void)
+const char *
+auth_default_file(void)
 {
-	static char	*path;
-	const char	*codex_home;
-	char		*default_home;
+	static char *path;
+	const char  *codex_home;
+	char	    *default_home;
 
 	if (path != NULL)
 		return path;
@@ -281,8 +282,9 @@ const char
 		path = oaio_join_path(codex_home, "auth.json");
 	else {
 		default_home = oaio_join_path(oaio_home_dir(), ".codex");
-		path = default_home == NULL ? NULL : oaio_join_path(default_home,
-		    "auth.json");
+		path = default_home == NULL
+		    ? NULL
+		    : oaio_join_path(default_home, "auth.json");
 		free(default_home);
 	}
 	return path;
@@ -312,23 +314,25 @@ int
 auth_load(const char *path, struct auth_session *session, char *error,
     size_t length)
 {
-	struct buffer	buffer;
-	json_t		*root;
-	json_t		*tokens;
-	const char	*value;
+	struct buffer buffer;
+	json_t	     *root;
+	json_t	     *tokens;
+	const char   *value;
 
 	/* A successful call transfers all duplicated fields to session. */
 	memset(session, 0, sizeof(*session));
 	buffer_init(&buffer);
 	if (read_file(path, &buffer) == -1) {
-		set_error(error, length, "could not read auth file: %s", strerror(errno));
+		set_error(error, length, "could not read auth file: %s",
+		    strerror(errno));
 		return -1;
 	}
 	root = json_load_string_checked(buffer.data, error, length);
 	buffer_free(&buffer);
 	if (root == NULL || !json_is_object(root)) {
 		json_decref(root);
-		set_error(error, length, "auth file must contain a JSON object");
+		set_error(error, length,
+		    "auth file must contain a JSON object");
 		return -1;
 	}
 	tokens = json_object_get(root, "tokens");
@@ -367,14 +371,15 @@ int
 auth_save(const char *path, const struct auth_session *session, char *error,
     size_t length)
 {
-	struct buffer	buffer;
-	json_t	*root;
-	json_t	*tokens;
-	char	*text;
+	struct buffer buffer;
+	json_t	     *root;
+	json_t	     *tokens;
+	char	     *text;
 
 	/* Preserve unknown Codex fields so this remains a cooperative auth.json. */
 	buffer_init(&buffer);
-	root = read_file(path, &buffer) == 0 ? json_loads(buffer.data, 0, NULL) : NULL;
+	root = read_file(path, &buffer) == 0 ? json_loads(buffer.data, 0, NULL)
+					     : NULL;
 	buffer_free(&buffer);
 	if (!json_is_object(root)) {
 		json_decref(root);
@@ -392,15 +397,19 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 		json_object_set_new(tokens, "refresh_token",
 		    json_string(session->refresh_token));
 	if (session->id_token != NULL)
-		json_object_set_new(tokens, "id_token", json_string(session->id_token));
-	json_object_set_new(tokens, "account_id", json_string(session->account_id));
+		json_object_set_new(tokens, "id_token",
+		    json_string(session->id_token));
+	json_object_set_new(tokens, "account_id",
+	    json_string(session->account_id));
 	if (session->last_refresh != NULL)
-		json_object_set_new(root, "last_refresh", json_string(session->last_refresh));
+		json_object_set_new(root, "last_refresh",
+		    json_string(session->last_refresh));
 	text = json_dumps(root, JSON_INDENT(2));
 	json_decref(root);
 	if (text == NULL || write_private_file(path, text) == -1) {
 		free(text);
-		set_error(error, length, "could not write auth file: %s", strerror(errno));
+		set_error(error, length, "could not write auth file: %s",
+		    strerror(errno));
 		return -1;
 	}
 	free(text);
@@ -417,17 +426,17 @@ auth_save(const char *path, const struct auth_session *session, char *error,
 int
 auth_session_needs_refresh(const struct auth_session *session)
 {
-	const char	*first;
-	const char	*second;
-	char		*payload;
-	unsigned char	*decoded;
-	int		decoded_length;
-	size_t		payload_length;
-	size_t		padding;
-	json_t		*claims;
-	json_int_t	expires;
-	int		result;
-	time_t		refreshed;
+	const char    *first;
+	const char    *second;
+	char	      *payload;
+	unsigned char *decoded;
+	int	       decoded_length;
+	size_t	       payload_length;
+	size_t	       padding;
+	json_t	      *claims;
+	json_int_t     expires;
+	int	       result;
+	time_t	       refreshed;
 
 	/* Prefer JWT expiry, then retain a conservative interval for opaque tokens. */
 	if (session->access_token == NULL || session->refresh_token == NULL)
@@ -494,9 +503,9 @@ static int
 token_response(const char *text, struct auth_session *session, char *error,
     size_t length)
 {
-	json_t	*root;
-	const char	*value;
-	char	*account;
+	json_t	   *root;
+	const char *value;
+	char	   *account;
 
 	root = json_load_string_checked(text, error, length);
 	if (root == NULL)
@@ -520,15 +529,16 @@ token_response(const char *text, struct auth_session *session, char *error,
 		session->id_token = oaio_strdup(value);
 	}
 	value = json_string_value(json_object_get(root, "account_id"));
-	account = value == NULL ? jwt_account_id(session->id_token) :
-	    oaio_strdup(value);
+	account = value == NULL ? jwt_account_id(session->id_token)
+				: oaio_strdup(value);
 	if (account == NULL)
 		account = jwt_account_id(session->access_token);
 	if (account == NULL && session->account_id != NULL)
 		account = oaio_strdup(session->account_id);
 	if (account == NULL) {
 		json_decref(root);
-		set_error(error, length, "token response has no ChatGPT account id");
+		set_error(error, length,
+		    "token response has no ChatGPT account id");
 		return -1;
 	}
 	free(session->account_id);
@@ -536,8 +546,9 @@ token_response(const char *text, struct auth_session *session, char *error,
 	free(session->last_refresh);
 	session->last_refresh = current_timestamp();
 	json_decref(root);
-	return session->access_token == NULL || session->last_refresh == NULL ?
-	    -1 : 0;
+	return session->access_token == NULL || session->last_refresh == NULL
+	    ? -1
+	    : 0;
 }
 
 /*
@@ -551,10 +562,10 @@ int
 auth_refresh(const char *path, const char *client_id, const char *token_url,
     struct auth_session *session, char *error, size_t length)
 {
-	struct http_response	response;
-	json_t			*body;
-	char			*text;
-	int			result;
+	struct http_response response;
+	json_t		    *body;
+	char		    *text;
+	int		     result;
 
 	if (session->refresh_token == NULL) {
 		set_error(error, length, "auth file has no refresh token");
@@ -569,8 +580,9 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 	json_decref(body);
 	if (text == NULL)
 		return -1;
-	result = http_post_json(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-	    text, NULL, NULL, NULL, &response, error, length);
+	result =
+	    http_post_json(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
+		text, NULL, NULL, NULL, &response, error, length);
 	free(text);
 	if (result == -1)
 		return -1;
@@ -597,19 +609,19 @@ int
 oauth_request_create(const char *redirect_uri, const char *client_id,
     struct oauth_request *request, char *error, size_t length)
 {
-	unsigned char	digest[EVP_MAX_MD_SIZE];
-	unsigned int	digest_length;
-	char		*challenge;
-	char		*escaped_redirect;
-	struct buffer	url;
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int  digest_length;
+	char	     *challenge;
+	char	     *escaped_redirect;
+	struct buffer url;
 
 	/* state prevents callback substitution; S256 binds the code to this client. */
 	memset(request, 0, sizeof(*request));
 	request->state = random_urlsafe(24);
 	request->code_verifier = random_urlsafe(48);
 	if (request->state == NULL || request->code_verifier == NULL ||
-	    EVP_Digest(request->code_verifier, strlen(request->code_verifier), digest,
-	    &digest_length, EVP_sha256(), NULL) != 1) {
+	    EVP_Digest(request->code_verifier, strlen(request->code_verifier),
+		digest, &digest_length, EVP_sha256(), NULL) != 1) {
 		set_error(error, length, "could not create OAuth PKCE request");
 		oauth_request_free(request);
 		return -1;
@@ -618,20 +630,23 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 	escaped_redirect = http_form_encode(redirect_uri);
 	buffer_init(&url);
 	if (challenge == NULL || escaped_redirect == NULL ||
-	    buffer_append_string(&url, DEFAULT_ISSUER
-	    "/oauth/authorize?response_type=code&client_id=") == -1 ||
-	    buffer_append_string(&url, client_id == NULL ?
-	    DEFAULT_CLIENT_ID : client_id) == -1 ||
+	    buffer_append_string(&url,
+		DEFAULT_ISSUER
+		"/oauth/authorize?response_type=code&client_id=") == -1 ||
+	    buffer_append_string(&url,
+		client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
 	    buffer_append_string(&url, "&redirect_uri=") == -1 ||
 	    buffer_append_string(&url, escaped_redirect) == -1 ||
 	    buffer_append_string(&url,
-	    "&scope=openid%20profile%20email%20offline_access&state=") == -1 ||
+		"&scope=openid%20profile%20email%20offline_access&state=") ==
+		-1 ||
 	    buffer_append_string(&url, request->state) == -1 ||
 	    buffer_append_string(&url, "&code_challenge=") == -1 ||
 	    buffer_append_string(&url, challenge) == -1 ||
-	    buffer_append_string(&url, "&code_challenge_method=S256"
-	    "&id_token_add_organizations=true"
-	    "&codex_cli_simplified_flow=true") == -1) {
+	    buffer_append_string(&url,
+		"&code_challenge_method=S256"
+		"&id_token_add_organizations=true"
+		"&codex_cli_simplified_flow=true") == -1) {
 		free(challenge);
 		free(escaped_redirect);
 		buffer_free(&url);
@@ -665,15 +680,14 @@ oauth_request_free(struct oauth_request *request)
 int
 oauth_exchange_code(const char *code, const char *code_verifier,
     const char *redirect_uri, const char *client_id, const char *token_url,
-    struct auth_session *session, char *error,
-    size_t length)
+    struct auth_session *session, char *error, size_t length)
 {
-	char			*escaped_code;
-	char			*escaped_verifier;
-	char			*escaped_redirect;
-	struct buffer		body;
-	struct http_response	response;
-	int			result;
+	char		    *escaped_code;
+	char		    *escaped_verifier;
+	char		    *escaped_redirect;
+	struct buffer	     body;
+	struct http_response response;
+	int		     result;
 
 	escaped_code = http_form_encode(code);
 	escaped_verifier = http_form_encode(code_verifier);
@@ -686,20 +700,22 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 		return -1;
 	}
 	buffer_init(&body);
-	(void)buffer_append_string(&body, "grant_type=authorization_code&code=");
+	(void)buffer_append_string(&body,
+	    "grant_type=authorization_code&code=");
 	(void)buffer_append_string(&body, escaped_code);
 	(void)buffer_append_string(&body, "&redirect_uri=");
 	(void)buffer_append_string(&body, escaped_redirect);
 	(void)buffer_append_string(&body, "&client_id=");
-	(void)buffer_append_string(&body, client_id == NULL ?
-	    DEFAULT_CLIENT_ID : client_id);
+	(void)buffer_append_string(&body,
+	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
 	(void)buffer_append_string(&body, "&code_verifier=");
 	(void)buffer_append_string(&body, escaped_verifier);
 	free(escaped_code);
 	free(escaped_verifier);
 	free(escaped_redirect);
-	result = http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-	    body.data, &response, error, length);
+	result =
+	    http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
+		body.data, &response, error, length);
 	buffer_free(&body);
 	if (result == -1)
 		return -1;

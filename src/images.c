@@ -15,10 +15,6 @@
 ** would be worse than a clear compatibility error.
 */
 
-#include "images.h"
-#include "json.h"
-#include "util.h"
-
 #include <ctype.h>
 #include <errno.h>
 #include <float.h>
@@ -30,9 +26,13 @@
 #include <string.h>
 #include <strings.h>
 
+#include "images.h"
+#include "json.h"
+#include "util.h"
+
 #define MAX_BOUNDARY_LENGTH 70
-#define MAX_FORM_HEADERS (16 * 1024)
-#define MAX_FORM_PARTS 64
+#define MAX_FORM_HEADERS    (16 * 1024)
+#define MAX_FORM_PARTS	    64
 
 /*
 ** A non-owning view of a scalar multipart part.
@@ -42,10 +42,10 @@
 ** accidentally being interpreted as a textual option.
 */
 struct form_field {
-	const unsigned char	*data;
-	size_t			 length;
-	int			 present;
-	int			 is_file;
+	const unsigned char *data;
+	size_t		     length;
+	int		     present;
+	int		     is_file;
 };
 
 /*
@@ -53,16 +53,16 @@ struct form_field {
 ** content_type are duplicated because multipart header storage is temporary.
 */
 struct image_file {
-	const unsigned char	*data;
-	size_t			 length;
-	char			*filename;
-	char			*content_type;
+	const unsigned char *data;
+	size_t		     length;
+	char		    *filename;
+	char		    *content_type;
 };
 
 /* A bounded ordered collection of accepted image uploads. */
 struct image_list {
-	struct image_file	 files[IMAGE_MAX_REFERENCE_IMAGES];
-	size_t			 count;
+	struct image_file files[IMAGE_MAX_REFERENCE_IMAGES];
+	size_t		  count;
 };
 
 /*
@@ -73,19 +73,19 @@ struct image_list {
 ** dropping uploads.  unsupported records the first incompatible option.
 */
 struct image_form {
-	struct form_field	 stream;
-	struct form_field	 prompt;
-	struct form_field	 model;
-	struct form_field	 response_format;
-	struct form_field	 n;
-	struct form_field	 background;
-	struct form_field	 quality;
-	struct form_field	 size;
-	struct image_list	 image;
-	struct image_list	 image_array;
-	size_t			 image_count;
-	const char		*unsupported;
-	int			 has_mask;
+	struct form_field stream;
+	struct form_field prompt;
+	struct form_field model;
+	struct form_field response_format;
+	struct form_field n;
+	struct form_field background;
+	struct form_field quality;
+	struct form_field size;
+	struct image_list image;
+	struct image_list image_array;
+	size_t		  image_count;
+	const char	 *unsupported;
+	int		  has_mask;
 };
 
 /*
@@ -95,26 +95,21 @@ struct image_form {
 ** either copies/moves them into image_form or records the part as invalid.
 */
 struct part_info {
-	char	*name;
-	char	*filename;
-	char	*content_type;
-	int	 has_filename;
+	char *name;
+	char *filename;
+	char *content_type;
+	int   has_filename;
 };
 
 /* OpenAI options that cannot be represented through the Codex OAuth API. */
-static const char *unsupported_options[] = {
-	"input_fidelity",
-	"moderation",
-	"output_compression",
-	"output_format",
-	"partial_images"
-};
+static const char *unsupported_options[] = { "input_fidelity", "moderation",
+	"output_compression", "output_format", "partial_images" };
 
 /* Format a caller-owned diagnostic buffer without allocation. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
-	va_list	ap;
+	va_list ap;
 
 	if (error == NULL || length == 0)
 		return;
@@ -127,7 +122,7 @@ set_error(char *error, size_t length, const char *format, ...)
 static char *
 copy_bytes(const void *data, size_t length)
 {
-	char	*copy;
+	char *copy;
 
 	if (length == (size_t)-1)
 		return NULL;
@@ -144,7 +139,7 @@ static const unsigned char *
 find_bytes(const unsigned char *data, size_t length,
     const unsigned char *needle, size_t needle_length)
 {
-	size_t	offset;
+	size_t offset;
 
 	if (needle_length == 0)
 		return data;
@@ -195,9 +190,9 @@ skip_space(const char **cursor)
 static int
 read_parameter_value(const char **cursor, char **value)
 {
-	struct buffer	buffer;
-	const char	*start;
-	const char	*end;
+	struct buffer buffer;
+	const char   *start;
+	const char   *end;
 
 	*value = NULL;
 	skip_space(cursor);
@@ -227,7 +222,7 @@ read_parameter_value(const char **cursor, char **value)
 		*value = buffer_steal(&buffer);
 		return *value == NULL ? IMAGE_RESULT_NOMEM : IMAGE_RESULT_OK;
 
-invalid_quoted:
+	invalid_quoted:
 		buffer_free(&buffer);
 		return IMAGE_RESULT_INVALID;
 	}
@@ -253,14 +248,14 @@ invalid_quoted:
 static int
 parse_boundary(const char *content_type, char **boundary)
 {
-	const char	*cursor;
-	const char	*start;
-	const char	*end;
-	char		*key;
-	char		*value;
-	size_t		 index;
-	size_t		 length;
-	int		 result;
+	const char *cursor;
+	const char *start;
+	const char *end;
+	char	   *key;
+	char	   *value;
+	size_t	    index;
+	size_t	    length;
+	int	    result;
 
 	*boundary = NULL;
 	if (content_type == NULL)
@@ -275,7 +270,7 @@ parse_boundary(const char *content_type, char **boundary)
 		end--;
 	if ((size_t)(end - start) != sizeof("multipart/form-data") - 1 ||
 	    strncasecmp(start, "multipart/form-data",
-	    sizeof("multipart/form-data") - 1) != 0)
+		sizeof("multipart/form-data") - 1) != 0)
 		return IMAGE_RESULT_INVALID;
 	while (*cursor != '\0') {
 		cursor++;
@@ -339,12 +334,12 @@ invalid:
 static int
 parse_disposition(const char *value, struct part_info *part)
 {
-	const char	*cursor;
-	const char	*start;
-	const char	*end;
-	char		*key;
-	char		*parameter;
-	int		 result;
+	const char *cursor;
+	const char *start;
+	const char *end;
+	char	   *key;
+	char	   *parameter;
+	int	    result;
 
 	cursor = value;
 	skip_space(&cursor);
@@ -421,15 +416,15 @@ static int
 parse_part_headers(const unsigned char *data, size_t length,
     struct part_info *part)
 {
-	char	*headers;
-	char	*cursor;
-	char	*line_end;
-	char	*colon;
-	char	*value;
-	char	*value_end;
-	int	 result;
-	int	 has_disposition;
-	int	 last_line;
+	char *headers;
+	char *cursor;
+	char *line_end;
+	char *colon;
+	char *value;
+	char *value_end;
+	int   result;
+	int   has_disposition;
+	int   last_line;
 
 	memset(part, 0, sizeof(*part));
 	if (length == 0 || length > MAX_FORM_HEADERS ||
@@ -520,10 +515,11 @@ set_form_field(struct form_field *field, const struct part_info *part,
 static int
 is_unsupported(const char *name, const char **option)
 {
-	size_t	index;
+	size_t index;
 
-	for (index = 0; index < sizeof(unsupported_options) /
-	    sizeof(unsupported_options[0]); index++) {
+	for (index = 0; index <
+	    sizeof(unsupported_options) / sizeof(unsupported_options[0]);
+	    index++) {
 		if (strcmp(name, unsupported_options[index]) == 0) {
 			*option = unsupported_options[index];
 			return 1;
@@ -536,7 +532,7 @@ is_unsupported(const char *name, const char **option)
 static void
 image_list_free(struct image_list *list)
 {
-	size_t	index;
+	size_t index;
 
 	for (index = 0; index < list->count; index++) {
 		free(list->files[index].filename);
@@ -565,7 +561,7 @@ static int
 add_image(struct image_form *form, struct image_list *list,
     struct part_info *part, const unsigned char *data, size_t length)
 {
-	struct image_file	*file;
+	struct image_file *file;
 
 	form->image_count++;
 	if (form->image_count > IMAGE_MAX_REFERENCE_IMAGES)
@@ -576,8 +572,8 @@ add_image(struct image_form *form, struct image_list *list,
 	file->filename = part->filename;
 	part->filename = NULL;
 	if (part->content_type == NULL)
-		part->content_type = copy_bytes("image/png",
-		    sizeof("image/png") - 1);
+		part->content_type =
+		    copy_bytes("image/png", sizeof("image/png") - 1);
 	if (part->content_type == NULL)
 		return IMAGE_RESULT_NOMEM;
 	file->content_type = part->content_type;
@@ -590,7 +586,7 @@ static int
 collect_part(struct image_form *form, struct part_info *part,
     const unsigned char *data, size_t length)
 {
-	const char	*unsupported;
+	const char *unsupported;
 
 	if (strcmp(part->name, "stream") == 0)
 		set_form_field(&form->stream, part, data, length);
@@ -630,16 +626,17 @@ static const unsigned char *
 next_boundary(const unsigned char *data, size_t length,
     const unsigned char *delimiter, size_t delimiter_length)
 {
-	const unsigned char	*candidate;
-	size_t			 remaining;
+	const unsigned char *candidate;
+	size_t		     remaining;
 
 	while ((candidate = find_bytes(data, length,
-	    (const unsigned char *)"\r\n", 2)) != NULL) {
+		    (const unsigned char *)"\r\n", 2)) != NULL) {
 		remaining = length - (size_t)(candidate - data);
 		if (remaining >= delimiter_length + 4 &&
 		    memcmp(candidate + 2, delimiter, delimiter_length) == 0 &&
 		    (memcmp(candidate + 2 + delimiter_length, "--", 2) == 0 ||
-		    memcmp(candidate + 2 + delimiter_length, "\r\n", 2) == 0))
+			memcmp(candidate + 2 + delimiter_length, "\r\n", 2) ==
+			    0))
 			return candidate;
 		candidate += 2;
 		length = remaining - 2;
@@ -659,16 +656,16 @@ static int
 parse_multipart(const char *content_type, const void *body, size_t length,
     struct image_form *form)
 {
-	struct buffer		 marker;
-	struct part_info	 part;
-	const unsigned char	*data;
-	const unsigned char	*cursor;
-	const unsigned char	*header_end;
-	const unsigned char	*boundary_at;
-	char			*boundary;
-	size_t			 remaining;
-	size_t			 part_count;
-	int			 result;
+	struct buffer	     marker;
+	struct part_info     part;
+	const unsigned char *data;
+	const unsigned char *cursor;
+	const unsigned char *header_end;
+	const unsigned char *boundary_at;
+	char		    *boundary;
+	size_t		     remaining;
+	size_t		     part_count;
+	int		     result;
 
 	/*
 	 * Keep pointers into the original body until normalization is complete.
@@ -731,10 +728,11 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 		remaining = length - (size_t)(cursor - data);
 		if (remaining >= 2 && memcmp(cursor, "--", 2) == 0) {
 			remaining -= 2;
-			if (remaining >= 2 && memcmp(cursor + 2, "\r\n", 2) == 0)
+			if (remaining >= 2 &&
+			    memcmp(cursor + 2, "\r\n", 2) == 0)
 				remaining -= 2;
-			result = remaining == 0 ? IMAGE_RESULT_OK :
-			    IMAGE_RESULT_INVALID;
+			result = remaining == 0 ? IMAGE_RESULT_OK
+						: IMAGE_RESULT_INVALID;
 			break;
 		}
 		if (remaining < 2 || memcmp(cursor, "\r\n", 2) != 0) {
@@ -754,7 +752,7 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 static int
 field_equals(const struct form_field *field, const char *value)
 {
-	size_t	length;
+	size_t length;
 
 	if (!field->present || field->is_file)
 		return 0;
@@ -765,10 +763,9 @@ field_equals(const struct form_field *field, const char *value)
 
 /* Copy one scalar multipart field into a JSON string property. */
 static int
-set_json_field(json_t *object, const char *name,
-    const struct form_field *field)
+set_json_field(json_t *object, const char *name, const struct form_field *field)
 {
-	json_t	*value;
+	json_t *value;
 
 	value = json_stringn((const char *)field->data, field->length);
 	if (value == NULL)
@@ -790,13 +787,13 @@ set_json_field(json_t *object, const char *name,
 static int
 set_json_number(json_t *object, const struct form_field *field)
 {
-	char		*text;
-	char		*cursor;
-	char		*end;
-	double		 number;
-	json_int_t	 integer;
-	json_t		*value;
-	int		 valid;
+	char	  *text;
+	char	  *cursor;
+	char	  *end;
+	double	   number;
+	json_int_t integer;
+	json_t	  *value;
+	int	   valid;
 
 	if (!field->present || field->is_file || field->length == 0)
 		return 0;
@@ -814,8 +811,8 @@ set_json_number(json_t *object, const struct form_field *field)
 	} else {
 		errno = 0;
 		number = strtod(cursor, &end);
-		while (*end == ' ' || *end == '\t' || *end == '\r' ||
-		    *end == '\n')
+		while (
+		    *end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
 			end++;
 		if (errno != 0 || end == cursor || *end != '\0')
 			valid = 0;
@@ -854,10 +851,10 @@ set_json_number(json_t *object, const struct form_field *field)
 static char *
 file_data_url(const struct image_file *file)
 {
-	struct buffer	url;
-	unsigned char	*encoded;
-	size_t		 encoded_length;
-	int		 result;
+	struct buffer  url;
+	unsigned char *encoded;
+	size_t	       encoded_length;
+	int	       result;
 
 	if (file->length > (size_t)INT_MAX ||
 	    file->length > ((size_t)-1 - 2) / 4 * 3)
@@ -889,8 +886,8 @@ file_data_url(const struct image_file *file)
 static int
 append_image_list(json_t *images, const struct image_list *list)
 {
-	json_t	*entry;
-	char	*url;
+	json_t *entry;
+	char   *url;
 	size_t	index;
 
 	for (index = 0; index < list->count; index++) {
@@ -917,7 +914,7 @@ append_image_list(json_t *images, const struct image_list *list)
 static int
 validate_form(const struct image_form *form, char *error, size_t length)
 {
-	const struct image_file	*file;
+	const struct image_file *file;
 	size_t			 index;
 
 	/* Reject incompatible options instead of silently changing image semantics. */
@@ -933,7 +930,8 @@ validate_form(const struct image_form *form, char *error, size_t length)
 	}
 	if (!form->prompt.present || form->prompt.is_file ||
 	    form->prompt.length == 0) {
-		set_error(error, length, "`prompt` must be a non-empty string.");
+		set_error(error, length,
+		    "`prompt` must be a non-empty string.");
 		return IMAGE_RESULT_INVALID;
 	}
 	if (!form->model.present || form->model.is_file ||
@@ -992,14 +990,12 @@ int
 image_prepare_generation(const void *body, size_t length, char **output,
     char *error, size_t error_length)
 {
-	static const char *allowed[] = {
-		"background", "n", "quality", "size"
-	};
-	json_error_t	json_error;
-	json_t		*root;
-	json_t		*normalized;
-	json_t		*value;
-	size_t		 index;
+	static const char *allowed[] = { "background", "n", "quality", "size" };
+	json_error_t	   json_error;
+	json_t		  *root;
+	json_t		  *normalized;
+	json_t		  *value;
+	size_t		   index;
 
 	/* Emit only the Codex-supported subset; callers own output on success. */
 	*output = NULL;
@@ -1035,8 +1031,9 @@ image_prepare_generation(const void *body, size_t length, char **output,
 		    "`model` must be a non-empty string.");
 		return IMAGE_RESULT_INVALID;
 	}
-	for (index = 0; index < sizeof(unsupported_options) /
-	    sizeof(unsupported_options[0]); index++) {
+	for (index = 0; index <
+	    sizeof(unsupported_options) / sizeof(unsupported_options[0]);
+	    index++) {
 		if (json_object_get(root, unsupported_options[index]) != NULL) {
 			set_error(error, error_length,
 			    "`%s` is not supported by ChatGPT OAuth image generation.",
@@ -1046,8 +1043,9 @@ image_prepare_generation(const void *body, size_t length, char **output,
 		}
 	}
 	value = json_object_get(root, "response_format");
-	if (value != NULL && (!json_is_string(value) ||
-	    strcmp(json_string_value(value), "b64_json") != 0)) {
+	if (value != NULL &&
+	    (!json_is_string(value) ||
+		strcmp(json_string_value(value), "b64_json") != 0)) {
 		json_decref(root);
 		set_error(error, error_length,
 		    "ChatGPT OAuth image generation only returns `b64_json`.");
@@ -1056,9 +1054,9 @@ image_prepare_generation(const void *body, size_t length, char **output,
 	normalized = json_object();
 	if (normalized == NULL ||
 	    json_object_set(normalized, "model",
-	    json_object_get(root, "model")) == -1 ||
+		json_object_get(root, "model")) == -1 ||
 	    json_object_set(normalized, "prompt",
-	    json_object_get(root, "prompt")) == -1)
+		json_object_get(root, "prompt")) == -1)
 		goto nomem;
 	for (index = 0; index < sizeof(allowed) / sizeof(allowed[0]); index++) {
 		value = json_object_get(root, allowed[index]);
@@ -1093,10 +1091,10 @@ int
 image_prepare_edit(const char *content_type, const void *body, size_t length,
     char **output, char *error, size_t error_length)
 {
-	struct image_form	form;
-	json_t			*root;
-	json_t			*images;
-	int			 result;
+	struct image_form form;
+	json_t		 *root;
+	json_t		 *images;
+	int		  result;
 
 	/* Convert uploaded bytes to JSON data URLs only after full form validation. */
 	*output = NULL;
@@ -1107,9 +1105,10 @@ image_prepare_edit(const char *content_type, const void *body, size_t length,
 	}
 	result = parse_multipart(content_type, body, length, &form);
 	if (result != IMAGE_RESULT_OK) {
-		set_error(error, error_length, result == IMAGE_RESULT_NOMEM ?
-		    "out of memory" :
-		    "Image editing request contains invalid form data.");
+		set_error(error, error_length,
+		    result == IMAGE_RESULT_NOMEM
+			? "out of memory"
+			: "Image editing request contains invalid form data.");
 		return result;
 	}
 	result = validate_form(&form, error, error_length);

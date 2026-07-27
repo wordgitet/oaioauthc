@@ -13,15 +13,15 @@
 ** temporary buffers, and response allocations until they are handed back.
 */
 
-#include "http.h"
-#include "util.h"
-
 #include <curl/curl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#include "http.h"
+#include "util.h"
 
 #define MAX_RESPONSE_SIZE (64 * 1024 * 1024)
 
@@ -33,17 +33,17 @@
 ** upstream status and diagnostics.
 */
 struct write_context {
-	struct http_response	*response;
-	struct buffer		*body;
-	http_write_callback	 callback;
-	void			*argument;
+	struct http_response *response;
+	struct buffer	     *body;
+	http_write_callback   callback;
+	void		     *argument;
 };
 
 /* Populate an optional caller diagnostic buffer without allocating. */
 static void
 set_error(char *error, size_t length, const char *format, ...)
 {
-	va_list	ap;
+	va_list ap;
 
 	if (error == NULL || length == 0)
 		return;
@@ -56,7 +56,7 @@ set_error(char *error, size_t length, const char *format, ...)
 static int
 append_header(struct curl_slist **headers, const char *value)
 {
-	struct curl_slist	*next;
+	struct curl_slist *next;
 
 	next = curl_slist_append(*headers, value);
 	if (next == NULL)
@@ -70,8 +70,8 @@ static int
 append_header_value(struct curl_slist **headers, const char *name,
     const char *value)
 {
-	struct buffer	header;
-	int		result;
+	struct buffer header;
+	int	      result;
 
 	buffer_init(&header);
 	result = buffer_append_string(&header, name);
@@ -92,8 +92,8 @@ append_header_value(struct curl_slist **headers, const char *name,
 static size_t
 write_callback(char *data, size_t size, size_t count, void *argument)
 {
-	struct write_context	*context;
-	size_t			 length;
+	struct write_context *context;
+	size_t		      length;
 
 	context = argument;
 	if (count != 0 && size > (size_t)-1 / count)
@@ -102,8 +102,9 @@ write_callback(char *data, size_t size, size_t count, void *argument)
 	/* Stream only successful bodies; preserve upstream errors for the caller. */
 	if (context->callback != NULL && context->response->status >= 200 &&
 	    context->response->status < 300)
-		return context->callback(data, length, context->argument) == 0 ?
-		    length : 0;
+		return context->callback(data, length, context->argument) == 0
+		    ? length
+		    : 0;
 	if (context->body->len > MAX_RESPONSE_SIZE ||
 	    length > MAX_RESPONSE_SIZE - context->body->len)
 		return 0;
@@ -121,9 +122,9 @@ write_callback(char *data, size_t size, size_t count, void *argument)
 static size_t
 header_callback(char *data, size_t size, size_t count, void *argument)
 {
-	struct http_response	*response;
-	char			*value;
-	size_t			length;
+	struct http_response *response;
+	char		     *value;
+	size_t		      length;
 
 	response = argument;
 	length = size * count;
@@ -132,9 +133,8 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 
 		space = memchr(data, ' ', length);
 		if (space != NULL && data + length - space >= 4 &&
-		    space[1] >= '0' && space[1] <= '9' &&
-		    space[2] >= '0' && space[2] <= '9' &&
-		    space[3] >= '0' && space[3] <= '9')
+		    space[1] >= '0' && space[1] <= '9' && space[2] >= '0' &&
+		    space[2] <= '9' && space[3] >= '0' && space[3] <= '9')
 			response->status = (space[1] - '0') * 100 +
 			    (space[2] - '0') * 10 + space[3] - '0';
 		free(response->content_type);
@@ -171,11 +171,11 @@ request(const char *url, const char *method, const char *body,
     const char *content_type, http_write_callback callback, void *argument,
     struct http_response *response, char *error, size_t error_length)
 {
-	CURL			*curl;
-	CURLcode		code;
-	struct curl_slist	*headers;
-	struct buffer		response_body;
-	struct write_context	context;
+	CURL		    *curl;
+	CURLcode	     code;
+	struct curl_slist   *headers;
+	struct buffer	     response_body;
+	struct write_context context;
 
 	/*
 	 * response is reset before work begins.  On success its body is owned by
@@ -194,15 +194,20 @@ request(const char *url, const char *method, const char *body,
 		return -1;
 	}
 	if (append_header(&headers, "Accept: application/json") == -1 ||
-	    (body != NULL && append_header(&headers, content_type == NULL ?
-	    "Content-Type: application/json" : content_type) == -1) ||
-	    (authorization != NULL && append_header_value(&headers,
-	    "Authorization: Bearer ", authorization) == -1) ||
-	    (account_id != NULL && append_header_value(&headers,
-	    "chatgpt-account-id: ", account_id) == -1) ||
+	    (body != NULL &&
+		append_header(&headers,
+		    content_type == NULL ? "Content-Type: application/json"
+					 : content_type) == -1) ||
+	    (authorization != NULL &&
+		append_header_value(&headers, "Authorization: Bearer ",
+		    authorization) == -1) ||
+	    (account_id != NULL &&
+		append_header_value(&headers,
+		    "chatgpt-account-id: ", account_id) == -1) ||
 	    (extra_header != NULL &&
-	    append_header(&headers, extra_header) == -1)) {
-		set_error(error, error_length, "could not allocate HTTP headers");
+		append_header(&headers, extra_header) == -1)) {
+		set_error(error, error_length,
+		    "could not allocate HTTP headers");
 		curl_slist_free_all(headers);
 		curl_easy_cleanup(curl);
 		return -1;
@@ -255,19 +260,20 @@ http_post_json(const char *url, const char *body, const char *authorization,
     const char *account_id, const char *extra_header,
     struct http_response *response, char *error, size_t error_length)
 {
-	return request(url, "POST", body, authorization, account_id, extra_header,
-	    NULL, NULL, NULL, response, error, error_length);
+	return request(url, "POST", body, authorization, account_id,
+	    extra_header, NULL, NULL, NULL, response, error, error_length);
 }
 
 /* POST JSON and deliver successful response fragments to callback. */
 int
 http_post_json_stream(const char *url, const char *body,
-    const char *authorization, const char *account_id,
-    const char *extra_header, http_write_callback callback, void *argument,
+    const char *authorization, const char *account_id, const char *extra_header,
+    http_write_callback callback, void *argument,
     struct http_response *response, char *error, size_t error_length)
 {
-	return request(url, "POST", body, authorization, account_id, extra_header,
-	    NULL, callback, argument, response, error, error_length);
+	return request(url, "POST", body, authorization, account_id,
+	    extra_header, NULL, callback, argument, response, error,
+	    error_length);
 }
 
 /* POST an OAuth URL-encoded body without Codex authorization headers. */
@@ -304,12 +310,12 @@ http_response_free(struct http_response *response)
 ** curl_easy_escape returns a curl allocation, so copy it into the program's
 ** ordinary malloc ownership domain before cleaning up the curl handle.
 */
-char
-*http_form_encode(const char *value)
+char *
+http_form_encode(const char *value)
 {
-	CURL	*curl;
-	char	*escaped;
-	char	*copy;
+	CURL *curl;
+	char *escaped;
+	char *copy;
 
 	curl = curl_easy_init();
 	if (curl == NULL)

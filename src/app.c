@@ -14,22 +14,24 @@
 ** request limits, and route dispatch belong to proxy.c instead.
 */
 
-#include "app.h"
-#include "auth.h"
-#include "proxy.h"
-#include "util.h"
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netinet/in.h>
+
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
+
+#include "app.h"
+#include "auth.h"
+#include "proxy.h"
+#include "util.h"
 
 /* Print the complete public command grammar to a diagnostic stream. */
 static void
@@ -50,8 +52,8 @@ usage(FILE *stream)
 ** Advancing index to argc on failure makes the command parser stop without
 ** accidentally treating a missing value as a later independent option.
 */
-static const char
-*option_value(int *index, int argc, char **argv, const char *name)
+static const char *
+option_value(int *index, int argc, char **argv, const char *name)
 {
 	if (*index + 1 >= argc) {
 		(void)fprintf(stderr, "%s requires a value\n", name);
@@ -71,7 +73,7 @@ static const char
 static int
 open_browser(const char *url)
 {
-	pid_t	pid;
+	pid_t pid;
 
 	pid = fork();
 	if (pid == -1)
@@ -92,9 +94,9 @@ open_browser(const char *url)
 static int
 listen_callback(void)
 {
-	struct sockaddr_in	address;
-	int			fd;
-	int			one;
+	struct sockaddr_in address;
+	int		   fd;
+	int		   one;
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd == -1)
@@ -133,17 +135,17 @@ hex_value(char character)
 ** form-query rules, while malformed escapes and decoded NUL bytes are rejected
 ** so callers never compare truncated security-sensitive values such as state.
 */
-static char
-*query_value(const char *target, const char *name)
+static char *
+query_value(const char *target, const char *name)
 {
-	const char	*cursor;
-	const char	*end;
-	const char	*equal;
-	const char	*query;
-	struct buffer	value;
-	char		decoded;
-	int		high;
-	int		low;
+	const char   *cursor;
+	const char   *end;
+	const char   *equal;
+	const char   *query;
+	struct buffer value;
+	char	      decoded;
+	int	      high;
+	int	      low;
 
 	/* Decode only the selected parameter; reject embedded NULs in the URL. */
 	query = strchr(target, '?');
@@ -198,13 +200,14 @@ static int
 send_callback_response(int fd, int status, const char *content_type,
     const char *body)
 {
-	char	header[256];
-	int	length;
+	char header[256];
+	int  length;
 
 	length = snprintf(header, sizeof(header),
 	    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-	    "Connection: close\r\n\r\n", status, status == 200 ? "OK" :
-	    "Bad Request", content_type, strlen(body));
+	    "Connection: close\r\n\r\n",
+	    status, status == 200 ? "OK" : "Bad Request", content_type,
+	    strlen(body));
 	if (length < 0 || (size_t)length >= sizeof(header))
 		return -1;
 	if (write_all(fd, header, (size_t)length) == -1)
@@ -223,22 +226,22 @@ send_callback_response(int fd, int status, const char *content_type,
 static int
 run_login(const struct proxy_options *options, int should_open)
 {
-	int			listen_fd;
-	int			client_fd;
-	char			request[8192];
-	ssize_t		count;
-	size_t			used;
-	struct oauth_request	oauth;
-	struct auth_session	session;
-	char			*code;
-	char			*method;
-	char			*state;
-	char			*target;
-	char			*version;
-	char			error[256];
-	const char		*path;
-	const char		*body;
-	int			result;
+	int		     listen_fd;
+	int		     client_fd;
+	char		     request[8192];
+	ssize_t		     count;
+	size_t		     used;
+	struct oauth_request oauth;
+	struct auth_session  session;
+	char		    *code;
+	char		    *method;
+	char		    *state;
+	char		    *target;
+	char		    *version;
+	char		     error[256];
+	const char	    *path;
+	const char	    *body;
+	int		     result;
 
 	/*
 	 * The state comparison binds the one local redirect to this PKCE request.
@@ -249,17 +252,19 @@ run_login(const struct proxy_options *options, int should_open)
 	memset(&session, 0, sizeof(session));
 	listen_fd = listen_callback();
 	if (listen_fd == -1) {
-		(void)fprintf(stderr, "login needs http://localhost:1455/auth/callback: %s\n",
+		(void)fprintf(stderr,
+		    "login needs http://localhost:1455/auth/callback: %s\n",
 		    strerror(errno));
 		return 1;
 	}
 	if (oauth_request_create("http://localhost:1455/auth/callback",
-	    options->client_id, &oauth, error, sizeof(error)) == -1) {
+		options->client_id, &oauth, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		close(listen_fd);
 		return 1;
 	}
-	(void)fprintf(stderr, "OpenAI OAuth login URL: %s\n", oauth.authorization_url);
+	(void)fprintf(stderr, "OpenAI OAuth login URL: %s\n",
+	    oauth.authorization_url);
 	if (should_open)
 		(void)open_browser(oauth.authorization_url);
 	client_fd = accept(listen_fd, NULL, NULL);
@@ -270,7 +275,8 @@ run_login(const struct proxy_options *options, int should_open)
 	}
 	used = 0;
 	while (used + 1 < sizeof(request)) {
-		count = read(client_fd, request + used, sizeof(request) - used - 1);
+		count =
+		    read(client_fd, request + used, sizeof(request) - used - 1);
 		if (count == -1 && errno == EINTR)
 			continue;
 		if (count <= 0)
@@ -289,7 +295,8 @@ run_login(const struct proxy_options *options, int should_open)
 	if (method == NULL || strcmp(method, "GET") != 0 || target == NULL ||
 	    strncmp(target, "/auth/callback", strlen("/auth/callback")) != 0 ||
 	    (target[strlen("/auth/callback")] != '?' &&
-	    target[strlen("/auth/callback")] != '\0') || version == NULL ||
+		target[strlen("/auth/callback")] != '\0') ||
+	    version == NULL ||
 	    strncmp(version, "HTTP/1.", strlen("HTTP/1.")) != 0) {
 		free(code);
 		free(state);
@@ -306,9 +313,10 @@ run_login(const struct proxy_options *options, int should_open)
 		close(client_fd);
 		return 1;
 	}
-	body = "<html><body>Sign-in complete. Return to your terminal.</body></html>";
-	(void)send_callback_response(client_fd, 200,
-	    "text/html; charset=utf-8", body);
+	body =
+	    "<html><body>Sign-in complete. Return to your terminal.</body></html>";
+	(void)send_callback_response(client_fd, 200, "text/html; charset=utf-8",
+	    body);
 	close(client_fd);
 	result = oauth_exchange_code(code, oauth.code_verifier,
 	    "http://localhost:1455/auth/callback", options->client_id,
@@ -321,7 +329,8 @@ run_login(const struct proxy_options *options, int should_open)
 		auth_session_free(&session);
 		return 1;
 	}
-	path = options->auth_file == NULL ? auth_default_file() : options->auth_file;
+	path = options->auth_file == NULL ? auth_default_file()
+					  : options->auth_file;
 	if (auth_save(path, &session, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
@@ -340,11 +349,11 @@ run_login(const struct proxy_options *options, int should_open)
 int
 app_main(int argc, char **argv)
 {
-	struct proxy_options	options;
-	const char		*command;
-	int			index;
-	int			open;
-	char			error[256];
+	struct proxy_options options;
+	const char	    *command;
+	int		     index;
+	int		     open;
+	char		     error[256];
 
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
 		(void)fprintf(stderr, "could not ignore SIGPIPE: %s\n",
@@ -353,26 +362,35 @@ app_main(int argc, char **argv)
 	}
 	memset(&options, 0, sizeof(options));
 	command = argc > 1 && argv[1][0] != '-' ? argv[1] : "serve";
-	index = strcmp(command, "serve") == 0 && argc > 1 && argv[1][0] == '-' ?
-	    1 : 2;
+	index = strcmp(command, "serve") == 0 && argc > 1 && argv[1][0] == '-'
+	    ? 1
+	    : 2;
 	open = 1;
 	for (; index < argc; index++) {
 		if (strcmp(argv[index], "--host") == 0)
-			options.host = option_value(&index, argc, argv, "--host");
+			options.host =
+			    option_value(&index, argc, argv, "--host");
 		else if (strcmp(argv[index], "--port") == 0)
-			options.port = option_value(&index, argc, argv, "--port");
+			options.port =
+			    option_value(&index, argc, argv, "--port");
 		else if (strcmp(argv[index], "--models") == 0)
-			options.models = option_value(&index, argc, argv, "--models");
+			options.models =
+			    option_value(&index, argc, argv, "--models");
 		else if (strcmp(argv[index], "--codex-version") == 0)
-			options.codex_version = option_value(&index, argc, argv, "--codex-version");
+			options.codex_version =
+			    option_value(&index, argc, argv, "--codex-version");
 		else if (strcmp(argv[index], "--base-url") == 0)
-			options.base_url = option_value(&index, argc, argv, "--base-url");
+			options.base_url =
+			    option_value(&index, argc, argv, "--base-url");
 		else if (strcmp(argv[index], "--oauth-file") == 0)
-			options.auth_file = option_value(&index, argc, argv, "--oauth-file");
+			options.auth_file =
+			    option_value(&index, argc, argv, "--oauth-file");
 		else if (strcmp(argv[index], "--oauth-client-id") == 0)
-			options.client_id = option_value(&index, argc, argv, "--oauth-client-id");
+			options.client_id = option_value(&index, argc, argv,
+			    "--oauth-client-id");
 		else if (strcmp(argv[index], "--oauth-token-url") == 0)
-			options.token_url = option_value(&index, argc, argv, "--oauth-token-url");
+			options.token_url = option_value(&index, argc, argv,
+			    "--oauth-token-url");
 		else if (strcmp(argv[index], "--debug-json") == 0)
 			options.debug_json = debug_json_compact;
 		else if (strcmp(argv[index], "--debug-json=compact") == 0)
@@ -380,7 +398,8 @@ app_main(int argc, char **argv)
 		else if (strcmp(argv[index], "--debug-json=pretty") == 0)
 			options.debug_json = debug_json_pretty;
 		else if (strncmp(argv[index], "--debug-json=", 13) == 0) {
-			(void)fprintf(stderr, "invalid --debug-json format: %s\n",
+			(void)fprintf(stderr,
+			    "invalid --debug-json format: %s\n",
 			    argv[index] + 13);
 			return 1;
 		} else if (strcmp(argv[index], "--no-open") == 0)
@@ -402,10 +421,13 @@ app_main(int argc, char **argv)
 		return 1;
 	}
 	if (options.host != NULL && strcmp(options.host, "127.0.0.1") != 0 &&
-	    strcmp(options.host, "localhost") != 0 && strcmp(options.host, "::1") != 0)
-		(void)fprintf(stderr, "Warning: this proxy is exposed to your network.\n");
+	    strcmp(options.host, "localhost") != 0 &&
+	    strcmp(options.host, "::1") != 0)
+		(void)fprintf(stderr,
+		    "Warning: this proxy is exposed to your network.\n");
 	if (options.debug_json != debug_json_disabled)
-		(void)fprintf(stderr, "Warning: --debug-json logs prompts and "
+		(void)fprintf(stderr,
+		    "Warning: --debug-json logs prompts and "
 		    "conversation history to stderr.\n");
 	if (proxy_serve(&options, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);

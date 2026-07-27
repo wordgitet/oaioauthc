@@ -25,18 +25,19 @@ enum debug_json_format {
 ** caller retains every string for as long as proxy_serve can run.
 */
 struct proxy_options {
-	const char	*auth_file;
-	const char	*host;
-	const char	*port;
-	const char	*base_url;
-	const char	*codex_version;
-	const char	*models;
-	const char	*client_id;
-	const char	*token_url;
-	enum debug_json_format	debug_json;
+	const char	      *auth_file;
+	const char	      *host;
+	const char	      *port;
+	const char	      *base_url;
+	const char	      *codex_version;
+	const char	      *models;
+	const char	      *client_id;
+	const char	      *token_url;
+	enum debug_json_format debug_json;
 };
 
 /* Bind, announce, and serve until a fatal setup or accept error is reported. */
-int	proxy_serve(const struct proxy_options *, char *, size_t);
+int
+proxy_serve(const struct proxy_options *, char *, size_t);
 
 #endif

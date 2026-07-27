@@ -14,9 +14,9 @@
 
 /* Buffered upstream response returned by the HTTP helpers. */
 struct http_response {
-	long	status;
-	char	*body;
-	char	*content_type;
+	long  status;
+	char *body;
+	char *content_type;
 };
 
 /*
@@ -28,21 +28,27 @@ struct http_response {
 typedef int (*http_write_callback)(const void *, size_t, void *);
 
 /* POST one JSON body with optional Codex bearer/account/feature headers. */
-int	http_post_json(const char *, const char *, const char *, const char *,
-	    const char *, struct http_response *, char *, size_t);
+int
+http_post_json(const char *, const char *, const char *, const char *,
+    const char *, struct http_response *, char *, size_t);
 /* POST JSON and stream successful fragments to the supplied callback. */
-int	http_post_json_stream(const char *, const char *, const char *,
-	    const char *, const char *, http_write_callback, void *,
-	    struct http_response *, char *, size_t);
+int
+http_post_json_stream(const char *, const char *, const char *, const char *,
+    const char *, http_write_callback, void *, struct http_response *, char *,
+    size_t);
 /* POST an OAuth form body without Codex authorization headers. */
-int	http_post_form(const char *, const char *, struct http_response *, char *,
-	    size_t);
+int
+http_post_form(const char *, const char *, struct http_response *, char *,
+    size_t);
 /* GET an authenticated Codex endpoint into a bounded response. */
-int	http_get(const char *, const char *, const char *, struct http_response *,
-	    char *, size_t);
+int
+http_get(const char *, const char *, const char *, struct http_response *,
+    char *, size_t);
 /* Release response body/type allocations and reset response. */
-void	http_response_free(struct http_response *);
+void
+http_response_free(struct http_response *);
 /* Return an owned application/x-www-form-urlencoded encoding. */
-char	*http_form_encode(const char *);
+char *
+http_form_encode(const char *);
 
 #endif
