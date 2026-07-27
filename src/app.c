@@ -22,6 +22,8 @@
 #include <netinet/in.h>
 
 #include <errno.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +36,9 @@
 #include "proxy.h"
 #include "util.h"
 
+/* Set by the short-lived login signal handlers; read by the main thread. */
+static volatile sig_atomic_t login_signal_received;
+
 /* Print the complete public command grammar to a diagnostic stream. */
 static void
 usage(FILE *stream)
@@ -45,6 +50,7 @@ usage(FILE *stream)
 	    "                  [--oauth-file PATH]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
 	    "  oaioauthc login [--oauth-file PATH] [--open|--no-open]\n"
+	    "                  [--login-timeout-ms MS]\n"
 	    "  oaioauthc --help\n"
 	    "  oaioauthc --version\n");
 }
@@ -112,6 +118,42 @@ open_browser(const char *url)
 		_exit(127);
 	}
 	return 0;
+}
+
+/* Record interruption without calling non-async-signal-safe functions. */
+static void
+login_signal_handler(int signal_number)
+{
+	login_signal_received = signal_number;
+}
+
+/* Install the cancellation handlers used only during one login attempt. */
+static int
+install_login_signals(struct sigaction *old_interrupt,
+    struct sigaction		       *old_terminate)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	sigemptyset(&action.sa_mask);
+	action.sa_handler = login_signal_handler;
+	login_signal_received = 0;
+	if (sigaction(SIGINT, &action, old_interrupt) == -1)
+		return -1;
+	if (sigaction(SIGTERM, &action, old_terminate) == -1) {
+		(void)sigaction(SIGINT, old_interrupt, NULL);
+		return -1;
+	}
+	return 0;
+}
+
+/* Restore process signal behavior after the login callback is closed. */
+static void
+restore_login_signals(const struct sigaction *old_interrupt,
+    const struct sigaction		     *old_terminate)
+{
+	(void)sigaction(SIGINT, old_interrupt, NULL);
+	(void)sigaction(SIGTERM, old_terminate, NULL);
 }
 
 /*
@@ -253,10 +295,15 @@ send_callback_response(int fd, int status, const char *content_type,
 ** and saved session survives this function; all other paths release secrets.
 */
 static int
-run_login(const struct proxy_options *options, int should_open)
+run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 {
-	int		     listen_fd;
+	struct sigaction     old_interrupt;
+	struct sigaction     old_terminate;
+	struct pollfd	     descriptor;
 	int		     client_fd;
+	int		     listen_fd;
+	int		     poll_result;
+	int		     signals_installed;
 	char		     request[8192];
 	ssize_t		     count;
 	size_t		     used;
@@ -279,6 +326,12 @@ run_login(const struct proxy_options *options, int should_open)
 	 */
 	memset(&oauth, 0, sizeof(oauth));
 	memset(&session, 0, sizeof(session));
+	client_fd = -1;
+	listen_fd = -1;
+	code = NULL;
+	state = NULL;
+	signals_installed = 0;
+	result = 1;
 	listen_fd = listen_callback();
 	if (listen_fd == -1) {
 		(void)fprintf(stderr,
@@ -289,25 +342,66 @@ run_login(const struct proxy_options *options, int should_open)
 	if (oauth_request_create("http://localhost:1455/auth/callback",
 		options->client_id, &oauth, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
-		close(listen_fd);
-		return 1;
+		goto done;
 	}
+	if (install_login_signals(&old_interrupt, &old_terminate) == -1) {
+		(void)fprintf(stderr,
+		    "could not install login signal handlers: %s\n",
+		    strerror(errno));
+		goto done;
+	}
+	signals_installed = 1;
 	(void)fprintf(stderr, "OpenAI OAuth login URL: %s\n",
 	    oauth.authorization_url);
 	if (should_open)
 		(void)open_browser(oauth.authorization_url);
+	descriptor.fd = listen_fd;
+	descriptor.events = POLLIN;
+	descriptor.revents = 0;
+	for (;;) {
+		poll_result = poll(&descriptor, 1, timeout_ms);
+		if (poll_result == -1 && errno == EINTR) {
+			if (login_signal_received != 0) {
+				(void)fprintf(stderr,
+				    "OAuth login cancelled\n");
+				goto done;
+			}
+			continue;
+		}
+		if (poll_result == 0) {
+			(void)fprintf(stderr,
+			    "OAuth login timed out waiting for callback\n");
+			goto done;
+		}
+		if (poll_result == -1) {
+			(void)fprintf(stderr,
+			    "could not wait for OAuth callback: %s\n",
+			    strerror(errno));
+			goto done;
+		}
+		if ((descriptor.revents & (POLLIN | POLLERR | POLLHUP)) != 0)
+			break;
+	}
 	client_fd = accept(listen_fd, NULL, NULL);
 	close(listen_fd);
+	listen_fd = -1;
 	if (client_fd == -1) {
-		oauth_request_free(&oauth);
-		return 1;
+		if (login_signal_received != 0)
+			(void)fprintf(stderr, "OAuth login cancelled\n");
+		else
+			(void)fprintf(stderr,
+			    "could not accept OAuth callback: %s\n",
+			    strerror(errno));
+		goto done;
 	}
 	used = 0;
 	while (used + 1 < sizeof(request)) {
 		count =
 		    read(client_fd, request + used, sizeof(request) - used - 1);
-		if (count == -1 && errno == EINTR)
+		if (count == -1 && errno == EINTR && login_signal_received == 0)
 			continue;
+		if (count == -1 && errno == EINTR)
+			break;
 		if (count <= 0)
 			break;
 		used += (size_t)count;
@@ -316,6 +410,10 @@ run_login(const struct proxy_options *options, int should_open)
 			break;
 	}
 	request[used] = '\0';
+	if (login_signal_received != 0) {
+		(void)fprintf(stderr, "OAuth login cancelled\n");
+		goto done;
+	}
 	method = strtok(request, " ");
 	target = strtok(NULL, " ");
 	version = strtok(NULL, "\r\n");
@@ -337,37 +435,53 @@ run_login(const struct proxy_options *options, int should_open)
 		(void)send_callback_response(client_fd, 400,
 		    "text/plain; charset=utf-8", body);
 		free(code);
+		code = NULL;
 		free(state);
-		oauth_request_free(&oauth);
-		close(client_fd);
-		return 1;
+		state = NULL;
+		goto done;
 	}
 	body =
 	    "<html><body>Sign-in complete. Return to your terminal.</body></html>";
 	(void)send_callback_response(client_fd, 200, "text/html; charset=utf-8",
 	    body);
 	close(client_fd);
+	client_fd = -1;
 	result = oauth_exchange_code(code, oauth.code_verifier,
 	    "http://localhost:1455/auth/callback", options->client_id,
 	    options->token_url, &session, error, sizeof(error));
 	free(code);
+	code = NULL;
 	free(state);
+	state = NULL;
 	oauth_request_free(&oauth);
 	if (result == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
-		return 1;
+		goto done;
 	}
 	path = options->auth_file == NULL ? auth_default_file()
 					  : options->auth_file;
 	if (auth_save(path, &session, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		auth_session_free(&session);
-		return 1;
+		goto done;
 	}
 	auth_session_free(&session);
 	(void)fprintf(stderr, "Credentials saved to %s\n", path);
-	return 0;
+	result = 0;
+
+done:
+	free(code);
+	free(state);
+	if (client_fd != -1)
+		close(client_fd);
+	if (listen_fd != -1)
+		close(listen_fd);
+	oauth_request_free(&oauth);
+	auth_session_free(&session);
+	if (signals_installed)
+		restore_login_signals(&old_interrupt, &old_terminate);
+	return result;
 }
 
 /*
@@ -383,6 +497,8 @@ app_main(int argc, char **argv)
 	int		     index;
 	int		     open;
 	char		     error[256];
+	const char	    *login_timeout_value;
+	unsigned long	     login_timeout;
 	unsigned long	     port_number;
 
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -396,6 +512,8 @@ app_main(int argc, char **argv)
 	    ? 1
 	    : 2;
 	open = 1;
+	login_timeout = 300000UL;
+	login_timeout_value = NULL;
 	for (; index < argc; index++) {
 		if (strcmp(argv[index], "--host") == 0)
 			options.host =
@@ -439,6 +557,11 @@ app_main(int argc, char **argv)
 			open = 1;
 		else if (strcmp(argv[index], "--no-open") == 0)
 			open = 0;
+		else if (strcmp(argv[index], "--login-timeout-ms") == 0)
+			login_timeout_value = option_value(&index, argc, argv,
+			    "--login-timeout-ms");
+		else if (strncmp(argv[index], "--login-timeout-ms=", 19) == 0)
+			login_timeout_value = argv[index] + 19;
 		else if (strcmp(argv[index], "--help") == 0 ||
 		    strcmp(argv[index], "-h") == 0) {
 			usage(stdout);
@@ -460,8 +583,17 @@ app_main(int argc, char **argv)
 		    options.port);
 		return 1;
 	}
+	if (login_timeout_value != NULL &&
+	    parse_positive_number(login_timeout_value, (unsigned long)INT_MAX,
+		&login_timeout) == -1) {
+		(void)fprintf(stderr,
+		    "invalid login timeout \"%s\" (expected a number from 1 to "
+		    "%d)\n",
+		    login_timeout_value, INT_MAX);
+		return 1;
+	}
 	if (strcmp(command, "login") == 0)
-		return run_login(&options, open);
+		return run_login(&options, open, (int)login_timeout);
 	if (strcmp(command, "serve") != 0) {
 		usage(stderr);
 		return 1;
