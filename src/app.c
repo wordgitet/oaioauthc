@@ -16,6 +16,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 
 #include <arpa/inet.h>
@@ -423,6 +424,7 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 	int		     listener_index;
 	int		     poll_result;
 	int		     signals_installed;
+	struct timeval	     receive_timeout;
 	char		     request[8192];
 	ssize_t		     count;
 	size_t		     used;
@@ -521,11 +523,16 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		for (listener_index = 0; listener_index < listener_count;
 		    listener_index++) {
 			if ((descriptors[listener_index].revents &
-				(POLLIN | POLLERR | POLLHUP)) != 0)
+				(POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
 				break;
 		}
 		if (listener_index < listener_count)
 			break;
+	}
+	if ((descriptors[listener_index].revents & POLLNVAL) != 0) {
+		(void)fprintf(stderr,
+		    "OAuth callback listener became invalid\n");
+		goto done;
 	}
 	client_fd = accept(listeners[listener_index], NULL, NULL);
 	close_callback_listeners(listeners);
@@ -536,6 +543,15 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 			(void)fprintf(stderr,
 			    "could not accept OAuth callback: %s\n",
 			    strerror(errno));
+		goto done;
+	}
+	receive_timeout.tv_sec = timeout_ms / 1000;
+	receive_timeout.tv_usec = (timeout_ms % 1000) * 1000;
+	if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+		sizeof(receive_timeout)) == -1) {
+		(void)fprintf(stderr,
+		    "could not limit OAuth callback request: %s\n",
+		    strerror(errno));
 		goto done;
 	}
 	used = 0;
