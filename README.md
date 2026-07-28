@@ -50,6 +50,8 @@ proxy authenticates upstream with the saved OAuth session.
 - `man oaioauthc` after installation provides the complete command reference.
 - [API compatibility](docs/api-compatibility.md) lists supported behavior and
   explicit limitations.
+- [AI assistance policy](AI_DISCLOSURE.md) defines disclosure and authorship
+  requirements for contributions.
 - `oaioauthc --help` prints the installed version's command syntax.
 
 For a local ASan and UBSan run, configure a clean build with
