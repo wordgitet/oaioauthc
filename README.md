@@ -16,6 +16,16 @@ make
 make check
 ```
 
+For a local AddressSanitizer and UndefinedBehaviorSanitizer run, use a fresh
+build directory:
+
+```sh
+autoreconf -fi
+mkdir build-sanitized && cd build-sanitized
+../configure --enable-sanitizers
+make check
+```
+
 ## Use
 
 ```sh
