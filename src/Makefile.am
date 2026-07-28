@@ -4,6 +4,7 @@ bin_PROGRAMS = oaioauthc
 oaioauthc_SOURCES = \
 	main.c \
 	app.c app.h \
+	daemon.c daemon.h \
 	auth.c auth.h \
 	http.c http.h \
 	images.c images.h \

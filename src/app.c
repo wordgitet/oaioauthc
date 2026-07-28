@@ -35,6 +35,7 @@
 #include "app.h"
 #include "auth.h"
 #include "config.h"
+#include "daemon.h"
 #include "proxy.h"
 #include "util.h"
 
@@ -55,10 +56,14 @@ usage(FILE *stream)
 	    "                  [--codex-version VERSION] [--base-url URL]\n"
 	    "                  [--oauth-file PATH]\n"
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
+	    "                  [--daemon] [--runtime-dir DIR]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
 	    "  oaioauthc login [--oauth-file PATH] [--open|--no-open]\n"
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--login-timeout-ms MS]\n"
+	    "  oaioauthc status [--runtime-dir DIR]\n"
+	    "  oaioauthc stop [--runtime-dir DIR]\n"
+	    "  oaioauthc logs [--follow] [--runtime-dir DIR]\n"
 	    "  oaioauthc --help\n"
 	    "  oaioauthc --version\n");
 }
@@ -776,8 +781,11 @@ app_main(int argc, char **argv)
 {
 	struct proxy_options options;
 	const char	    *command;
+	const char	    *runtime_directory;
 	int		     index;
 	int		     open;
+	int		     daemon_mode;
+	int		     follow_logs;
 	char		     error[256];
 	const char	    *login_timeout_value;
 	unsigned long	     login_timeout;
@@ -794,6 +802,9 @@ app_main(int argc, char **argv)
 	    ? 1
 	    : 2;
 	open = 1;
+	daemon_mode = 0;
+	follow_logs = 0;
+	runtime_directory = NULL;
 	login_timeout = 300000UL;
 	login_timeout_value = NULL;
 	for (; index < argc; index++) {
@@ -824,6 +835,13 @@ app_main(int argc, char **argv)
 		else if (strcmp(argv[index], "--oauth-token-url") == 0)
 			options.token_url = option_value(&index, argc, argv,
 			    "--oauth-token-url");
+		else if (strcmp(argv[index], "--daemon") == 0)
+			daemon_mode = 1;
+		else if (strcmp(argv[index], "--runtime-dir") == 0)
+			runtime_directory =
+			    option_value(&index, argc, argv, "--runtime-dir");
+		else if (strcmp(argv[index], "--follow") == 0)
+			follow_logs = 1;
 		else if (strcmp(argv[index], "--debug-json") == 0)
 			options.debug_json = debug_json_compact;
 		else if (strcmp(argv[index], "--debug-json=compact") == 0)
@@ -874,9 +892,46 @@ app_main(int argc, char **argv)
 		    login_timeout_value, INT_MAX);
 		return 1;
 	}
-	if (strcmp(command, "login") == 0)
+	if (strcmp(command, "login") == 0) {
+		if (daemon_mode || follow_logs || runtime_directory != NULL) {
+			usage(stderr);
+			return 1;
+		}
 		return run_login(&options, open, (int)login_timeout);
-	if (strcmp(command, "serve") != 0) {
+	}
+	if (strcmp(command, "status") == 0 || strcmp(command, "stop") == 0 ||
+	    strcmp(command, "logs") == 0) {
+		/*
+		** Lifecycle commands never inspect runtime.json as proof of life.
+		** daemon.c connects to the private control socket, so stale metadata
+		** cannot make status or stop report a process that is not listening.
+		*/
+		if (daemon_mode || options.host != NULL ||
+		    options.port != NULL || options.models != NULL ||
+		    options.base_url != NULL || options.codex_version != NULL ||
+		    options.auth_file != NULL || options.client_id != NULL ||
+		    options.token_url != NULL ||
+		    options.debug_json != debug_json_disabled ||
+		    (follow_logs && strcmp(command, "logs") != 0)) {
+			usage(stderr);
+			return 1;
+		}
+		if (strcmp(command, "status") == 0)
+			index = daemon_status(runtime_directory, stdout, error,
+			    sizeof(error));
+		else if (strcmp(command, "stop") == 0)
+			index = daemon_stop(runtime_directory, stdout, error,
+			    sizeof(error));
+		else
+			index = daemon_logs(runtime_directory, follow_logs,
+			    stdout, error, sizeof(error));
+		if (index == -1) {
+			(void)fprintf(stderr, "%s\n", error);
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(command, "serve") != 0 || follow_logs) {
 		usage(stderr);
 		return 1;
 	}
@@ -889,7 +944,18 @@ app_main(int argc, char **argv)
 		(void)fprintf(stderr,
 		    "Warning: --debug-json logs prompts and "
 		    "conversation history to stderr.\n");
-	if (proxy_serve(&options, error, sizeof(error)) == -1) {
+	/*
+	** Foreground serve passes no control endpoint and therefore keeps its
+	** existing synchronous behavior.  --daemon delegates all fork, lock,
+	** readiness, and log-redirection work to daemon_serve.
+	*/
+	if (daemon_mode) {
+		if (daemon_serve(&options, runtime_directory, error,
+			sizeof(error)) == -1) {
+			(void)fprintf(stderr, "%s\n", error);
+			return 1;
+		}
+	} else if (proxy_serve(&options, NULL, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		return 1;
 	}

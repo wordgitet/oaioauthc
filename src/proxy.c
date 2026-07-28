@@ -132,6 +132,16 @@ child_exited(int signal_number)
 	(void)signal_number;
 }
 
+/* Request an orderly listener shutdown without doing work in the handler. */
+static volatile sig_atomic_t proxy_stop_requested;
+
+static void
+proxy_stop_handler(int signal_number)
+{
+	(void)signal_number;
+	proxy_stop_requested = 1;
+}
+
 /* Apply finite send/receive timeouts to one accepted client connection. */
 static void
 set_client_timeout(int fd)
@@ -544,9 +554,9 @@ read_request(int fd, struct request *request)
 	int	      last_header;
 
 	/*
-	 * Parse only the framing needed by the supported routes.  Reject ambiguous
-	 * Content-Length/Transfer-Encoding combinations before allocating a body.
-	 */
+	** Parse only the framing needed by the supported routes.  Reject ambiguous
+	** Content-Length/Transfer-Encoding combinations before allocating a body.
+	*/
 	memset(request, 0, sizeof(*request));
 	buffer_init(&buffer);
 	while ((header_end = buffer.data == NULL
@@ -920,7 +930,7 @@ catalog_refresh_init(struct catalog_refresh *refresh)
 */
 static void
 catalog_refresh_child(const struct proxy_options *options, int listen_fd,
-    int output_fd)
+    int control_fd, int output_fd)
 {
 	struct auth_session  session;
 	struct model_catalog catalog;
@@ -930,7 +940,17 @@ catalog_refresh_child(const struct proxy_options *options, int listen_fd,
 	const char	    *auth_file;
 	int		     result;
 
+	/*
+	** The catalog child is short-lived and must not inherit the parent's
+	** graceful-stop handler.  catalog_refresh_free sends SIGTERM and then
+	** waits synchronously, so the default action is required for reliable
+	** reaping during daemon shutdown.
+	*/
+	(void)signal(SIGTERM, SIG_DFL);
+	(void)signal(SIGINT, SIG_DFL);
 	close(listen_fd);
+	if (control_fd != -1)
+		close(control_fd);
 	memset(&session, 0, sizeof(session));
 	memset(&catalog, 0, sizeof(catalog));
 	update = NULL;
@@ -966,7 +986,7 @@ catalog_refresh_child(const struct proxy_options *options, int listen_fd,
 static void
 catalog_refresh_start(const struct proxy_options *options,
     struct model_catalog *catalog, struct catalog_refresh *refresh,
-    int listen_fd)
+    int listen_fd, int control_fd)
 {
 	int    descriptors[2];
 	pid_t  pid;
@@ -988,7 +1008,8 @@ catalog_refresh_start(const struct proxy_options *options,
 	}
 	if (pid == 0) {
 		close(descriptors[0]);
-		catalog_refresh_child(options, listen_fd, descriptors[1]);
+		catalog_refresh_child(options, listen_fd, control_fd,
+		    descriptors[1]);
 	}
 	close(descriptors[1]);
 	refresh->pid = pid;
@@ -1667,7 +1688,8 @@ dispatch(int fd, const struct proxy_options *options,
 ** children, and releases all parent-owned state on its error exit path.
 */
 int
-proxy_serve(const struct proxy_options *options, char *error, size_t length)
+proxy_serve(const struct proxy_options *options,
+    const struct proxy_control *control, char *error, size_t length)
 {
 	struct addrinfo	       hints;
 	struct addrinfo	      *addresses;
@@ -1676,13 +1698,15 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	int		       client_fd;
 	int		       one;
 	pid_t		       pid;
-	size_t		       workers;
+	pid_t		       worker_pids[MAX_WORKERS];
+	size_t		       worker_count;
+	size_t		       worker_index;
 	struct sigaction       action;
 	struct request	       request;
 	struct auth_session    session;
 	struct model_catalog   catalog;
 	struct catalog_refresh refresh;
-	struct pollfd	       descriptors[2];
+	struct pollfd	       descriptors[3];
 	const char	      *host;
 	const char	      *port;
 	const char	      *auth_file;
@@ -1690,22 +1714,38 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	struct proxy_options   effective_options;
 	nfds_t		       descriptor_count;
 	pid_t		       exited;
+	int		       control_index;
+	int		       refresh_index;
 	int		       poll_result;
 	int		       saved_errno;
 	int		       timeout;
+	int		       stop_result;
 
-	/* The parent owns listener and cache; children own exactly one connection. */
+	/*
+	** The parent owns the listener and catalog.  A control object is borrowed
+	** for this blocking call, so its descriptor and callback must remain valid
+	** until this function returns.  NULL preserves the ordinary foreground
+	** server with no lifecycle socket.
+	*/
 	if (options->base_url != NULL && options->base_url[0] == '\0') {
 		set_error(error, length, "--base-url must not be empty");
 		return (-1);
 	}
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
+	proxy_stop_requested = 0;
 	memset(&action, 0, sizeof(action));
 	action.sa_handler = child_exited;
 	sigemptyset(&action.sa_mask);
 	if (sigaction(SIGCHLD, &action, NULL) == -1) {
 		set_error(error, length, "could not configure child handling");
+		return -1;
+	}
+	action.sa_handler = proxy_stop_handler;
+	if (sigaction(SIGTERM, &action, NULL) == -1 ||
+	    sigaction(SIGINT, &action, NULL) == -1) {
+		set_error(error, length,
+		    "could not configure shutdown handling");
 		return -1;
 	}
 	memset(&hints, 0, sizeof(hints));
@@ -1738,6 +1778,17 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		    port, strerror(errno));
 		return -1;
 	}
+	/*
+	** A detached caller cannot infer readiness from fork success: DNS,
+	** binding, and listen can all fail after the child exists.  Notify only
+	** after listen succeeds, then continue with optional catalog warming.
+	*/
+	if (control != NULL && control->ready != NULL &&
+	    control->ready(control->argument) == -1) {
+		close(listen_fd);
+		set_error(error, length, "could not report daemon readiness");
+		return -1;
+	}
 	codex_version = resolve_codex_version(options, error, length);
 	if (codex_version == NULL) {
 		close(listen_fd);
@@ -1762,25 +1813,52 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 	}
 	(void)announce_startup(host, port, &effective_options, &catalog);
 	catalog_refresh_init(&refresh);
-	workers = 0;
+	worker_count = 0;
+	memset(worker_pids, 0, sizeof(worker_pids));
 	saved_errno = 0;
 	for (;;) {
+		/*
+		** SIGCHLD only interrupts poll; it does not identify which child
+		** exited.  Reap everything non-blockingly and remove known worker
+		** PIDs from the bounded table before accepting more clients.
+		*/
 		while ((exited = waitpid(-1, NULL, WNOHANG)) > 0) {
 			if (exited == refresh.pid)
 				refresh.pid = -1;
-			else if (workers > 0)
-				workers--;
+			else {
+				for (worker_index = 0;
+				    worker_index < worker_count; worker_index++)
+					if (worker_pids[worker_index] == exited)
+						break;
+				if (worker_index < worker_count) {
+					worker_count--;
+					worker_pids[worker_index] =
+					    worker_pids[worker_count];
+				}
+			}
 		}
+		if (proxy_stop_requested)
+			break;
 		catalog_refresh_start(&effective_options, &catalog, &refresh,
-		    listen_fd);
+		    listen_fd, control == NULL ? -1 : control->fd);
 		descriptors[0].fd = listen_fd;
 		descriptors[0].events = POLLIN;
 		descriptors[0].revents = 0;
 		descriptor_count = 1;
+		control_index = -1;
+		refresh_index = -1;
+		if (control != NULL && control->fd != -1) {
+			control_index = (int)descriptor_count;
+			descriptors[descriptor_count].fd = control->fd;
+			descriptors[descriptor_count].events = POLLIN;
+			descriptors[descriptor_count].revents = 0;
+			descriptor_count++;
+		}
 		if (refresh.fd != -1) {
-			descriptors[1].fd = refresh.fd;
-			descriptors[1].events = POLLIN;
-			descriptors[1].revents = 0;
+			refresh_index = (int)descriptor_count;
+			descriptors[descriptor_count].fd = refresh.fd;
+			descriptors[descriptor_count].events = POLLIN;
+			descriptors[descriptor_count].revents = 0;
 			descriptor_count++;
 		}
 		timeout = catalog_refresh_timeout(&effective_options, &catalog,
@@ -1794,10 +1872,31 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		}
 		if (poll_result == 0)
 			continue;
-		if (descriptor_count > 1 &&
-		    (descriptors[1].revents &
+		/*
+		** Control requests are intentionally handled in the listener parent.
+		** They never fork and therefore cannot outlive the daemon's lock or
+		** race cleanup of the control socket during a STOP request.
+		*/
+		if (control_index != -1 &&
+		    (descriptors[control_index].revents &
+			(POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+			client_fd = accept(control->fd, NULL, NULL);
+			if (client_fd != -1) {
+				stop_result = control->callback == NULL
+				    ? 0
+				    : control->callback(client_fd,
+					  control->argument);
+				close(client_fd);
+				if (stop_result > 0)
+					proxy_stop_requested = 1;
+			}
+		}
+		if (refresh_index != -1 &&
+		    (descriptors[refresh_index].revents &
 			(POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
 			catalog_refresh_read(&refresh, &catalog);
+		if (proxy_stop_requested)
+			break;
 		if ((descriptors[0].revents & POLLIN) == 0) {
 			if ((descriptors[0].revents &
 				(POLLERR | POLLHUP | POLLNVAL)) != 0) {
@@ -1814,7 +1913,7 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			break;
 		}
 		set_client_timeout(client_fd);
-		if (workers >= MAX_WORKERS) {
+		if (worker_count >= MAX_WORKERS) {
 			(void)send_error(client_fd, 503,
 			    "Too many concurrent requests.", "server_error");
 			close(client_fd);
@@ -1828,7 +1927,16 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			continue;
 		}
 		if (pid == 0) {
+			/*
+			** Request workers must retain default termination semantics.  The
+			** listener's signal handler is useful only in the parent; inheriting
+			** it would make SIGTERM leave a worker serving a stalled client.
+			*/
+			(void)signal(SIGTERM, SIG_DFL);
+			(void)signal(SIGINT, SIG_DFL);
 			close(listen_fd);
+			if (control != NULL && control->fd != -1)
+				close(control->fd);
 			if (refresh.fd != -1)
 				close(refresh.fd);
 			if (read_request(client_fd, &request) == -1)
@@ -1844,14 +1952,29 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 			close(client_fd);
 			_exit(0);
 		}
-		workers++;
+		worker_pids[worker_count++] = pid;
 		close(client_fd);
 	}
+	/*
+	** STOP, SIGTERM, and SIGINT all converge here.  Closing the listener first
+	** prevents new work; then terminate and reap every tracked request worker
+	** before releasing the catalog-refresh child and cached JSON.
+	*/
 	close(listen_fd);
 	catalog_refresh_free(&refresh);
+	for (worker_index = 0; worker_index < worker_count; worker_index++)
+		(void)kill(worker_pids[worker_index], SIGTERM);
+	for (worker_index = 0; worker_index < worker_count; worker_index++) {
+		do {
+			exited = waitpid(worker_pids[worker_index], NULL, 0);
+		} while (exited == -1 && errno == EINTR);
+	}
 	model_catalog_free(&catalog);
 	free(codex_version);
-	set_error(error, length, "server accept failed: %s",
-	    strerror(saved_errno));
-	return -1;
+	if (saved_errno != 0) {
+		set_error(error, length, "server accept failed: %s",
+		    strerror(saved_errno));
+		return -1;
+	}
+	return 0;
 }
