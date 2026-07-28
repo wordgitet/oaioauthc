@@ -37,6 +37,56 @@ main(void)
 	json_decref(request);
 
 	request = json_load_string_checked(
+	    "{\"model\":\"gpt-5.2\",\"input\":\"Hello\",\"verbosity\":\"high\","
+	    "\"reasoning_effort\":\"medium\",\"max_tokens\":8,"
+	    "\"max_completion_tokens\":9,\"max_output_tokens\":10,"
+	    "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{"
+	    "\"name\":\"answer\",\"strict\":true,\"schema\":{\"type\":\"object\"}}}}",
+	    error, sizeof(error));
+	CHECK(request != NULL);
+	CHECK(json_normalize_response_request(request, 1, error,
+		  sizeof(error)) == 0);
+	CHECK(json_object_get(request, "verbosity") == NULL);
+	CHECK(json_object_get(request, "reasoning_effort") == NULL);
+	CHECK(json_object_get(request, "response_format") == NULL);
+	CHECK(json_object_get(request, "max_tokens") == NULL);
+	CHECK(json_object_get(request, "max_completion_tokens") == NULL);
+	CHECK(json_object_get(request, "max_output_tokens") == NULL);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(request, "text"), "verbosity")),
+		  "high") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(request, "reasoning"), "effort")),
+		  "medium") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(json_object_get(request, "text"),
+			     "format"),
+			 "type")),
+		  "json_schema") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(json_object_get(request, "text"),
+			     "format"),
+			 "name")),
+		  "answer") == 0);
+	json_decref(request);
+
+	request = json_load_string_checked(
+	    "{\"model\":\"gpt-test\",\"input\":\"Hello\",\"verbosity\":\"high\"}",
+	    error, sizeof(error));
+	model = json_load_string_checked(
+	    "{\"slug\":\"gpt-test\",\"support_verbosity\":false}", error,
+	    sizeof(error));
+	CHECK(request != NULL && model != NULL);
+	CHECK(json_normalize_response_request(request, 1, error,
+		  sizeof(error)) == 0);
+	CHECK(json_apply_model_defaults(request, model, &use_lite, error,
+		  sizeof(error)) == 0);
+	CHECK(json_object_get(json_object_get(request, "text"), "verbosity") ==
+	    NULL);
+	json_decref(model);
+	json_decref(request);
+
+	request = json_load_string_checked(
 	    "{\"model\":\"gpt-lite\",\"input\":\"Hello\","
 	    "\"instructions\":\"Be concise\",\"tools\":[{\"type\":"
 	    "\"function\",\"name\":\"lookup\"}]}",
@@ -91,6 +141,35 @@ main(void)
 	CHECK(strcmp(json_string_value(json_object_get(
 			 json_object_get(converted, "tool_choice"), "name")),
 		  "lookup") == 0);
+	json_decref(converted);
+	json_decref(chat);
+
+	chat = json_load_string_checked(
+	    "{\"model\":\"gpt-test\",\"verbosity\":\"low\","
+	    "\"response_format\":{\"type\":\"json_object\"},"
+	    "\"function_call\":{\"name\":\"lookup\"},\"functions\":[{"
+	    "\"name\":\"lookup\",\"description\":\"Find a value\","
+	    "\"strict\":true,\"parameters\":{\"type\":\"object\"}}],"
+	    "\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}",
+	    error, sizeof(error));
+	CHECK(chat != NULL);
+	converted = json_chat_to_responses(chat, error, sizeof(error));
+	CHECK(converted != NULL);
+	CHECK(json_normalize_response_request(converted, 1, error,
+		  sizeof(error)) == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(converted, "text"), "verbosity")),
+		  "low") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(json_object_get(converted, "text"),
+			     "format"),
+			 "type")),
+		  "json_object") == 0);
+	CHECK(strcmp(json_string_value(json_object_get(
+			 json_object_get(converted, "tool_choice"), "name")),
+		  "lookup") == 0);
+	CHECK(json_is_true(json_object_get(
+	    json_array_get(json_object_get(converted, "tools"), 0), "strict")));
 	json_decref(converted);
 	json_decref(chat);
 

@@ -109,11 +109,189 @@ json_has_replay_state(json_t *request)
 }
 
 /*
+** Return request.text, allocating its object form for a compatibility alias.
+**
+** The caller borrows the returned object through request.  A replacement only
+** occurs when a malformed or absent text member cannot hold nested settings.
+*/
+static json_t *
+request_text_object(json_t *request)
+{
+	json_t *text;
+
+	text = json_object_get(request, "text");
+	if (json_is_object(text))
+		return text;
+	text = json_object();
+	if (text == NULL)
+		return NULL;
+	if (json_object_set(request, "text", text) == -1) {
+		json_decref(text);
+		return NULL;
+	}
+	json_decref(text);
+	return json_object_get(request, "text");
+}
+
+/*
+** Check the documented Responses text verbosity levels before moving an alias.
+**
+** Validating locally prevents a client-only top-level field from becoming an
+** opaque upstream Codex error after the proxy has already rewritten it.
+*/
+static int
+valid_verbosity(json_t *value)
+{
+	const char *verbosity;
+
+	verbosity = json_string_value(value);
+	return verbosity != NULL &&
+	    (strcmp(verbosity, "low") == 0 ||
+		strcmp(verbosity, "medium") == 0 ||
+		strcmp(verbosity, "high") == 0);
+}
+
+/*
+** Translate documented compatibility aliases into their Responses equivalents.
+**
+** Open WebUI exposes some Chat-shaped settings even when configured to call
+** /v1/responses.  The aliases handled here have exact Responses meanings.
+** Canonical nested fields always win, so callers can safely send both forms
+** during a gradual migration.  Token caps are deliberately discarded because
+** the Codex OAuth endpoint does not accept output-token limit controls.
+*/
+static int
+normalize_response_compatibility(json_t *request, char *error, size_t length)
+{
+	const char *type;
+	json_t	   *format;
+	json_t	   *reasoning;
+	json_t	   *schema;
+	json_t	   *text;
+	json_t	   *value;
+
+	value = json_object_get(request, "verbosity");
+	if (value != NULL) {
+		if (!valid_verbosity(value)) {
+			set_error(error, length,
+			    "`verbosity` must be `low`, `medium`, or `high`");
+			return -1;
+		}
+		text = request_text_object(request);
+		if (text == NULL ||
+		    (json_object_get(text, "verbosity") == NULL &&
+			json_object_set(text, "verbosity", value) == -1))
+			goto fail;
+		json_object_del(request, "verbosity");
+	}
+	value = json_object_get(request, "reasoning_effort");
+	if (value != NULL) {
+		if (!json_is_string(value)) {
+			set_error(error, length,
+			    "`reasoning_effort` must be a string");
+			return -1;
+		}
+		reasoning = json_object_get(request, "reasoning");
+		if (!json_is_object(reasoning)) {
+			reasoning = json_object();
+			if (reasoning == NULL ||
+			    json_object_set(request, "reasoning", reasoning) ==
+				-1) {
+				json_decref(reasoning);
+				goto fail;
+			}
+			json_decref(reasoning);
+			reasoning = json_object_get(request, "reasoning");
+		}
+		if (json_object_get(reasoning, "effort") == NULL &&
+		    json_object_set(reasoning, "effort", value) == -1)
+			goto fail;
+		json_object_del(request, "reasoning_effort");
+	}
+	format = json_object_get(request, "response_format");
+	if (format != NULL) {
+		if (!json_is_object(format) ||
+		    !json_is_string(json_object_get(format, "type"))) {
+			set_error(error, length,
+			    "`response_format` must be an object with a `type`");
+			return -1;
+		}
+		text = request_text_object(request);
+		if (text == NULL)
+			goto fail;
+		if (json_object_get(text, "format") == NULL) {
+			type = json_string_value(
+			    json_object_get(format, "type"));
+			if (strcmp(type, "text") == 0 ||
+			    strcmp(type, "json_object") == 0) {
+				value = json_pack("{s:s}", "type", type);
+				if (value == NULL ||
+				    json_object_set(text, "format", value) ==
+					-1) {
+					json_decref(value);
+					goto fail;
+				}
+				json_decref(value);
+			} else if (strcmp(type, "json_schema") == 0) {
+				schema = json_object_get(format, "json_schema");
+				if (!json_is_object(schema) ||
+				    !json_is_string(
+					json_object_get(schema, "name")) ||
+				    !json_is_object(
+					json_object_get(schema, "schema"))) {
+					set_error(error, length,
+					    "`response_format.json_schema` needs name and schema");
+					return -1;
+				}
+				value =
+				    json_pack("{s:s}", "type", "json_schema");
+				if (value == NULL ||
+				    json_object_set(value, "name",
+					json_object_get(schema, "name")) ==
+					-1 ||
+				    json_object_set(value, "schema",
+					json_object_get(schema, "schema")) ==
+					-1 ||
+				    (json_object_get(schema, "description") !=
+					    NULL &&
+					json_object_set(value, "description",
+					    json_object_get(schema,
+						"description")) == -1) ||
+				    (json_object_get(schema, "strict") !=
+					    NULL &&
+					json_object_set(value, "strict",
+					    json_object_get(schema,
+						"strict")) == -1) ||
+				    json_object_set(text, "format", value) ==
+					-1) {
+					json_decref(value);
+					goto fail;
+				}
+				json_decref(value);
+			} else {
+				set_error(error, length,
+				    "unsupported `response_format.type`");
+				return -1;
+			}
+		}
+		json_object_del(request, "response_format");
+	}
+	json_object_del(request, "max_tokens");
+	json_object_del(request, "max_completion_tokens");
+	json_object_del(request, "max_output_tokens");
+	return 0;
+
+fail:
+	set_error(error, length, "could not normalize Responses compatibility");
+	return -1;
+}
+
+/*
 ** Normalize one Responses request in place for the Codex backend.
 **
 ** A string input becomes a user input_text message.  store is forced false,
-** obsolete max_output_tokens is removed, encrypted reasoning is requested for
-** client-side replay, and force_stream can override a caller's stream choice.
+** obsolete output-token aliases are removed, encrypted reasoning is requested
+** for client-side replay, and force_stream can override a caller's choice.
 ** The caller retains ownership of request on both success and failure.
 */
 int
@@ -150,7 +328,8 @@ json_normalize_response_request(json_t *request, int force_stream, char *error,
 	if (!json_is_string(json_object_get(request, "instructions")))
 		json_object_set_new(request, "instructions", json_string(""));
 	json_object_set_new(request, "store", json_false());
-	json_object_del(request, "max_output_tokens");
+	if (normalize_response_compatibility(request, error, length) == -1)
+		return -1;
 	include = json_object_get(request, "include");
 	if (!json_is_array(include)) {
 		include = json_array();
@@ -236,9 +415,12 @@ json_apply_model_defaults(json_t *request, json_t *model, int *use_lite,
 		goto fail;
 	default_verbosity = json_string_value(
 	    json_object_get(model, "default_verbosity"));
-	if (json_is_true(json_object_get(model, "support_verbosity")) &&
+	text = json_object_get(request, "text");
+	if (json_is_false(json_object_get(model, "support_verbosity"))) {
+		if (json_is_object(text))
+			json_object_del(text, "verbosity");
+	} else if (json_is_true(json_object_get(model, "support_verbosity")) &&
 	    default_verbosity != NULL) {
-		text = json_object_get(request, "text");
 		if (!json_is_object(text)) {
 			text = json_object();
 			if (text == NULL ||
@@ -361,6 +543,42 @@ chat_content_to_input(json_t *content, int assistant)
 }
 
 /*
+** Convert one legacy or modern Chat function declaration into a Responses tool.
+**
+** Both declarations have the same function object after the modern tools[]
+** wrapper is removed.  Preserve the documented description, schema, and
+** strictness fields without changing a caller-provided JSON schema.
+*/
+static json_t *
+chat_function_to_response(json_t *function)
+{
+	json_t	   *converted;
+	const char *name;
+
+	if (!json_is_object(function))
+		return NULL;
+	name = json_string_value(json_object_get(function, "name"));
+	if (name == NULL)
+		return NULL;
+	converted = json_pack("{s:s,s:s}", "type", "function", "name", name);
+	if (converted == NULL)
+		return NULL;
+	if ((json_is_string(json_object_get(function, "description")) &&
+		json_object_set(converted, "description",
+		    json_object_get(function, "description")) == -1) ||
+	    (json_is_object(json_object_get(function, "parameters")) &&
+		json_object_set(converted, "parameters",
+		    json_object_get(function, "parameters")) == -1) ||
+	    (json_is_boolean(json_object_get(function, "strict")) &&
+		json_object_set(converted, "strict",
+		    json_object_get(function, "strict")) == -1)) {
+		json_decref(converted);
+		return NULL;
+	}
+	return converted;
+}
+
+/*
 ** Translate a complete Chat Completions request into a Responses request.
 **
 ** The result owns newly created input and tool arrays but borrows compatible
@@ -378,6 +596,7 @@ json_chat_to_responses(json_t *chat, char *error, size_t length)
 	json_t *tools;
 	json_t *tool_choice;
 	json_t *response_tools;
+	json_t *legacy_functions;
 	size_t	index;
 
 	/* Rebuild history as Responses input because no server-side replay exists. */
@@ -469,7 +688,10 @@ json_chat_to_responses(json_t *chat, char *error, size_t length)
 	if (json_is_boolean(json_object_get(chat, "stream")))
 		json_object_set(result, "stream",
 		    json_object_get(chat, "stream"));
-	if (json_is_integer(json_object_get(chat, "max_tokens")))
+	if (json_is_integer(json_object_get(chat, "max_completion_tokens")))
+		json_object_set(result, "max_output_tokens",
+		    json_object_get(chat, "max_completion_tokens"));
+	else if (json_is_integer(json_object_get(chat, "max_tokens")))
 		json_object_set(result, "max_output_tokens",
 		    json_object_get(chat, "max_tokens"));
 	if (json_is_real(json_object_get(chat, "temperature")) ||
@@ -490,6 +712,12 @@ json_chat_to_responses(json_t *chat, char *error, size_t length)
 		json_object_set_new(result, "reasoning",
 		    json_pack("{s:O}", "effort",
 			json_object_get(chat, "reasoning_effort")));
+	if (json_is_string(json_object_get(chat, "verbosity")))
+		json_object_set(result, "verbosity",
+		    json_object_get(chat, "verbosity"));
+	if (json_is_object(json_object_get(chat, "response_format")))
+		json_object_set(result, "response_format",
+		    json_object_get(chat, "response_format"));
 	tool_choice = json_object_get(chat, "tool_choice");
 	if (json_is_string(tool_choice))
 		json_object_set(result, "tool_choice", tool_choice);
@@ -504,39 +732,37 @@ json_chat_to_responses(json_t *chat, char *error, size_t length)
 			    json_pack("{s:s,s:s}", "type", "function", "name",
 				name));
 	}
+	if (json_object_get(result, "tool_choice") == NULL) {
+		tool_choice = json_object_get(chat, "function_call");
+		if (json_is_string(tool_choice))
+			json_object_set(result, "tool_choice", tool_choice);
+		else if (json_is_object(tool_choice) &&
+		    json_is_string(json_object_get(tool_choice, "name")))
+			json_object_set_new(result, "tool_choice",
+			    json_pack("{s:s,s:s}", "type", "function", "name",
+				json_string_value(
+				    json_object_get(tool_choice, "name"))));
+	}
 	tools = json_object_get(chat, "tools");
-	if (json_is_array(tools)) {
+	legacy_functions = json_object_get(chat, "functions");
+	if (json_is_array(tools) || json_is_array(legacy_functions)) {
 		json_t *tool;
 		size_t	tool_index;
 
+		if (!json_is_array(tools))
+			tools = legacy_functions;
 		response_tools = json_array();
 		json_array_foreach(tools, tool_index, tool)
 		{
-			json_t	   *function;
-			const char *name;
+			json_t *converted;
 
-			function = json_object_get(tool, "function");
-			name = json_string_value(
-			    json_object_get(function, "name"));
-			if (json_is_object(function) && name != NULL) {
-				json_t *converted;
-
-				converted = json_pack("{s:s,s:s}", "type",
-				    "function", "name", name);
-				if (json_is_string(json_object_get(function,
-					"description")))
-					json_object_set(converted,
-					    "description",
-					    json_object_get(function,
-						"description"));
-				if (json_is_object(json_object_get(function,
-					"parameters")))
-					json_object_set(converted, "parameters",
-					    json_object_get(function,
-						"parameters"));
+			converted = chat_function_to_response(
+			    json_is_array(json_object_get(chat, "tools"))
+				? json_object_get(tool, "function")
+				: tool);
+			if (converted != NULL)
 				json_array_append_new(response_tools,
 				    converted);
-			}
 		}
 		json_object_set_new(result, "tools", response_tools);
 	}
