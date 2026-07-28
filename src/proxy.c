@@ -194,13 +194,13 @@ send_stream_headers(struct stream_client *client)
 }
 
 /*
-** Forward one upstream Responses stream fragment unchanged.
+** Write one finalized local Responses fragment to the client connection.
 **
 ** started records that an HTTP response is already visible, so later failures
 ** cannot be replaced by a conflicting JSON error response on the same socket.
 */
 static int
-write_stream(const void *data, size_t length, void *argument)
+write_stream_raw(const void *data, size_t length, void *argument)
 {
 	struct stream_client *client;
 
@@ -208,6 +208,13 @@ write_stream(const void *data, size_t length, void *argument)
 	if (send_stream_headers(client) == -1)
 		return -1;
 	return write_all(client->fd, data, length);
+}
+
+/* Feed one upstream Responses fragment through its terminal-output normalizer. */
+static int
+write_stream(const void *data, size_t length, void *argument)
+{
+	return sse_response_stream_feed(argument, data, length);
 }
 
 /* Feed Codex SSE bytes into the Responses-to-Chat streaming translator. */
@@ -1386,6 +1393,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	int			result;
 	struct stream_client	client;
 	struct sse_chat_stream *chat_stream;
+	struct sse_response_stream *response_stream;
 
 	/* Convert Chat only here; all upstream work uses Responses JSON. */
 	request = json_load_string_checked(body, error, sizeof(error));
@@ -1451,13 +1459,26 @@ handle_responses(int fd, const struct proxy_options *options,
 	client.fd = fd;
 	client.started = 0;
 	chat_stream = NULL;
+	response_stream = NULL;
+	if (!as_chat && want_stream) {
+		response_stream =
+		    sse_response_stream_new(write_stream_raw, &client);
+		if (response_stream == NULL) {
+			free(url);
+			free(request_text);
+			json_decref(request);
+			return send_error(fd, 500, "out of memory",
+			    "server_error");
+		}
+	}
 	if (as_chat && want_stream) {
 		chat_stream = sse_chat_stream_new(
 		    json_string_value(json_object_get(request, "model")),
-		    write_stream, &client);
+		    write_stream_raw, &client);
 		if (chat_stream == NULL) {
 			free(url);
 			free(request_text);
+			sse_response_stream_free(response_stream);
 			json_decref(request);
 			return send_error(fd, 500, "out of memory",
 			    "server_error");
@@ -1469,8 +1490,8 @@ handle_responses(int fd, const struct proxy_options *options,
 		    use_lite ? "x-openai-internal-codex-responses-lite: true"
 			     : NULL,
 		    as_chat ? write_chat_stream : write_stream,
-		    as_chat ? (void *)chat_stream : (void *)&client, &response,
-		    error, sizeof(error));
+		    as_chat ? (void *)chat_stream : (void *)response_stream,
+		    &response, error, sizeof(error));
 	else
 		result = http_post_json(url, request_text,
 		    session->access_token, session->account_id,
@@ -1481,6 +1502,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	free(request_text);
 	if (result == -1) {
 		sse_chat_stream_free(chat_stream);
+		sse_response_stream_free(response_stream);
 		json_decref(request);
 		if (client.started)
 			return -1;
@@ -1493,6 +1515,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		    response.body == NULL ? "" : response.body);
 		http_response_free(&response);
 		sse_chat_stream_free(chat_stream);
+		sse_response_stream_free(response_stream);
 		json_decref(request);
 		return result;
 	}
@@ -1500,9 +1523,10 @@ handle_responses(int fd, const struct proxy_options *options,
 		if (as_chat)
 			result = sse_chat_stream_finish(chat_stream);
 		else
-			result = send_stream_headers(&client);
+			result = sse_response_stream_finish(response_stream);
 		http_response_free(&response);
 		sse_chat_stream_free(chat_stream);
+		sse_response_stream_free(response_stream);
 		json_decref(request);
 		if (result == -1 && !client.started)
 			return send_error(fd, 502,

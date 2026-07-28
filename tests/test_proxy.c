@@ -439,6 +439,7 @@ main(void)
 		    "{\"model\":\"gpt-test\",\"input\":\"hi\",\"stream\":true}",
 		    response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "response.output_text.delta") != NULL);
+	REQUIRE(strstr(response, "\"output\":[{\"id\":\"msg_test\"") != NULL);
 	REQUIRE(request_json(port, "/v1/chat/completions",
 		    "{\"model\":\"gpt-test\",\"messages\":[{\"role\":\"user\","
 		    "\"content\":\"hi\"}]}",
