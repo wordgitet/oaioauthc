@@ -120,7 +120,7 @@ static int
 open_browser(const char *url)
 {
 	const char *browser;
-	pid_t pid;
+	pid_t	    pid;
 
 	browser = getenv("BROWSER");
 	if (browser == NULL || browser[0] == '\0' ||
