@@ -761,6 +761,7 @@ daemon_logs(const char *directory, int follow, FILE *stream, char *error,
 	ssize_t		     count;
 	int		     fd;
 	int		     result;
+	int		     saved_errno;
 
 	if (runtime_paths_init(&paths, directory, error, length) == -1)
 		return -1;
@@ -785,6 +786,10 @@ daemon_logs(const char *directory, int follow, FILE *stream, char *error,
 			if (fwrite(chunk, 1, (size_t)count, stream) !=
 				(size_t)count ||
 			    fflush(stream) == EOF) {
+				saved_errno = errno == 0 ? EIO : errno;
+				set_error(error, length,
+				    "could not write daemon log output: %s",
+				    strerror(saved_errno));
 				result = -1;
 				break;
 			}
@@ -793,6 +798,8 @@ daemon_logs(const char *directory, int follow, FILE *stream, char *error,
 		if (count == -1 && errno == EINTR)
 			continue;
 		if (count == -1) {
+			set_error(error, length,
+			    "could not read daemon log: %s", strerror(errno));
 			result = -1;
 			break;
 		}

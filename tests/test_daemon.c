@@ -111,6 +111,68 @@ run_command(char *const argv[], char *output, size_t length)
 	return WEXITSTATUS(status);
 }
 
+/*
+** Execute one command with stdout connected to a pipe that has no reader.
+**
+** app_main ignores SIGPIPE, so writing the log returns EPIPE to daemon_logs.
+** Stderr remains captured separately to prove that the failure initializes a
+** complete diagnostic rather than passing untouched stack bytes to fprintf.
+*/
+static int
+run_command_closed_stdout(char *const argv[], char *output, size_t length)
+{
+	int	closed_output[2];
+	int	diagnostics[2];
+	int	status;
+	int	result;
+	pid_t	child;
+	ssize_t count;
+	size_t	used;
+
+	if (pipe(closed_output) == -1)
+		return -1;
+	if (pipe(diagnostics) == -1) {
+		close(closed_output[0]);
+		close(closed_output[1]);
+		return -1;
+	}
+	child = fork();
+	if (child == -1) {
+		close(closed_output[0]);
+		close(closed_output[1]);
+		close(diagnostics[0]);
+		close(diagnostics[1]);
+		return -1;
+	}
+	if (child == 0) {
+		close(closed_output[0]);
+		close(diagnostics[0]);
+		if (dup2(closed_output[1], STDOUT_FILENO) == -1 ||
+		    dup2(diagnostics[1], STDERR_FILENO) == -1)
+			_exit(126);
+		close(closed_output[1]);
+		close(diagnostics[1]);
+		execv("../src/oaioauthc", argv);
+		_exit(127);
+	}
+	close(closed_output[0]);
+	close(closed_output[1]);
+	close(diagnostics[1]);
+	used = 0;
+	while (used + 1 < length &&
+	    (count = read(diagnostics[0], output + used, length - used - 1)) >
+		0)
+		used += (size_t)count;
+	output[used] = '\0';
+	close(diagnostics[0]);
+	do {
+		result = waitpid(child, &status, 0);
+	} while (result == -1 && errno == EINTR);
+	if (result != child || !WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
+
 /* Wait until a runtime path exists or the bounded startup deadline expires. */
 static int
 wait_for_path(const char *path, int present)
@@ -209,6 +271,8 @@ test_daemon_lifecycle(void)
 		"gpt-test", "--codex-version", "9.9.9", NULL };
 	char *status_argv[] = { "../src/oaioauthc", "status", "--runtime-dir",
 		directory, NULL };
+	char *logs_argv[] = { "../src/oaioauthc", "logs", "--runtime-dir",
+		directory, NULL };
 	char *stop_argv[] = { "../src/oaioauthc", "stop", "--runtime-dir",
 		directory, NULL };
 	int   result;
@@ -250,6 +314,9 @@ test_daemon_lifecycle(void)
 	started = 0;
 	if (wait_for_path(control_path, 0) == -1 ||
 	    run_command(status_argv, output, sizeof(output)) == 0)
+		goto cleanup;
+	if (run_command_closed_stdout(logs_argv, output, sizeof(output)) != 1 ||
+	    strstr(output, "could not write daemon log output:") == NULL)
 		goto cleanup;
 	result = 0;
 
