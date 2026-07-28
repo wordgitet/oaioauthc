@@ -22,12 +22,13 @@ capture(const void *data, size_t length, void *argument)
 int
 main(void)
 {
-	struct buffer		output;
-	struct sse_chat_stream *chat;
-	char			error[256];
-	json_t		       *response;
-	const char	       *stream;
-	size_t			split;
+	struct buffer		    output;
+	struct sse_chat_stream	   *chat;
+	struct sse_response_stream *responses;
+	char			    error[256];
+	json_t			   *response;
+	const char		   *stream;
+	size_t			    split;
 
 	stream = "event: response.created\r\n"
 		 "data: {\"response\":{\"id\":\"resp_1\",\"status\":"
@@ -47,6 +48,27 @@ main(void)
 		  "completed") == 0);
 	CHECK(json_array_size(json_object_get(response, "output")) == 1);
 	json_decref(response);
+
+	stream =
+	    "event: response.output_item.done\n"
+	    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":"
+	    "\"msg_2\",\"type\":\"message\",\"content\":[{\"type\":"
+	    "\"output_text\",\"text\":\"hello\"}]}}\n\n"
+	    "event: response.completed\n"
+	    "data: {\"type\":\"response.completed\",\"response\":{\"id\":"
+	    "\"resp_2\",\"status\":\"completed\",\"output\":[]}}\n\n";
+	buffer_init(&output);
+	responses = sse_response_stream_new(capture, &output);
+	CHECK(responses != NULL);
+	split = strlen(stream) / 2;
+	CHECK(sse_response_stream_feed(responses, stream, split) == 0);
+	CHECK(sse_response_stream_feed(responses, stream + split,
+		  strlen(stream) - split) == 0);
+	CHECK(sse_response_stream_finish(responses) == 0);
+	CHECK(strstr(output.data, "event: response.completed") != NULL);
+	CHECK(strstr(output.data, "\"output\":[{\"id\":\"msg_2\"") != NULL);
+	sse_response_stream_free(responses);
+	buffer_free(&output);
 
 	stream =
 	    "data: {\"type\":\"response.created\",\"response\":{\"id\":"

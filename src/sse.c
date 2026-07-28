@@ -52,6 +52,23 @@ struct sse_chat_stream {
 	int		   done;
 };
 
+/*
+** Stateful normalizer for one outgoing Responses stream.
+**
+** Codex may send every completed output item before response.completed while
+** leaving response.output empty.  Some compatible clients use that final
+** object as their authoritative state and discard already rendered deltas.
+** items retains deep copies keyed by id until the terminal event can carry
+** them.  pending handles arbitrary curl callback fragment boundaries.
+*/
+struct sse_response_stream {
+	struct buffer	   pending;
+	json_t		  *items;
+	sse_write_callback write;
+	void		  *argument;
+	int		   done;
+};
+
 /* Set a short parse diagnostic in the caller-owned error buffer. */
 static void
 set_error(char *error, size_t length, const char *message)
@@ -92,6 +109,192 @@ collect_output_item(json_t *items, json_t *item)
 			return json_array_set_new(items, index, copy);
 	}
 	return json_array_append_new(items, copy);
+}
+
+/* Write one unchanged complete SSE block after its framing was normalized. */
+static int
+write_response_block(struct sse_response_stream *stream, const char *block)
+{
+	if (stream->write(block, strlen(block), stream->argument) == -1)
+		return -1;
+	return stream->write("\n\n", 2, stream->argument);
+}
+
+/*
+** Replace the JSON data line in one terminal event while retaining its fields.
+**
+** The parser accepts only one JSON data line, matching the Codex protocol.
+** Keeping the original prefix and suffix preserves event names, ids, and
+** comments which a generic SSE client may use independently of JSON data.
+*/
+static int
+write_completed_response(struct sse_response_stream *stream, const char *block,
+    const char *data, const char *data_end, json_t *event)
+{
+	json_t *response;
+	json_t *items;
+	char   *text;
+	int	result;
+
+	response = json_object_get(event, "response");
+	items = json_deep_copy(stream->items);
+	if (items == NULL || json_object_set(response, "output", items) == -1) {
+		json_decref(items);
+		return -1;
+	}
+	json_decref(items);
+	text = json_dumps(event, JSON_COMPACT);
+	if (text == NULL)
+		return -1;
+	result = stream->write(block, (size_t)(data - block), stream->argument);
+	if (result == 0)
+		result = stream->write(text, strlen(text), stream->argument);
+	if (result == 0)
+		result =
+		    stream->write(data_end, strlen(data_end), stream->argument);
+	if (result == 0)
+		result = stream->write("\n\n", 2, stream->argument);
+	free(text);
+	return result;
+}
+
+/*
+** Forward one complete Responses SSE block and repair its terminal object.
+**
+** Only a completed item is stable enough to place in the final output array.
+** A non-empty upstream output remains authoritative.  Malformed or unrelated
+** blocks pass through unchanged, so a newer Codex event cannot break clients.
+*/
+static int
+process_response_block(struct sse_response_stream *stream, char *block)
+{
+	const char  *type;
+	char	    *data;
+	char	    *data_end;
+	json_error_t error;
+	json_t	    *event;
+	json_t	    *item;
+	json_t	    *output;
+	json_t	    *response;
+	int	     result;
+
+	data = strstr(block, "data:");
+	if (data == NULL)
+		return write_response_block(stream, block);
+	data += 5;
+	while (*data == ' ')
+		data++;
+	data_end = strchr(data, '\n');
+	if (data_end == NULL)
+		data_end = data + strlen(data);
+	event = json_loadb(data, (size_t)(data_end - data), 0, &error);
+	if (event == NULL)
+		return write_response_block(stream, block);
+	type = json_string_value(json_object_get(event, "type"));
+	item = json_object_get(event, "item");
+	response = json_object_get(event, "response");
+	result = 0;
+	if (type != NULL && strcmp(type, "response.output_item.done") == 0 &&
+	    collect_output_item(stream->items, item) == -1)
+		result = -1;
+	if (result == 0 && type != NULL &&
+	    strcmp(type, "response.completed") == 0 &&
+	    json_is_object(response)) {
+		output = json_object_get(response, "output");
+		if (json_array_size(stream->items) > 0 &&
+		    json_is_array(output) && json_array_size(output) == 0)
+			result = write_completed_response(stream, block, data,
+			    data_end, event);
+		else
+			result = write_response_block(stream, block);
+		if (result == 0)
+			stream->done = 1;
+	} else if (result == 0) {
+		result = write_response_block(stream, block);
+	}
+	json_decref(event);
+	return result;
+}
+
+/* Allocate one bounded incremental normalizer for a Responses client stream. */
+struct sse_response_stream *
+sse_response_stream_new(sse_write_callback callback, void *argument)
+{
+	struct sse_response_stream *stream;
+
+	stream = calloc(1, sizeof(*stream));
+	if (stream == NULL)
+		return NULL;
+	stream->items = json_array();
+	if (stream->items == NULL) {
+		free(stream);
+		return NULL;
+	}
+	buffer_init(&stream->pending);
+	stream->write = callback;
+	stream->argument = argument;
+	return stream;
+}
+
+/*
+** Feed arbitrary upstream bytes into the Responses normalizer.
+**
+** CR is discarded so the parser accepts both CRLF and LF.  A 1 MiB cap limits
+** memory retained for an unfinished event while complete blocks are forwarded
+** immediately, including their original event metadata and JSON formatting.
+*/
+int
+sse_response_stream_feed(struct sse_response_stream *stream, const void *data,
+    size_t length)
+{
+	const char *source;
+	char	   *separator;
+	size_t	    consumed;
+	size_t	    index;
+
+	source = data;
+	for (index = 0; index < length; index++) {
+		if (source[index] != '\r' &&
+		    buffer_append(&stream->pending, source + index, 1) == -1)
+			return -1;
+	}
+	if (stream->pending.len > MAX_EVENT_SIZE)
+		return -1;
+	while ((separator = strstr(stream->pending.data, "\n\n")) != NULL) {
+		*separator = '\0';
+		consumed = (size_t)(separator - stream->pending.data) + 2;
+		if (process_response_block(stream, stream->pending.data) == -1)
+			return -1;
+		memmove(stream->pending.data, stream->pending.data + consumed,
+		    stream->pending.len - consumed);
+		stream->pending.len -= consumed;
+		stream->pending.data[stream->pending.len] = '\0';
+	}
+	return 0;
+}
+
+/* Require a terminal completed response so truncation cannot look successful. */
+int
+sse_response_stream_finish(struct sse_response_stream *stream)
+{
+	if (stream->pending.len > 0 &&
+	    process_response_block(stream, stream->pending.data) == -1)
+		return -1;
+	stream->pending.len = 0;
+	if (stream->pending.data != NULL)
+		stream->pending.data[0] = '\0';
+	return stream->done ? 0 : -1;
+}
+
+/* Release the normalizer's pending bytes and collected output item copies. */
+void
+sse_response_stream_free(struct sse_response_stream *stream)
+{
+	if (stream == NULL)
+		return;
+	json_decref(stream->items);
+	buffer_free(&stream->pending);
+	free(stream);
 }
 
 /* Serialize value as one complete SSE data block and write it to the client. */
