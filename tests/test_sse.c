@@ -50,6 +50,13 @@ main(void)
 
 	stream =
 	    "data: {\"type\":\"response.created\",\"response\":{\"id\":"
+	    "\"resp_partial\",\"status\":\"in_progress\",\"output\":[]}}\n\n";
+	response = sse_collect_completed_response(stream, error, sizeof(error));
+	CHECK(response == NULL);
+	CHECK(strstr(error, "no completed response") != NULL);
+
+	stream =
+	    "data: {\"type\":\"response.created\",\"response\":{\"id\":"
 	    "\"resp_2\"}}\n\n"
 	    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
 	    "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":"
