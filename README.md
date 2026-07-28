@@ -45,6 +45,19 @@ curl -sS http://127.0.0.1:10531/v1/responses \
 Clients that require an API-key setting may use any non-empty placeholder; the
 proxy authenticates upstream with the saved OAuth session.
 
+For a detached process with no system service manager:
+
+```sh
+./src/oaioauthc serve --daemon
+./src/oaioauthc status
+./src/oaioauthc logs --follow
+./src/oaioauthc stop
+```
+
+The daemon stores its lock, status, control socket, and log below
+`$XDG_STATE_HOME/oaioauthc` (or `$HOME/.local/state/oaioauthc`). Use
+`--runtime-dir DIR` when an explicit private state directory is required.
+
 ## Documentation
 
 - `man oaioauthc` after installation provides the complete command reference.

@@ -20,6 +20,9 @@ OpenAI-compatible API
 .IR id ]
 .RB [ \-\-oauth-token-url
 .IR url ]
+.RB [ \-\-daemon ]
+.RB [ \-\-runtime-dir
+.IR directory ]
 .RB [ \-\-debug-json [ =compact | =pretty ]]
 .PP
 .B oaioauthc login
@@ -32,6 +35,19 @@ OpenAI-compatible API
 .RB [ \-\-open | \-\-no-open ]
 .RB [ \-\-login-timeout-ms
 .IR milliseconds ]
+.PP
+.B oaioauthc status
+.RB [ \-\-runtime-dir
+.IR directory ]
+.PP
+.B oaioauthc stop
+.RB [ \-\-runtime-dir
+.IR directory ]
+.PP
+.B oaioauthc logs
+.RB [ \-\-follow ]
+.RB [ \-\-runtime-dir
+.IR directory ]
 .PP
 .B oaioauthc
 .RB [ \-\-help | \-\-version ]
@@ -58,6 +74,19 @@ receives a terminating signal or encounters a fatal listener error.
 Perform an OAuth PKCE login using a callback listener on localhost port 1455.
 The callback wait is limited to five minutes by default.  Existing credentials
 are replaced only after confirmation from an interactive terminal.
+.TP
+.B status
+Query the live daemon control socket and print its JSON status.  A stale
+metadata file without a responding control socket is not considered running.
+.TP
+.B stop
+Request graceful daemon shutdown and return success only after its control
+socket disappears.
+.TP
+.B logs
+Copy the daemon log to standard output.  With
+.B \-\-follow
+continue reading appended data until the daemon stops.
 .SH SERVE OPTIONS
 .TP
 .BR \-p " " \fIport\fR ", " \-\-port " " \fIport\fR
@@ -91,6 +120,23 @@ Select compact diagnostic JSON explicitly.
 .TP
 .BI \-\-debug-json=pretty
 Select indented diagnostic JSON.
+.TP
+.B \-\-daemon
+Detach the
+.B serve
+command into a session independent of the invoking terminal.  Startup does
+not return until the listener has successfully bound.  Standard output and
+standard error are appended to the daemon log.
+.TP
+.BI \-\-runtime-dir " directory"
+Use the specified private runtime directory for daemon lock, metadata,
+control socket, and log files.  The default is
+.IR $XDG_STATE_HOME/oaioauthc ,
+then
+.IR $HOME/.local/state/oaioauthc ,
+then
+.IR ./.local/state/oaioauthc .
+The directory and regular runtime files are created with modes 0700 and 0600.
 .PP
 Diagnostic JSON redacts OAuth token fields, encrypted reasoning content, and
 image data URLs.  It does not redact prompts, conversation history, or tool
@@ -158,6 +204,25 @@ is set.
 .TP
 .I $HOME/.codex/auth.json
 Default credential file otherwise.
+.TP
+.I $XDG_STATE_HOME/oaioauthc/runtime.lock
+Stable advisory lock held by a detached daemon.  It remains after shutdown
+so its inode can safely be reused by a later start.
+.TP
+.I $XDG_STATE_HOME/oaioauthc/runtime.json
+Atomic informational metadata for the live daemon.  Status uses the control
+socket as the source of truth and removes this file during shutdown.
+.TP
+.I $XDG_STATE_HOME/oaioauthc/control.sock
+Private AF_UNIX control socket accepting the bounded
+.BR STATUS
+and
+.BR STOP
+commands.
+.TP
+.I $XDG_STATE_HOME/oaioauthc/server.log
+Append-only daemon standard-output and standard-error log.  It is retained
+after shutdown for inspection.
 .PP
 New credential files are written with mode 0600 through a synchronized
 temporary file and atomic installation.  Refresh operations use a sibling
@@ -184,6 +249,10 @@ no inbound authentication layer.
 Treat auth.json and its tokens as passwords.  Enable diagnostic JSON only when
 needed, and protect standard-error logs because prompts and conversation
 content remain visible.
+.PP
+The daemon control socket is protected by the private runtime directory and
+socket mode 0600.  It is a local administrative interface, not an HTTP
+endpoint and not a substitute for inbound API authentication.
 .SH EXIT STATUS
 Zero indicates successful option display, a completed login, or a login
 cancelled at the credential-overwrite prompt.  A non-zero status indicates
@@ -214,6 +283,15 @@ Send a Responses request:
 curl -sS http://127.0.0.1:10531/v1/responses \e
     -H 'Content-Type: application/json' \e
     -d '{"model":"MODEL_ID","input":"Say hello."}'
+.fi
+.PP
+Start a detached local daemon and inspect or stop it:
+.PP
+.nf
+oaioauthc serve --daemon
+oaioauthc status
+oaioauthc logs --follow
+oaioauthc stop
 .fi
 .SH SEE ALSO
 .BR curl (1)

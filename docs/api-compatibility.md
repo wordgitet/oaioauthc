@@ -14,6 +14,14 @@ refreshes them when necessary.
 Do not expose the listener to an untrusted network. SDKs that require an API
 key may use any non-empty placeholder value.
 
+## Detached lifecycle
+
+`oaioauthc serve --daemon` detaches without systemd or another service manager.
+The process owns a private runtime directory containing `runtime.lock`,
+`runtime.json`, `control.sock`, and `server.log`. `status`, `stop`, and
+`logs --follow` communicate through the local control socket; they do not
+treat stale metadata or a PID alone as proof that a daemon is alive.
+
 ## Supported routes
 
 | Method | Route | Behavior |
