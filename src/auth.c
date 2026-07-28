@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <jansson.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -28,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "auth.h"
 #include "http.h"
@@ -585,15 +587,16 @@ token_response(const char *text, struct auth_session *session, char *error,
 }
 
 /*
-** Refresh an existing session and persist the replacement credentials.
+** Refresh the currently locked session and persist replacement credentials.
 **
 ** The in-memory session is updated before auth_save.  A save failure therefore
 ** returns an error even though the caller holds a usable fresh token: later
 ** workers would otherwise reload the stale on-disk session.
 */
-int
-auth_refresh(const char *path, const char *client_id, const char *token_url,
-    struct auth_session *session, char *error, size_t length)
+static int
+auth_refresh_locked(const char *path, const char *client_id,
+    const char *token_url, struct auth_session *session, char *error,
+    size_t length)
 {
 	struct http_response response;
 	json_t		    *body;
@@ -630,6 +633,93 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 	if (result == 0)
 		result = auth_save(path, session, error, length);
 	return result;
+}
+
+/*
+** Acquire the stable sibling lock used to serialize auth.json refreshes.
+**
+** auth.json itself is atomically renamed, so locking that inode would not
+** coordinate a worker that opens the replacement.  The persistent .lock path
+** keeps every process on the same advisory lock across credential replacements.
+*/
+static int
+auth_refresh_lock(const char *path, char *error, size_t length)
+{
+	struct buffer lock_path;
+	struct flock  lock;
+	int	      fd;
+	int	      saved_errno;
+
+	buffer_init(&lock_path);
+	if (buffer_append_string(&lock_path, path) == -1 ||
+	    buffer_append_string(&lock_path, ".lock") == -1) {
+		buffer_free(&lock_path);
+		set_error(error, length,
+		    "could not allocate auth refresh lock path");
+		return (-1);
+	}
+	fd = open(lock_path.data, O_CREAT | O_RDWR, 0600);
+	if (fd == -1) {
+		saved_errno = errno;
+		buffer_free(&lock_path);
+		errno = saved_errno;
+		set_error(error, length, "could not open auth refresh lock: %s",
+		    strerror(errno));
+		return (-1);
+	}
+	buffer_free(&lock_path);
+	if (fchmod(fd, 0600) == -1) {
+		saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		set_error(error, length,
+		    "could not secure auth refresh lock: %s", strerror(errno));
+		return (-1);
+	}
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = F_WRLCK;
+	lock.l_whence = SEEK_SET;
+	while (fcntl(fd, F_SETLKW, &lock) == -1) {
+		if (errno == EINTR)
+			continue;
+		saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		set_error(error, length,
+		    "could not acquire auth refresh lock: %s", strerror(errno));
+		return (-1);
+	}
+	return (fd);
+}
+
+/*
+** Serialize refreshes, then reload auth.json before deciding whether to renew.
+**
+** A worker may wait while another process rotates and saves the refresh token.
+** Reloading under the sibling lock lets the waiter adopt that completed session
+** instead of exchanging and later saving credentials derived from stale state.
+*/
+int
+auth_refresh(const char *path, const char *client_id, const char *token_url,
+    struct auth_session *session, char *error, size_t length)
+{
+	struct auth_session current;
+	int		    lock_fd;
+	int		    result;
+
+	lock_fd = auth_refresh_lock(path, error, length);
+	if (lock_fd == -1)
+		return (-1);
+	result = auth_load(path, &current, error, length);
+	if (result == 0) {
+		auth_session_free(session);
+		*session = current;
+		if (auth_session_needs_refresh(session))
+			result = auth_refresh_locked(path, client_id, token_url,
+			    session, error, length);
+	}
+	close(lock_fd);
+	return (result);
 }
 
 /*
