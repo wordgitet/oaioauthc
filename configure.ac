@@ -4,6 +4,12 @@ AM_INIT_AUTOMAKE([foreign subdir-objects -Wall])
 AC_CONFIG_SRCDIR([src/main.c])
 AC_CONFIG_HEADERS([config.h])
 AC_PROG_CC
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([[
+#ifndef __APPLE__
+#error "not macOS"
+#endif
+]])], [AC_DEFINE([HAVE_MACOS_OPEN], [1],
+    [Define to 1 when the macOS open utility is available.])])
 AC_ARG_ENABLE([sanitizers],
     [AS_HELP_STRING([--enable-sanitizers],
         [build with AddressSanitizer and UndefinedBehaviorSanitizer])],

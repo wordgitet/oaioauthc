@@ -54,8 +54,10 @@ usage(FILE *stream)
 	    "  oaioauthc serve [-p PORT] [--host HOST] [--models IDS]\n"
 	    "                  [--codex-version VERSION] [--base-url URL]\n"
 	    "                  [--oauth-file PATH]\n"
+	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
 	    "  oaioauthc login [--oauth-file PATH] [--open|--no-open]\n"
+	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--login-timeout-ms MS]\n"
 	    "  oaioauthc --help\n"
 	    "  oaioauthc --version\n");
@@ -106,21 +108,34 @@ option_value(int *index, int argc, char **argv, const char *name)
 }
 
 /*
-** Ask the desktop opener to visit url without making login depend on it.
+** Ask the selected desktop opener to visit url without making login depend on it.
 **
 ** The child is intentionally not waited for: browsers often remain attached
 ** to the opener, and the loopback callback is the actual completion signal.
+** BROWSER is accepted only as a single executable name or path.  It is passed
+** directly to execlp rather than to a shell, so environment text cannot become
+** command syntax.
 */
 static int
 open_browser(const char *url)
 {
+	const char *browser;
 	pid_t pid;
 
+	browser = getenv("BROWSER");
+	if (browser == NULL || browser[0] == '\0' ||
+	    strpbrk(browser, " \t\r\n") != NULL) {
+#ifdef HAVE_MACOS_OPEN
+		browser = "open";
+#else
+		browser = "xdg-open";
+#endif
+	}
 	pid = fork();
 	if (pid == -1)
 		return -1;
 	if (pid == 0) {
-		execlp("xdg-open", "xdg-open", url, (char *)NULL);
+		execlp(browser, browser, url, (char *)NULL);
 		_exit(127);
 	}
 	return 0;
