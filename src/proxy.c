@@ -29,7 +29,9 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -51,6 +53,7 @@
 #define CODEX_REGISTRY_URL  "https://registry.npmjs.org/@openai/codex/latest"
 #define MAX_REQUEST_SIZE    ((size_t)8 * 1024 * 1024)
 #define MAX_HEADER_SIZE	    ((size_t)64 * 1024)
+#define MAX_CATALOG_UPDATE  ((size_t)64 * 1024 * 1024)
 #define CLIENT_TIMEOUT	    30
 #define MAX_WORKERS	    32
 #define MODEL_CATALOG_RETRY 30
@@ -82,6 +85,19 @@ struct model_catalog {
 	json_t *root;
 	char   *account_id;
 	time_t	expires;
+};
+
+/*
+** One asynchronous parent catalog refresh.
+**
+** The child performs blocking auth/model I/O and serializes the validated
+** catalog through fd.  The parent incrementally buffers that pipe while it
+** continues polling the listener, then installs the completed update.
+*/
+struct catalog_refresh {
+	struct buffer input;
+	pid_t	      pid;
+	int	      fd;
 };
 
 /*
@@ -706,6 +722,8 @@ upstream_url(const struct proxy_options *options, const char *suffix)
 	const char   *base;
 
 	base = options->base_url == NULL ? DEFAULT_BASE_URL : options->base_url;
+	if (base[0] == '\0')
+		return (NULL);
 	buffer_init(&buffer);
 	if (buffer_append_string(&buffer, base) == -1 ||
 	    (base[strlen(base) - 1] == '/'
@@ -882,6 +900,206 @@ load_model_catalog(const struct proxy_options *options,
 	catalog->root = root;
 	catalog->expires = time(NULL) + 300;
 	return 0;
+}
+
+/* Initialize the inactive asynchronous catalog-refresh state. */
+static void
+catalog_refresh_init(struct catalog_refresh *refresh)
+{
+	buffer_init(&refresh->input);
+	refresh->pid = -1;
+	refresh->fd = -1;
+}
+
+/*
+** Fetch and serialize one validated model catalog in a background child.
+**
+** The child never refreshes OAuth credentials or writes auth.json.  A request
+** worker owns that operation under the auth refresh lock; this worker retries
+** model discovery after the replacement credentials become visible.
+*/
+static void
+catalog_refresh_child(const struct proxy_options *options, int listen_fd,
+    int output_fd)
+{
+	struct auth_session  session;
+	struct model_catalog catalog;
+	json_t		    *update;
+	char		    *text;
+	char		     error[256];
+	const char	    *auth_file;
+	int		     result;
+
+	close(listen_fd);
+	memset(&session, 0, sizeof(session));
+	memset(&catalog, 0, sizeof(catalog));
+	update = NULL;
+	text = NULL;
+	auth_file = options->auth_file == NULL ? auth_default_file()
+					       : options->auth_file;
+	result = auth_file == NULL ||
+	    auth_load(auth_file, &session, error, sizeof(error)) == -1 ||
+	    auth_session_needs_refresh(&session) ||
+	    load_model_catalog(options, &session, &catalog, error,
+		sizeof(error)) == -1;
+	if (!result)
+		update = json_pack("{s:s,s:O}", "account_id",
+		    catalog.account_id, "catalog", catalog.root);
+	if (update != NULL)
+		text = json_dump_compact(update);
+	if (text != NULL)
+		(void)write_all(output_fd, text, strlen(text));
+	free(text);
+	json_decref(update);
+	model_catalog_free(&catalog);
+	auth_session_free(&session);
+	close(output_fd);
+	_exit(0);
+}
+
+/*
+** Start a due catalog refresh without blocking the listener parent.
+**
+** A short retry expiry prevents fork/pipe failures from spinning.  Existing
+** catalog data remains usable by workers while the replacement is in flight.
+*/
+static void
+catalog_refresh_start(const struct proxy_options *options,
+    struct model_catalog *catalog, struct catalog_refresh *refresh,
+    int listen_fd)
+{
+	int    descriptors[2];
+	pid_t  pid;
+	time_t now;
+
+	if (options->models != NULL || refresh->fd != -1 || refresh->pid > 0)
+		return;
+	now = time(NULL);
+	if (catalog->expires > now)
+		return;
+	catalog->expires = now + MODEL_CATALOG_RETRY;
+	if (pipe(descriptors) == -1)
+		return;
+	pid = fork();
+	if (pid == -1) {
+		close(descriptors[0]);
+		close(descriptors[1]);
+		return;
+	}
+	if (pid == 0) {
+		close(descriptors[0]);
+		catalog_refresh_child(options, listen_fd, descriptors[1]);
+	}
+	close(descriptors[1]);
+	refresh->pid = pid;
+	refresh->fd = descriptors[0];
+	buffer_free(&refresh->input);
+}
+
+/* Validate and install the complete catalog update received from the child. */
+static int
+catalog_refresh_install(struct catalog_refresh *refresh,
+    struct model_catalog		       *catalog)
+{
+	const char *account_id;
+	char	   *account_copy;
+	json_t	   *update;
+	json_t	   *root;
+
+	update = json_loadb(refresh->input.data, refresh->input.len, 0, NULL);
+	account_id = json_string_value(json_object_get(update, "account_id"));
+	root = json_object_get(update, "catalog");
+	if (account_id == NULL || !json_is_object(root)) {
+		json_decref(update);
+		return (-1);
+	}
+	account_copy = oaio_strdup(account_id);
+	if (account_copy == NULL) {
+		json_decref(update);
+		return (-1);
+	}
+	json_incref(root);
+	model_catalog_free(catalog);
+	catalog->root = root;
+	catalog->account_id = account_copy;
+	catalog->expires = time(NULL) + 300;
+	json_decref(update);
+	return (0);
+}
+
+/*
+** Consume one ready pipe fragment and finish the refresh at EOF.
+**
+** Reads are deliberately single-shot so a child that pauses while producing a
+** response cannot stall the parent between listener polls.
+*/
+static void
+catalog_refresh_read(struct catalog_refresh *refresh,
+    struct model_catalog		    *catalog)
+{
+	char	chunk[4096];
+	ssize_t count;
+
+	do {
+		count = read(refresh->fd, chunk, sizeof(chunk));
+	} while (count == -1 && errno == EINTR);
+	if (count > 0) {
+		if (refresh->input.len > MAX_CATALOG_UPDATE ||
+		    (size_t)count > MAX_CATALOG_UPDATE - refresh->input.len ||
+		    buffer_append(&refresh->input, chunk, (size_t)count) ==
+			-1) {
+			close(refresh->fd);
+			refresh->fd = -1;
+			buffer_free(&refresh->input);
+		}
+		return;
+	}
+	close(refresh->fd);
+	refresh->fd = -1;
+	if (count == 0 && refresh->input.len > 0 &&
+	    catalog_refresh_install(refresh, catalog) == 0) {
+		buffer_free(&refresh->input);
+		return;
+	}
+	buffer_free(&refresh->input);
+	catalog->expires = time(NULL) + MODEL_CATALOG_RETRY;
+}
+
+/* Return the poll timeout until the next parent catalog refresh is due. */
+static int
+catalog_refresh_timeout(const struct proxy_options *options,
+    const struct model_catalog *catalog, const struct catalog_refresh *refresh)
+{
+	time_t now;
+	time_t seconds;
+
+	if (options->models != NULL || refresh->fd != -1 || refresh->pid > 0)
+		return (-1);
+	now = time(NULL);
+	if (catalog->expires <= now)
+		return (0);
+	seconds = catalog->expires - now;
+	if (seconds > INT_MAX / 1000)
+		return (INT_MAX);
+	return ((int)seconds * 1000);
+}
+
+/* Stop and reap the owned refresh child during listener shutdown. */
+static void
+catalog_refresh_free(struct catalog_refresh *refresh)
+{
+	pid_t result;
+
+	if (refresh->fd != -1)
+		close(refresh->fd);
+	if (refresh->pid > 0) {
+		(void)kill(refresh->pid, SIGTERM);
+		do {
+			result = waitpid(refresh->pid, NULL, 0);
+		} while (result == -1 && errno == EINTR);
+	}
+	buffer_free(&refresh->input);
+	catalog_refresh_init(refresh);
 }
 
 /* Return the matching catalog model object as a borrowed JSON reference. */
@@ -1441,48 +1659,6 @@ dispatch(int fd, const struct proxy_options *options,
 }
 
 /*
-** Refresh the parent's catalog after a worker has been forked.
-**
-** A child cannot update the parent's memory.  Post-fork refresh keeps the
-** active request responsive while allowing later workers to inherit fresh
-** metadata.  Parent refresh never writes auth.json: token renewal remains in
-** the worker to avoid concurrent writers.
-*/
-static void
-refresh_parent_catalog(const struct proxy_options *options,
-    struct model_catalog			  *catalog)
-{
-	struct auth_session session;
-	char		    error[256];
-	const char	   *auth_file;
-	time_t		    now;
-
-	/*
-	 * fork gives each worker a private cache copy.  Refresh only in the parent
-	 * after a worker starts so later workers inherit it without delaying the
-	 * current client.  Workers alone refresh OAuth credentials to avoid two
-	 * processes writing auth.json at once.
-	 */
-	if (options->models != NULL)
-		return;
-	now = time(NULL);
-	if (catalog->expires > now)
-		return;
-	auth_file = options->auth_file == NULL ? auth_default_file()
-					       : options->auth_file;
-	if (auth_file == NULL ||
-	    auth_load(auth_file, &session, error, sizeof(error)) == -1) {
-		catalog->expires = now + MODEL_CATALOG_RETRY;
-		return;
-	}
-	if (auth_session_needs_refresh(&session) ||
-	    load_model_catalog(options, &session, catalog, error,
-		sizeof(error)) == -1)
-		catalog->expires = now + MODEL_CATALOG_RETRY;
-	auth_session_free(&session);
-}
-
-/*
 ** Bind the local listener and run the parent worker-management loop.
 **
 ** proxy_serve borrows options and returns only after a fatal setup or accept
@@ -1493,25 +1669,36 @@ refresh_parent_catalog(const struct proxy_options *options,
 int
 proxy_serve(const struct proxy_options *options, char *error, size_t length)
 {
-	struct addrinfo	     hints;
-	struct addrinfo	    *addresses;
-	struct addrinfo	    *address;
-	int		     listen_fd;
-	int		     client_fd;
-	int		     one;
-	pid_t		     pid;
-	size_t		     workers;
-	struct sigaction     action;
-	struct request	     request;
-	struct auth_session  session;
-	struct model_catalog catalog;
-	const char	    *host;
-	const char	    *port;
-	const char	    *auth_file;
-	char		    *codex_version;
-	struct proxy_options effective_options;
+	struct addrinfo	       hints;
+	struct addrinfo	      *addresses;
+	struct addrinfo	      *address;
+	int		       listen_fd;
+	int		       client_fd;
+	int		       one;
+	pid_t		       pid;
+	size_t		       workers;
+	struct sigaction       action;
+	struct request	       request;
+	struct auth_session    session;
+	struct model_catalog   catalog;
+	struct catalog_refresh refresh;
+	struct pollfd	       descriptors[2];
+	const char	      *host;
+	const char	      *port;
+	const char	      *auth_file;
+	char		      *codex_version;
+	struct proxy_options   effective_options;
+	nfds_t		       descriptor_count;
+	pid_t		       exited;
+	int		       poll_result;
+	int		       saved_errno;
+	int		       timeout;
 
 	/* The parent owns listener and cache; children own exactly one connection. */
+	if (options->base_url != NULL && options->base_url[0] == '\0') {
+		set_error(error, length, "--base-url must not be empty");
+		return (-1);
+	}
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
 	memset(&action, 0, sizeof(action));
@@ -1574,16 +1761,56 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		}
 	}
 	(void)announce_startup(host, port, &effective_options, &catalog);
+	catalog_refresh_init(&refresh);
 	workers = 0;
+	saved_errno = 0;
 	for (;;) {
-		while (waitpid(-1, NULL, WNOHANG) > 0) {
-			if (workers > 0)
+		while ((exited = waitpid(-1, NULL, WNOHANG)) > 0) {
+			if (exited == refresh.pid)
+				refresh.pid = -1;
+			else if (workers > 0)
 				workers--;
+		}
+		catalog_refresh_start(&effective_options, &catalog, &refresh,
+		    listen_fd);
+		descriptors[0].fd = listen_fd;
+		descriptors[0].events = POLLIN;
+		descriptors[0].revents = 0;
+		descriptor_count = 1;
+		if (refresh.fd != -1) {
+			descriptors[1].fd = refresh.fd;
+			descriptors[1].events = POLLIN;
+			descriptors[1].revents = 0;
+			descriptor_count++;
+		}
+		timeout = catalog_refresh_timeout(&effective_options, &catalog,
+		    &refresh);
+		poll_result = poll(descriptors, descriptor_count, timeout);
+		if (poll_result == -1) {
+			if (errno == EINTR)
+				continue;
+			saved_errno = errno;
+			break;
+		}
+		if (poll_result == 0)
+			continue;
+		if (descriptor_count > 1 &&
+		    (descriptors[1].revents &
+			(POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
+			catalog_refresh_read(&refresh, &catalog);
+		if ((descriptors[0].revents & POLLIN) == 0) {
+			if ((descriptors[0].revents &
+				(POLLERR | POLLHUP | POLLNVAL)) != 0) {
+				saved_errno = EIO;
+				break;
+			}
+			continue;
 		}
 		client_fd = accept(listen_fd, NULL, NULL);
 		if (client_fd == -1) {
 			if (errno == EINTR)
 				continue;
+			saved_errno = errno;
 			break;
 		}
 		set_client_timeout(client_fd);
@@ -1602,6 +1829,8 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		}
 		if (pid == 0) {
 			close(listen_fd);
+			if (refresh.fd != -1)
+				close(refresh.fd);
 			if (read_request(client_fd, &request) == -1)
 				(void)send_error(client_fd, 400,
 				    "Malformed HTTP request.",
@@ -1617,11 +1846,12 @@ proxy_serve(const struct proxy_options *options, char *error, size_t length)
 		}
 		workers++;
 		close(client_fd);
-		refresh_parent_catalog(&effective_options, &catalog);
 	}
 	close(listen_fd);
+	catalog_refresh_free(&refresh);
 	model_catalog_free(&catalog);
 	free(codex_version);
-	set_error(error, length, "server accept failed: %s", strerror(errno));
+	set_error(error, length, "server accept failed: %s",
+	    strerror(saved_errno));
 	return -1;
 }
