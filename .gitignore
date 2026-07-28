@@ -27,6 +27,8 @@
 /tests/test_auth
 /tests/test_images
 /tests/test_json
+/tests/test_login
+/tests/test_local
 /tests/test_proxy
 /tests/test_sse
 /tests/*.log
