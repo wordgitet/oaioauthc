@@ -86,7 +86,7 @@ append_header_value(struct curl_slist **headers, const char *name,
 	if (result == 0)
 		result = append_header(headers, header.data);
 	buffer_free(&header);
-	return result;
+	return (result);
 }
 
 /*
@@ -199,6 +199,7 @@ request(const char *url, const char *method, const char *body,
 	struct curl_slist    *headers;
 	struct buffer	      response_body;
 	struct write_context  context;
+	int		      result;
 
 	/*
 	 * response is reset before work begins.  On success its body is owned by
@@ -213,6 +214,7 @@ request(const char *url, const char *method, const char *body,
 	cancel_context.callback = cancel;
 	cancel_context.argument = cancel_argument;
 	headers = NULL;
+	result = -1;
 	curl = curl_easy_init();
 	if (curl == NULL) {
 		set_error(error, error_length, "could not initialize libcurl");
@@ -233,9 +235,7 @@ request(const char *url, const char *method, const char *body,
 		append_header(&headers, extra_header) == -1)) {
 		set_error(error, error_length,
 		    "could not allocate HTTP headers");
-		curl_slist_free_all(headers);
-		curl_easy_cleanup(curl);
-		return -1;
+		goto cleanup;
 	}
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -264,25 +264,25 @@ request(const char *url, const char *method, const char *body,
 	if (code != CURLE_OK) {
 		set_error(error, error_length, "upstream request failed: %s",
 		    curl_easy_strerror(code));
-		curl_slist_free_all(headers);
-		curl_easy_cleanup(curl);
-		buffer_free(&response_body);
-		http_response_free(response);
-		return -1;
+		goto cleanup;
 	}
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response->status);
 	response->body = buffer_steal(&response_body);
 	if (response->body == NULL) {
 		set_error(error, error_length,
 		    "could not allocate upstream response");
-		curl_slist_free_all(headers);
-		curl_easy_cleanup(curl);
-		http_response_free(response);
-		return -1;
+		goto cleanup;
 	}
+	result = 0;
+
+cleanup:
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
-	return 0;
+	if (result != 0) {
+		buffer_free(&response_body);
+		http_response_free(response);
+	}
+	return result;
 }
 
 /* POST JSON with optional Codex auth/account/feature headers. */
