@@ -1,0 +1,219 @@
+.TH OAIOAUTHC 1 "July 2026" "oaioauthc 0.1.0" "User Commands"
+.SH NAME
+oaioauthc \- expose a ChatGPT OAuth session through a local
+OpenAI-compatible API
+.SH SYNOPSIS
+.B oaioauthc serve
+.RB [ \-p
+.IR port ]
+.RB [ \-\-host
+.IR host ]
+.RB [ \-\-models
+.IR ids ]
+.RB [ \-\-codex-version
+.IR version ]
+.RB [ \-\-base-url
+.IR url ]
+.RB [ \-\-oauth-file
+.IR path ]
+.RB [ \-\-oauth-client-id
+.IR id ]
+.RB [ \-\-oauth-token-url
+.IR url ]
+.RB [ \-\-debug-json [ =compact | =pretty ]]
+.PP
+.B oaioauthc login
+.RB [ \-\-oauth-file
+.IR path ]
+.RB [ \-\-oauth-client-id
+.IR id ]
+.RB [ \-\-oauth-token-url
+.IR url ]
+.RB [ \-\-open | \-\-no-open ]
+.RB [ \-\-login-timeout-ms
+.IR milliseconds ]
+.PP
+.B oaioauthc
+.RB [ \-\-help | \-\-version ]
+.SH DESCRIPTION
+.B oaioauthc
+uses a ChatGPT OAuth session to serve a local subset of the OpenAI HTTP API.
+It supports model discovery, Responses, Chat Completions, image generation,
+and image editing.
+.PP
+The proxy is stateless: it does not store response objects or conversation
+history.  Clients must send the complete conversation with each request.
+.PP
+With no command, or when the first argument is an option,
+.B serve
+is selected.
+.SH COMMANDS
+.TP
+.B serve
+Listen for local OpenAI-compatible HTTP requests.  The default address is
+127.0.0.1 and the default port is 10531.  The process continues until it
+receives a terminating signal or encounters a fatal listener error.
+.TP
+.B login
+Perform an OAuth PKCE login using a callback listener on localhost port 1455.
+The callback wait is limited to five minutes by default.  Existing credentials
+are replaced only after confirmation from an interactive terminal.
+.SH SERVE OPTIONS
+.TP
+.BR \-p " " \fIport\fR ", " \-\-port " " \fIport\fR
+Listen on the specified decimal TCP port.  Valid values are 1 through 65535.
+The default is 10531.
+.TP
+.BI \-\-host " host"
+Bind to the specified host or address.  The default is 127.0.0.1.
+Values other than 127.0.0.1, localhost, and ::1 cause an exposure warning.
+The proxy does not authenticate incoming clients.
+.TP
+.BI \-\-models " ids"
+Expose the exact comma-separated model IDs instead of discovering the account
+catalog.  Empty entries are ignored.  Requests still must select a non-empty
+model explicitly.
+.TP
+.BI \-\-codex-version " version"
+Use the specified Codex client version for upstream requests instead of
+discovering the current version from the Codex package registry.
+.TP
+.BI \-\-base-url " url"
+Use the specified Codex upstream root URL.  Endpoint suffixes such as
+responses and models are appended to this value.  The value must not be empty.
+.TP
+.BI \-\-debug-json
+Write parsed client JSON and normalized upstream JSON to standard error in
+compact form.
+.TP
+.BI \-\-debug-json=compact
+Select compact diagnostic JSON explicitly.
+.TP
+.BI \-\-debug-json=pretty
+Select indented diagnostic JSON.
+.PP
+Diagnostic JSON redacts OAuth token fields, encrypted reasoning content, and
+image data URLs.  It does not redact prompts, conversation history, or tool
+definitions.
+.SH LOGIN OPTIONS
+.TP
+.B \-\-open
+Request the system desktop opener after printing the authorization URL.
+This is the default.  Browser launch failure does not fail the login command.
+.TP
+.B \-\-no-open
+Do not start a browser.  The authorization URL is still printed to standard
+error.
+.TP
+.BI \-\-login-timeout-ms " milliseconds"
+Set the callback and callback-request timeout in milliseconds.  The value must
+be a positive decimal integer no greater than the largest signed integer
+supported by the build.  The default is 300000.
+.SH COMMON OAUTH OPTIONS
+.TP
+.BI \-\-oauth-file " path"
+Read or write credentials at the specified path instead of the default
+auth.json path.
+.TP
+.BI \-\-oauth-client-id " id"
+Override the OAuth client ID used for login and token refresh.  This advanced
+option is accepted by both
+.B login
+and
+.BR serve .
+.TP
+.BI \-\-oauth-token-url " url"
+Override the endpoint that receives authorization codes and refresh tokens.
+This advanced option is accepted by both commands.  Credentials are sent to
+the specified URL; use only a trusted HTTPS endpoint.
+.SH ENVIRONMENT
+.TP
+.B CODEX_HOME
+When non-empty, the default credential path is
+.IR $CODEX_HOME/auth.json .
+.TP
+.B HOME
+When
+.B CODEX_HOME
+is unset or empty, the default credential path is
+.IR $HOME/.codex/auth.json .
+If both variables are unavailable, the fallback is
+.IR ./.codex/auth.json .
+.TP
+.B BROWSER
+With
+.BR \-\-open ,
+use this value as the browser executable when it is non-empty and contains no
+whitespace.  The value is executed directly, without a shell.  The default is
+.B open
+on macOS and
+.B xdg-open
+on other systems.
+.SH FILES
+.TP
+.I $CODEX_HOME/auth.json
+Preferred default credential file when
+.B CODEX_HOME
+is set.
+.TP
+.I $HOME/.codex/auth.json
+Default credential file otherwise.
+.PP
+New credential files are written with mode 0600 through a synchronized
+temporary file and atomic installation.  Refresh operations use a sibling
+.I .lock
+file to serialize credential rotation.
+.SH HTTP INTERFACE
+The default API root is
+.IR http://127.0.0.1:10531/v1 .
+The supported routes and request limitations are documented in
+.IR docs/api-compatibility.md
+in the source distribution.
+.PP
+The health endpoint is available at
+.I /health
+and does not load OAuth credentials.  Every
+.I /v1
+route requires a usable saved OAuth session.  Incoming Authorization headers
+are not used for local client authentication.
+.SH SECURITY
+Keep the listener on a loopback address.  Binding to a network-visible address
+allows other hosts to use the saved ChatGPT OAuth session because the proxy has
+no inbound authentication layer.
+.PP
+Treat auth.json and its tokens as passwords.  Enable diagnostic JSON only when
+needed, and protect standard-error logs because prompts and conversation
+content remain visible.
+.SH EXIT STATUS
+Zero indicates successful option display, a completed login, or a login
+cancelled at the credential-overwrite prompt.  A non-zero status indicates
+invalid command-line input, login failure, or fatal server setup or listener
+failure.  Signal termination status is determined by the invoking shell.
+.SH EXAMPLES
+Log in without starting a browser:
+.PP
+.nf
+oaioauthc login --no-open
+.fi
+.PP
+Serve on the default loopback address:
+.PP
+.nf
+oaioauthc serve
+.fi
+.PP
+Discover available model IDs:
+.PP
+.nf
+curl -sS http://127.0.0.1:10531/v1/models
+.fi
+.PP
+Send a Responses request:
+.PP
+.nf
+curl -sS http://127.0.0.1:10531/v1/responses \e
+    -H 'Content-Type: application/json' \e
+    -d '{"model":"MODEL_ID","input":"Say hello."}'
+.fi
+.SH SEE ALSO
+.BR curl (1)
