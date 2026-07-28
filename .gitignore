@@ -21,6 +21,7 @@
 **/Makefile.in
 
 # Build and test output
+.codex-security/
 **/.deps/
 **/*.o
 /src/oaioauthc
