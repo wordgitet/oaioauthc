@@ -580,6 +580,7 @@ sse_collect_completed_response(const char *stream, char *error, size_t length)
 		json_t	    *event;
 		json_t	    *item;
 		json_t	    *response;
+		const char  *type;
 
 		next = strstr(cursor, "\n\n");
 		if (next != NULL)
@@ -604,7 +605,9 @@ sse_collect_completed_response(const char *stream, char *error, size_t length)
 			return NULL;
 		}
 		response = json_object_get(event, "response");
-		if (json_is_object(response)) {
+		type = json_string_value(json_object_get(event, "type"));
+		if (type != NULL && strcmp(type, "response.completed") == 0 &&
+		    json_is_object(response)) {
 			json_decref(latest);
 			latest = json_deep_copy(response);
 		}
