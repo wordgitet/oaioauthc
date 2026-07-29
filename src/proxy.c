@@ -1716,6 +1716,18 @@ proxy_serve(const struct proxy_options *options,
 		set_error(error, length, "--base-url must not be empty");
 		return (-1);
 	}
+	if (options->base_url != NULL &&
+	    !url_is_secure_or_loopback(options->base_url)) {
+		set_error(error, length,
+		    "--base-url must use HTTPS, or HTTP only for localhost");
+		return (-1);
+	}
+	if (options->token_url != NULL &&
+	    !url_is_secure_or_loopback(options->token_url)) {
+		set_error(error, length,
+		    "--oauth-token-url must use HTTPS, or HTTP only for localhost");
+		return (-1);
+	}
 	host = options->host == NULL ? "127.0.0.1" : options->host;
 	port = options->port == NULL ? "10531" : options->port;
 	proxy_stop_requested = 0;

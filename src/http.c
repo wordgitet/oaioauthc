@@ -248,6 +248,14 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "oaioauthc/0.2.1");
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	code = curl_easy_setopt(curl, CURLOPT_SSLVERSION,
+	    CURL_SSLVERSION_TLSv1_2);
+	if (code != CURLE_OK) {
+		set_error(error, error_length,
+		    "could not require TLS 1.2 for upstream requests: %s",
+		    curl_easy_strerror(code));
+		goto cleanup;
+	}
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);

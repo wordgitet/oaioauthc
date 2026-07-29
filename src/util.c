@@ -25,6 +25,85 @@
 
 #include "util.h"
 
+/* Return non-zero when authority is one literal loopback host with a port. */
+static int
+loopback_authority(const char *authority, size_t length)
+{
+	const char    *port;
+	size_t	      host_length;
+	unsigned long number;
+	unsigned long digit;
+
+	host_length = 0;
+	if ((length == 9 || (length > 9 && authority[9] == ':')) &&
+	    memcmp(authority, "localhost", 9) == 0)
+		host_length = 9;
+	else if ((length == 9 || (length > 9 && authority[9] == ':')) &&
+	    memcmp(authority, "127.0.0.1", 9) == 0)
+		host_length = 9;
+	else if ((length == 5 || (length > 5 && authority[5] == ':')) &&
+	    memcmp(authority, "[::1]", 5) == 0)
+		host_length = 5;
+	if (host_length == 0)
+		return (0);
+	if (length == host_length)
+		return (1);
+	port = authority + host_length + 1;
+	if (port == authority + length)
+		return (0);
+	number = 0;
+	while (port < authority + length) {
+		if (*port < '0' || *port > '9')
+			return (0);
+		digit = (unsigned long)(*port - '0');
+		if (number > (65535UL - digit) / 10)
+			return (0);
+		number = number * 10 + digit;
+		port++;
+	}
+	return (number > 0);
+}
+
+/*
+** Accept an HTTPS URL or a deliberately local HTTP endpoint.
+**
+** OAuth credentials may be posted to these URLs.  The parser is intentionally
+** conservative: userinfo, control characters, and non-loopback HTTP hosts
+** are rejected before libcurl can make a connection.
+*/
+int
+url_is_secure_or_loopback(const char *url)
+{
+	const unsigned char *cursor;
+	const char	    *authority;
+	const char	    *authority_end;
+	size_t		     authority_length;
+	int		     secure;
+
+	if (url == NULL || url[0] == '\0')
+		return (0);
+	for (cursor = (const unsigned char *)url; *cursor != '\0'; cursor++) {
+		if (*cursor <= 0x20 || *cursor == 0x7f || *cursor == '\\')
+			return (0);
+	}
+	if (strncmp(url, "https://", 8) == 0) {
+		authority = url + 8;
+		secure = 1;
+	} else if (strncmp(url, "http://", 7) == 0) {
+		authority = url + 7;
+		secure = 0;
+	} else
+		return (0);
+	authority_end = strpbrk(authority, "/?#");
+	if (authority_end == NULL)
+		authority_end = authority + strlen(authority);
+	authority_length = (size_t)(authority_end - authority);
+	if (authority_length == 0 ||
+	    memchr(authority, '@', authority_length) != NULL)
+		return (0);
+	return (secure || loopback_authority(authority, authority_length));
+}
+
 /*
 ** Initialize buffer for first use.  No allocation occurs here, and the result
 ** may be passed to buffer_free or buffer_steal even if no bytes are appended.

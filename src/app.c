@@ -99,50 +99,8 @@ parse_positive_number(const char *value, unsigned long maximum,
 static int
 oauth_issuer_is_safe(const char *issuer)
 {
-	const unsigned char *cursor;
-	const char	    *authority;
-	const char	    *authority_end;
-	size_t		     authority_length;
-	int		     secure;
-
-	if (issuer == NULL || issuer[0] == '\0')
-		return 0;
-	for (cursor = (const unsigned char *)issuer; *cursor != '\0';
-	    cursor++) {
-		if (*cursor <= 0x20 || *cursor == 0x7f || *cursor == '\\' ||
-		    *cursor == '?' || *cursor == '#')
-			return 0;
-	}
-	if (strncmp(issuer, "https://", 8) == 0) {
-		authority = issuer + 8;
-		secure = 1;
-	} else if (strncmp(issuer, "http://", 7) == 0) {
-		authority = issuer + 7;
-		secure = 0;
-	} else
-		return 0;
-	authority_end = strchr(authority, '/');
-	if (authority_end == NULL)
-		authority_end = authority + strlen(authority);
-	authority_length = (size_t)(authority_end - authority);
-	if (authority_length == 0 ||
-	    memchr(authority, '@', authority_length) != NULL)
-		return 0;
-	if (secure)
-		return 1;
-	if ((authority_length == 9 ||
-		(authority_length > 9 && authority[9] == ':')) &&
-	    memcmp(authority, "localhost", 9) == 0)
-		return 1;
-	if ((authority_length == 9 ||
-		(authority_length > 9 && authority[9] == ':')) &&
-	    memcmp(authority, "127.0.0.1", 9) == 0)
-		return 1;
-	if ((authority_length == 5 ||
-		(authority_length > 5 && authority[5] == ':')) &&
-	    memcmp(authority, "[::1]", 5) == 0)
-		return 1;
-	return 0;
+	return (url_is_secure_or_loopback(issuer) &&
+	    strpbrk(issuer, "?#") == NULL);
 }
 
 /*
@@ -1065,6 +1023,12 @@ main(int argc, char **argv)
 	if (strcmp(command, "login") == 0) {
 		if (daemon_mode || follow_logs || runtime_directory != NULL) {
 			usage(stderr);
+			return 1;
+		}
+		if (options.token_url != NULL &&
+		    !url_is_secure_or_loopback(options.token_url)) {
+			(void)fprintf(stderr,
+			    "invalid OAuth token URL (use HTTPS, or HTTP only for localhost)\n");
 			return 1;
 		}
 		if (!oauth_issuer_is_safe(oauth_issuer)) {

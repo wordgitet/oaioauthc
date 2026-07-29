@@ -58,5 +58,8 @@ make_parent_directories(const char *);
 /* Return HOME or a current-directory fallback when HOME is unavailable. */
 const char *
 oaio_home_dir(void);
+/* Accept HTTPS endpoints or HTTP endpoints confined to the local machine. */
+int
+url_is_secure_or_loopback(const char *);
 
 #endif

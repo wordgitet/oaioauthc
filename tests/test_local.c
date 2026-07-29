@@ -246,6 +246,24 @@ test_empty_base_url(void)
 	    strstr(output, "--base-url must not be empty") == NULL ? -1 : 0);
 }
 
+/* Reject plaintext remote credential endpoints before listener startup. */
+static int
+test_unsafe_endpoints(void)
+{
+	if (url_is_secure_or_loopback("https://example.com/api") == 0 ||
+	    url_is_secure_or_loopback("http://localhost:8080/api") == 0 ||
+	    url_is_secure_or_loopback("http://127.0.0.1:8080/api") == 0 ||
+	    url_is_secure_or_loopback("http://[::1]:8080/api") == 0)
+		return (-1);
+	if (url_is_secure_or_loopback("http://example.com/api") ||
+	    url_is_secure_or_loopback("http://localhost.evil/api") ||
+	    url_is_secure_or_loopback("http://localhost:/api") ||
+	    url_is_secure_or_loopback("https://user@example.com/api") ||
+	    url_is_secure_or_loopback("https://example.com/\napi"))
+		return (-1);
+	return (0);
+}
+
 /* Confirm a slow parent catalog retry does not delay a second health request. */
 static int
 test_async_catalog_refresh(void)
@@ -359,6 +377,7 @@ main(void)
 {
 	(void)signal(SIGPIPE, SIG_IGN);
 	CHECK(test_empty_base_url() == 0);
+	CHECK(test_unsafe_endpoints() == 0);
 	CHECK(test_async_catalog_refresh() == 0);
 	return (0);
 }
