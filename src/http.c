@@ -133,6 +133,8 @@ header_callback(char *data, size_t size, size_t count, void *argument)
 	size_t		      length;
 
 	response = argument;
+	if (count != 0 && size > (size_t)-1 / count)
+		return 0;
 	length = size * count;
 	if (length > 5 && strncasecmp(data, "HTTP/", 5) == 0) {
 		char *space;
