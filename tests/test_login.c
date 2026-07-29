@@ -30,6 +30,14 @@
 #define CALLBACK_PORT 1455
 #define OUTPUT_SIZE   8192
 
+enum device_server_mode {
+	DEVICE_SERVER_SUCCESS,
+	DEVICE_SERVER_CONTROL_CODE,
+	DEVICE_SERVER_EMBEDDED_NUL,
+	DEVICE_SERVER_INCOMPLETE_TOKENS,
+	DEVICE_SERVER_HANG
+};
+
 #define REQUIRE(condition)                                                     \
 	do {                                                                   \
 		if (!(condition)) {                                            \
@@ -182,6 +190,284 @@ start_login(const char *timeout, const char *auth_path, const char *token_url,
 	return output_pipe[0];
 }
 
+/* Read one bounded HTTP request and return its request-target path. */
+static int
+read_http_request(int fd, char *request, size_t length, char *path,
+    size_t path_length)
+{
+	char   *headers;
+	char   *value;
+	char	target[256];
+	size_t	content_length;
+	size_t	header_length;
+	size_t	used;
+	ssize_t count;
+
+	used = 0;
+	headers = NULL;
+	while (used + 1 < length) {
+		count = read(fd, request + used, length - used - 1);
+		if (count == -1 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			return -1;
+		used += (size_t)count;
+		request[used] = '\0';
+		headers = strstr(request, "\r\n\r\n");
+		if (headers != NULL)
+			break;
+	}
+	if (headers == NULL)
+		return -1;
+	header_length = (size_t)(headers - request) + 4;
+	content_length = 0;
+	value = strstr(request, "\r\nContent-Length:");
+	if (value != NULL &&
+	    sscanf(value + 2, "Content-Length: %zu", &content_length) != 1)
+		return -1;
+	if (content_length > length - header_length - 1)
+		return -1;
+	while (used < header_length + content_length) {
+		count = read(fd, request + used, length - used - 1);
+		if (count == -1 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			return -1;
+		used += (size_t)count;
+	}
+	request[used] = '\0';
+	if (sscanf(request, "%*s %255s", target) != 1 ||
+	    strlen(target) >= path_length)
+		return -1;
+	(void)strcpy(path, target);
+	return 0;
+}
+
+/* Send one deterministic JSON response from the device-flow mock. */
+static int
+send_device_response_bytes(int fd, int status, const void *body,
+    size_t body_length)
+{
+	char header[256];
+	int  header_length;
+
+	header_length = snprintf(header, sizeof(header),
+	    "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+	    "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+	    status, status == 200 ? "OK" : "Pending", body_length);
+	if (header_length < 0 || (size_t)header_length >= sizeof(header) ||
+	    write_all(fd, header, (size_t)header_length) == -1)
+		return -1;
+	return write_all(fd, body, body_length);
+}
+
+/* Send one NUL-free deterministic JSON response from the device-flow mock. */
+static int
+send_device_response(int fd, int status, const char *body)
+{
+	return send_device_response_bytes(fd, status, body, strlen(body));
+}
+
+/* Serve the exact four-request device authorization protocol sequence. */
+static void
+run_device_server(int listen_fd, enum device_server_mode mode)
+{
+	static const char control_code[] =
+	    "{\"device_auth_id\":\"device-id\","
+	    "\"user_code\":\"ABCD-\\u001bEFGH\",\"interval\":\"0\"}";
+	static const char embedded_nul[] =
+	    "{\"device_auth_id\":\"device-id\","
+	    "\"user_code\":\"ABCD-EFGH\",\"interval\":\"0\"}\0{}";
+	static const char usercode[] =
+	    "{\"device_auth_id\":\"device-id\","
+	    "\"user_code\":\"ABCD-EFGH\",\"interval\":\" 0 \"}";
+	static const char pending[] = "{}";
+	static const char approved[] =
+	    "{\"authorization_code\":\"auth-code\","
+	    "\"code_challenge\":"
+	    "\"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\","
+	    "\"code_verifier\":"
+	    "\"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\"}";
+	static const char tokens[] = "{\"access_token\":\"device-access\","
+				     "\"refresh_token\":\"device-refresh\","
+				     "\"id_token\":\"device-id-token\","
+				     "\"account_id\":\"device-account\"}";
+	static const char incomplete_tokens[] =
+	    "{\"access_token\":\"device-access\","
+	    "\"account_id\":\"device-account\"}";
+	char request[8192];
+	char path[256];
+	int  client_fd;
+	int  index;
+	int  status;
+
+	if (mode != DEVICE_SERVER_SUCCESS &&
+	    mode != DEVICE_SERVER_INCOMPLETE_TOKENS) {
+		client_fd = accept(listen_fd, NULL, NULL);
+		if (client_fd == -1 ||
+		    read_http_request(client_fd, request, sizeof(request), path,
+			sizeof(path)) == -1)
+			_exit(4);
+		if (mode == DEVICE_SERVER_HANG) {
+			delay_ms(5000);
+			status = 0;
+		} else if (mode == DEVICE_SERVER_CONTROL_CODE)
+			status =
+			    send_device_response(client_fd, 200, control_code);
+		else
+			status = send_device_response_bytes(client_fd, 200,
+			    embedded_nul, sizeof(embedded_nul) - 1);
+		close(client_fd);
+		close(listen_fd);
+		_exit(status == 0 ? 0 : 5);
+	}
+	for (index = 0; index < 4; index++) {
+		client_fd = accept(listen_fd, NULL, NULL);
+		if (client_fd == -1)
+			_exit(1);
+		if (read_http_request(client_fd, request, sizeof(request), path,
+			sizeof(path)) == -1)
+			_exit(2);
+		status = 200;
+		if (index == 0 &&
+		    strcmp(path, "/api/accounts/deviceauth/usercode") == 0 &&
+		    strstr(request, "\"client_id\":\"client&id+value\"") !=
+			NULL)
+			status = send_device_response(client_fd, 200, usercode);
+		else if ((index == 1 || index == 2) &&
+		    strcmp(path, "/api/accounts/deviceauth/token") == 0)
+			status = send_device_response(client_fd,
+			    index == 1 ? 404 : 200,
+			    index == 1 ? pending : approved);
+		else if (index == 3 && strcmp(path, "/oauth/token") == 0 &&
+		    strstr(request, "client_id=client%26id%2Bvalue") != NULL)
+			status = send_device_response(client_fd, 200,
+			    mode == DEVICE_SERVER_INCOMPLETE_TOKENS
+				? incomplete_tokens
+				: tokens);
+		else
+			status = -1;
+		close(client_fd);
+		if (status == -1)
+			_exit(3);
+	}
+	close(listen_fd);
+	_exit(0);
+}
+
+/* Bind one issuer mock and expose both its root and token endpoint URLs. */
+static int
+open_device_listener(char *issuer, size_t issuer_length, char *token_url,
+    size_t token_length)
+{
+	struct sockaddr_in address;
+	socklen_t	   address_length;
+	int		   fd;
+	int		   result;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd == -1)
+		return -1;
+	memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	address.sin_port = 0;
+	if (bind(fd, (struct sockaddr *)&address, sizeof(address)) == -1 ||
+	    listen(fd, 4) == -1) {
+		close(fd);
+		return -1;
+	}
+	address_length = sizeof(address);
+	if (getsockname(fd, (struct sockaddr *)&address, &address_length) ==
+	    -1) {
+		close(fd);
+		return -1;
+	}
+	result = snprintf(issuer, issuer_length, "http://127.0.0.1:%u",
+	    (unsigned int)ntohs(address.sin_port));
+	if (result < 0 || (size_t)result >= issuer_length) {
+		close(fd);
+		return -1;
+	}
+	result = snprintf(token_url, token_length, "%s/oauth/token", issuer);
+	if (result < 0 || (size_t)result >= token_length) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* Start the device mock in a child before launching the login process. */
+static int
+start_device_server(pid_t *child, char *issuer, size_t issuer_length,
+    char *token_url, size_t token_length, enum device_server_mode mode)
+{
+	int listen_fd;
+
+	listen_fd = open_device_listener(issuer, issuer_length, token_url,
+	    token_length);
+	if (listen_fd == -1)
+		return -1;
+	*child = fork();
+	if (*child == -1) {
+		close(listen_fd);
+		return -1;
+	}
+	if (*child == 0)
+		run_device_server(listen_fd, mode);
+	close(listen_fd);
+	return 0;
+}
+
+/* Start --device-auth with captured diagnostics and an explicit local
+** issuer. */
+static int
+start_device_login(const char *timeout, const char *auth_path,
+    const char *issuer, const char *token_url, const char *client_id,
+    pid_t *child)
+{
+	int output_pipe[2];
+
+	if (pipe(output_pipe) == -1)
+		return -1;
+	*child = fork();
+	if (*child == -1) {
+		close(output_pipe[0]);
+		close(output_pipe[1]);
+		return -1;
+	}
+	if (*child == 0) {
+		close(output_pipe[0]);
+		if (dup2(output_pipe[1], STDERR_FILENO) == -1)
+			_exit(126);
+		close(output_pipe[1]);
+		if (token_url != NULL && client_id != NULL)
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
+			    "--device-auth", "--login-timeout-ms", timeout,
+			    "--oauth-file", auth_path, "--oauth-issuer", issuer,
+			    "--oauth-token-url", token_url, "--oauth-client-id",
+			    client_id, (char *)NULL);
+		else if (token_url != NULL)
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
+			    "--device-auth", "--login-timeout-ms", timeout,
+			    "--oauth-file", auth_path, "--oauth-issuer", issuer,
+			    "--oauth-token-url", token_url, (char *)NULL);
+		else if (client_id != NULL)
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
+			    "--device-auth", "--login-timeout-ms", timeout,
+			    "--oauth-file", auth_path, "--oauth-issuer", issuer,
+			    "--oauth-client-id", client_id, (char *)NULL);
+		else
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
+			    "--device-auth", "--login-timeout-ms", timeout,
+			    "--oauth-file", auth_path, "--oauth-issuer", issuer,
+			    (char *)NULL);
+		_exit(127);
+	}
+	close(output_pipe[1]);
+	return output_pipe[0];
+}
+
 /* Extract the generated OAuth state from one captured authorization URL. */
 static int
 extract_state(const char *output, char *state, size_t length)
@@ -300,7 +586,8 @@ static void
 run_token_server(int listen_fd, int ready_fd, int hold)
 {
 	static const char body[] =
-	    "{\"access_token\":\"new-access\",\"account_id\":\"new-account\"}";
+	    "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\","
+	    "\"id_token\":\"new-id\",\"account_id\":\"new-account\"}";
 	char	request[2048];
 	char	response[512];
 	int	client_fd;
@@ -652,6 +939,235 @@ cleanup:
 	return result;
 }
 
+/* Reject custom issuers that would send OAuth credentials over the network. */
+static int
+test_unsafe_issuer(void)
+{
+	char   auth_path[128];
+	char   output[OUTPUT_SIZE];
+	int    output_fd;
+	int    result;
+	int    status;
+	pid_t  child;
+	size_t used;
+
+	child = -1;
+	output_fd = -1;
+	result = 1;
+	used = 0;
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-issuer-%ld.json", (long)getpid());
+	(void)unlink(auth_path);
+	output_fd = start_device_login("500", auth_path, "http://example.com",
+	    NULL, NULL, &child);
+	REQUIRE(output_fd != -1);
+	REQUIRE(wait_child(child, &status, 2000) == 1);
+	child = -1;
+	REQUIRE(drain_output(output_fd, output, sizeof(output), &used) == 0);
+	close(output_fd);
+	output_fd = -1;
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+	REQUIRE(strstr(output, "invalid OAuth issuer") != NULL);
+	REQUIRE(access(auth_path, F_OK) == -1 && errno == ENOENT);
+	result = 0;
+
+cleanup:
+	if (output_fd != -1)
+		close(output_fd);
+	if (child > 0) {
+		(void)kill(child, SIGKILL);
+		(void)waitpid(child, &status, 0);
+	}
+	(void)unlink(auth_path);
+	return result;
+}
+
+/* Reject device responses containing terminal controls or hidden binary data. */
+static int
+test_rejected_device_response(enum device_server_mode mode,
+    const char *expected)
+{
+	char   auth_path[128];
+	char   issuer[128];
+	char   output[OUTPUT_SIZE];
+	char   token_url[160];
+	int    output_fd;
+	int    result;
+	int    server_status;
+	int    status;
+	pid_t  child;
+	pid_t  server_child;
+	size_t used;
+
+	child = -1;
+	server_child = -1;
+	output_fd = -1;
+	result = 1;
+	used = 0;
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-reject-%d-%ld.json", (int)mode,
+	    (long)getpid());
+	(void)unlink(auth_path);
+	REQUIRE(start_device_server(&server_child, issuer, sizeof(issuer),
+		    token_url, sizeof(token_url), mode) == 0);
+	output_fd = start_device_login("2000", auth_path, issuer, NULL,
+	    mode == DEVICE_SERVER_INCOMPLETE_TOKENS ? "client&id+value" : NULL,
+	    &child);
+	REQUIRE(output_fd != -1);
+	REQUIRE(wait_child(child, &status, 3000) == 1);
+	child = -1;
+	REQUIRE(drain_output(output_fd, output, sizeof(output), &used) == 0);
+	close(output_fd);
+	output_fd = -1;
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+	REQUIRE(strstr(output, expected) != NULL);
+	REQUIRE(wait_child(server_child, &server_status, 2000) == 1);
+	server_child = -1;
+	REQUIRE(WIFEXITED(server_status) && WEXITSTATUS(server_status) == 0);
+	REQUIRE(access(auth_path, F_OK) == -1 && errno == ENOENT);
+	result = 0;
+
+cleanup:
+	if (output_fd != -1)
+		close(output_fd);
+	if (child > 0) {
+		(void)kill(child, SIGKILL);
+		(void)waitpid(child, &status, 0);
+	}
+	if (server_child > 0) {
+		(void)kill(server_child, SIGKILL);
+		(void)waitpid(server_child, &server_status, 0);
+	}
+	(void)unlink(auth_path);
+	return result;
+}
+
+/* Bound the initial user-code HTTP request by the overall login deadline. */
+static int
+test_device_request_timeout(void)
+{
+	char   auth_path[128];
+	char   issuer[128];
+	char   output[OUTPUT_SIZE];
+	char   token_url[160];
+	int    output_fd;
+	int    result;
+	int    server_status;
+	int    status;
+	pid_t  child;
+	pid_t  server_child;
+	size_t used;
+
+	child = -1;
+	server_child = -1;
+	output_fd = -1;
+	result = 1;
+	used = 0;
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-device-timeout-%ld.json", (long)getpid());
+	(void)unlink(auth_path);
+	REQUIRE(start_device_server(&server_child, issuer, sizeof(issuer),
+		    token_url, sizeof(token_url), DEVICE_SERVER_HANG) == 0);
+	output_fd =
+	    start_device_login("100", auth_path, issuer, NULL, NULL, &child);
+	REQUIRE(output_fd != -1);
+	REQUIRE(wait_child(child, &status, 2000) == 1);
+	child = -1;
+	REQUIRE(drain_output(output_fd, output, sizeof(output), &used) == 0);
+	close(output_fd);
+	output_fd = -1;
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+	REQUIRE(strstr(output, "Timeout was reached") != NULL ||
+	    strstr(output, "timed out") != NULL);
+	REQUIRE(access(auth_path, F_OK) == -1 && errno == ENOENT);
+	result = 0;
+
+cleanup:
+	if (output_fd != -1)
+		close(output_fd);
+	if (child > 0) {
+		(void)kill(child, SIGKILL);
+		(void)waitpid(child, &status, 0);
+	}
+	if (server_child > 0) {
+		(void)kill(server_child, SIGKILL);
+		(void)waitpid(server_child, &server_status, 0);
+	}
+	(void)unlink(auth_path);
+	return result;
+}
+
+/* Verify device authorization prints the code, polls, exchanges, and saves. */
+static int
+test_device_login(void)
+{
+	char	      auth_path[128];
+	char	      issuer[128];
+	char	      token_url[160];
+	char	      output[OUTPUT_SIZE];
+	struct buffer saved;
+	int	      output_fd;
+	int	      result;
+	int	      status;
+	int	      server_status;
+	pid_t	      child;
+	pid_t	      server_child;
+	size_t	      issuer_used;
+	size_t	      used;
+
+	child = -1;
+	server_child = -1;
+	output_fd = -1;
+	result = 1;
+	used = 0;
+	buffer_init(&saved);
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-device-%ld.json", (long)getpid());
+	(void)unlink(auth_path);
+	REQUIRE(start_device_server(&server_child, issuer, sizeof(issuer),
+		    token_url, sizeof(token_url), DEVICE_SERVER_SUCCESS) == 0);
+	issuer_used = strlen(issuer);
+	REQUIRE(issuer_used + 1 < sizeof(issuer));
+	issuer[issuer_used] = '/';
+	issuer[issuer_used + 1] = '\0';
+	output_fd = start_device_login("5000", auth_path, issuer, NULL,
+	    "client&id+value", &child);
+	REQUIRE(output_fd != -1);
+	REQUIRE(read_until(output_fd, output, sizeof(output), &used,
+		    "OpenAI device authorization code: ABCD-EFGH", 2000) == 0);
+	REQUIRE(strstr(output,
+		    "Continue only if you started this login in oaioauthc") !=
+	    NULL);
+	REQUIRE(wait_child(child, &status, 5000) == 1);
+	child = -1;
+	REQUIRE(drain_output(output_fd, output, sizeof(output), &used) == 0);
+	close(output_fd);
+	output_fd = -1;
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	REQUIRE(wait_child(server_child, &server_status, 2000) == 1);
+	server_child = -1;
+	REQUIRE(WIFEXITED(server_status) && WEXITSTATUS(server_status) == 0);
+	REQUIRE(read_file(auth_path, &saved) == 0);
+	REQUIRE(strstr(saved.data, "device-access") != NULL);
+	REQUIRE(strstr(saved.data, "device-account") != NULL);
+	result = 0;
+
+cleanup:
+	buffer_free(&saved);
+	if (output_fd != -1)
+		close(output_fd);
+	if (child > 0) {
+		(void)kill(child, SIGKILL);
+		(void)waitpid(child, &status, 0);
+	}
+	if (server_child > 0) {
+		(void)kill(server_child, SIGKILL);
+		(void)waitpid(server_child, &server_status, 0);
+	}
+	(void)unlink(auth_path);
+	return result;
+}
+
 /* Exercise every login deadline, cancellation, and overwrite regression. */
 int
 main(void)
@@ -661,5 +1177,14 @@ main(void)
 	CHECK(test_slow_callback() == 0);
 	CHECK(test_exchange_cancellation() == 0);
 	CHECK(test_concurrent_auth_creation() == 0);
+	CHECK(test_unsafe_issuer() == 0);
+	CHECK(test_rejected_device_response(DEVICE_SERVER_CONTROL_CODE,
+		  "invalid required fields") == 0);
+	CHECK(test_rejected_device_response(DEVICE_SERVER_EMBEDDED_NUL,
+		  "invalid JSON") == 0);
+	CHECK(test_rejected_device_response(DEVICE_SERVER_INCOMPLETE_TOKENS,
+		  "missing initial OAuth credentials") == 0);
+	CHECK(test_device_request_timeout() == 0);
+	CHECK(test_device_login() == 0);
 	return 0;
 }
