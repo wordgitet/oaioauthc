@@ -116,7 +116,9 @@ discovering the current version from the Codex package registry.
 .TP
 .BI \-\-base-url " url"
 Use the specified Codex upstream root URL.  Endpoint suffixes such as
-responses and models are appended to this value.  The value must not be empty.
+responses and models are appended to this value.  The URL must use HTTPS.
+HTTP is permitted only for explicit loopback endpoints (localhost, 127.0.0.1,
+or [::1]) used during local testing.
 .TP
 .BI \-\-debug-json
 Write parsed client JSON and normalized upstream JSON to standard error in
@@ -185,8 +187,8 @@ default token endpoints.  The default is
 This login-only option is useful with a compatible private issuer; use
 .B \-\-oauth-token-url
 when only the final token endpoint differs.  The issuer must use HTTPS, except
-that HTTP is permitted for explicit localhost addresses used during local
-testing.
+that HTTP is permitted only for explicit loopback endpoints (localhost,
+127.0.0.1, or [::1]) used during local testing.
 .TP
 .BI \-\-oauth-file " path"
 Read or write credentials at the specified path instead of the default
@@ -202,7 +204,9 @@ and
 .BI \-\-oauth-token-url " url"
 Override the endpoint that receives authorization codes and refresh tokens.
 This advanced option is accepted by both commands.  Credentials are sent to
-the specified URL; use only a trusted HTTPS endpoint.
+the specified URL.  It must use HTTPS, except that HTTP is permitted only for
+explicit loopback endpoints (localhost, 127.0.0.1, or [::1]) used during local
+testing.
 .SH ENVIRONMENT
 .TP
 .B CODEX_HOME
@@ -276,6 +280,10 @@ are not used for local client authentication.
 Keep the listener on a loopback address.  Binding to a network-visible address
 allows other hosts to use the saved ChatGPT OAuth session because the proxy has
 no inbound authentication layer.
+.PP
+Upstream connections require TLS 1.2 or newer.  Custom Codex and OAuth URLs
+must use HTTPS, except for explicit loopback HTTP endpoints used in local
+testing.
 .PP
 Treat auth.json and its tokens as passwords.  Enable diagnostic JSON only when
 needed, and protect standard-error logs because prompts and conversation
