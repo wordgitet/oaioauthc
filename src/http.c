@@ -246,7 +246,7 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "oaioauthc/0.2");
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "oaioauthc/0.2.1");
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
