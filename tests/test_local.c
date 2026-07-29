@@ -224,7 +224,7 @@ test_empty_base_url(void)
 		if (dup2(descriptors[1], STDERR_FILENO) == -1)
 			_exit(126);
 		close(descriptors[1]);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "--base-url",
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--base-url",
 		    "", "--codex-version", "9.9.9", "--models", "gpt-test",
 		    (char *)NULL);
 		_exit(127);
@@ -307,7 +307,7 @@ test_async_catalog_refresh(void)
 		if (fd == -1 || dup2(fd, STDERR_FILENO) == -1)
 			_exit(126);
 		close(fd);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "--port",
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--port",
 		    proxy_port, "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", (char *)NULL);
 		_exit(127);

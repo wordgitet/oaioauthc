@@ -168,12 +168,12 @@ start_login(const char *timeout, const char *auth_path, const char *token_url,
 			_exit(126);
 		close(output_pipe[1]);
 		if (token_url != NULL)
-			execl("../src/oaioauthc", "oaioauthc", "login",
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
 			    "--no-open", "--login-timeout-ms", timeout,
 			    "--oauth-file", auth_path, "--oauth-token-url",
 			    token_url, (char *)NULL);
 		else
-			execl("../src/oaioauthc", "oaioauthc", "login",
+			execl(TEST_PROGRAM_PATH, "oaioauthc", "login",
 			    "--no-open", "--login-timeout-ms", timeout,
 			    "--oauth-file", auth_path, (char *)NULL);
 		_exit(127);

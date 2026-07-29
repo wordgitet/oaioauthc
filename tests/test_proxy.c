@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "test.h"
 #include "util.h"
 
 /*
@@ -408,7 +409,7 @@ main(void)
 		if (debug_fd == -1 || dup2(debug_fd, STDERR_FILENO) == -1)
 			_exit(126);
 		close(debug_fd);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "-p", port,
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "-p", port,
 		    "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", "--debug-json", (char *)NULL);
 		_exit(127);
@@ -532,7 +533,7 @@ main(void)
 		if (debug_fd == -1 || dup2(debug_fd, STDERR_FILENO) == -1)
 			_exit(126);
 		close(debug_fd);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--port", port,
 		    "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", "--debug-json=pretty",
 		    (char *)NULL);
@@ -554,7 +555,7 @@ main(void)
 	REQUIRE(pid != -1);
 	if (pid == 0) {
 		close(STDERR_FILENO);
-		execl("../src/oaioauthc", "oaioauthc", "serve", "--port", port,
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--port", port,
 		    "--oauth-file", path, "--base-url", base_url,
 		    "--codex-version", "9.9.9", (char *)NULL);
 		_exit(127);

@@ -1,4 +1,6 @@
-AM_CPPFLAGS = -D_POSIX_C_SOURCE=200809L -I$(top_srcdir)/src $(LIBCURL_CFLAGS) $(OPENSSL_CFLAGS) $(JANSSON_CFLAGS)
+AM_CPPFLAGS = -D_POSIX_C_SOURCE=200809L -I$(top_srcdir)/src \
+	-DOAIOAUTHC_TEST_PROGRAM=\"$(abs_top_builddir)/src/oaioauthc\" \
+	$(LIBCURL_CFLAGS) $(OPENSSL_CFLAGS) $(JANSSON_CFLAGS)
 AM_CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -Werror
 check_PROGRAMS = test_auth test_images test_json test_sse test_proxy test_login \
 	test_local test_daemon

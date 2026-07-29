@@ -92,7 +92,7 @@ run_command(char *const argv[], char *output, size_t length)
 		    dup2(descriptors[1], STDERR_FILENO) == -1)
 			_exit(126);
 		close(descriptors[1]);
-		execv("../src/oaioauthc", argv);
+		execv(TEST_PROGRAM_PATH, argv);
 		_exit(127);
 	}
 	close(descriptors[1]);
@@ -114,7 +114,8 @@ run_command(char *const argv[], char *output, size_t length)
 /*
 ** Execute one command with stdout connected to a pipe that has no reader.
 **
-** app_main ignores SIGPIPE, so writing the log returns EPIPE to daemon_logs.
+** The command entry point ignores SIGPIPE, so writing the log returns EPIPE
+** to daemon_logs.
 ** Stderr remains captured separately to prove that the failure initializes a
 ** complete diagnostic rather than passing untouched stack bytes to fprintf.
 */
@@ -152,7 +153,7 @@ run_command_closed_stdout(char *const argv[], char *output, size_t length)
 			_exit(126);
 		close(closed_output[1]);
 		close(diagnostics[1]);
-		execv("../src/oaioauthc", argv);
+		execv(TEST_PROGRAM_PATH, argv);
 		_exit(127);
 	}
 	close(closed_output[0]);
