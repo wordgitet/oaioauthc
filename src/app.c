@@ -32,7 +32,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "app.h"
 #include "auth.h"
 #include "config.h"
 #include "daemon.h"
@@ -777,7 +776,7 @@ done:
 ** the synchronous proxy_serve call without a second allocation layer.
 */
 int
-app_main(int argc, char **argv)
+main(int argc, char **argv)
 {
 	struct proxy_options options;
 	const char	    *command;

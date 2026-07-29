@@ -1,7 +1,7 @@
 AC_PREREQ([2.69])
 AC_INIT([oaioauthc], [0.2])
 AM_INIT_AUTOMAKE([foreign subdir-objects -Wall])
-AC_CONFIG_SRCDIR([src/main.c])
+AC_CONFIG_SRCDIR([src/app.c])
 AC_CONFIG_HEADERS([config.h])
 AC_PROG_CC
 AC_COMPILE_IFELSE([AC_LANG_SOURCE([[

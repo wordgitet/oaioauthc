@@ -2,8 +2,7 @@ AM_CPPFLAGS = -D_POSIX_C_SOURCE=200809L $(LIBCURL_CFLAGS) $(OPENSSL_CFLAGS) $(JA
 AM_CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -Werror
 bin_PROGRAMS = oaioauthc
 oaioauthc_SOURCES = \
-	main.c \
-	app.c app.h \
+	app.c \
 	daemon.c daemon.h \
 	auth.c auth.h \
 	http.c http.h \
