@@ -27,6 +27,20 @@ make check
 ./src/oaioauthc serve
 ```
 
+On a headless machine, authorize from another trusted device instead of
+starting a local browser:
+
+```sh
+./src/oaioauthc login --device-auth
+```
+
+The command prints an OpenAI verification URL and one-time code, polls for
+approval for up to 15 minutes, and writes the same Codex-compatible
+`auth.json` used by the proxy. Device authorization is a beta OpenAI feature;
+enable it in ChatGPT security or workspace settings if the endpoint says it
+is unavailable. Enter the code only when you started the login yourself; a
+code supplied by a website or another person may be a phishing attempt.
+
 The server listens on `http://127.0.0.1:10531` by default. Discover the models
 available to the signed-in account:
 
