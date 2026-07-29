@@ -26,8 +26,11 @@ OpenAI-compatible API
 .RB [ \-\-debug-json [ =compact | =pretty ]]
 .PP
 .B oaioauthc login
+.RB [ \-\-device-auth ]
 .RB [ \-\-oauth-file
 .IR path ]
+.RB [ \-\-oauth-issuer
+.IR url ]
 .RB [ \-\-oauth-client-id
 .IR id ]
 .RB [ \-\-oauth-token-url
@@ -73,7 +76,11 @@ receives a terminating signal or encounters a fatal listener error.
 .B login
 Perform an OAuth PKCE login using a callback listener on localhost port 1455.
 The callback wait is limited to five minutes by default.  Existing credentials
-are replaced only after confirmation from an interactive terminal.
+are replaced only after confirmation from an interactive terminal.  With
+.B \-\-device-auth ,
+print a verification URL and one-time code, then poll for approval on another
+device; no callback listener or browser is used.  Device login waits up to 15
+minutes by default.
 .TP
 .B status
 Query the live daemon control socket and print its JSON status.  A stale
@@ -143,6 +150,18 @@ image data URLs.  It does not redact prompts, conversation history, or tool
 definitions.
 .SH LOGIN OPTIONS
 .TP
+.B \-\-device-auth
+Use the headless device authorization flow.  The command prints a short-lived
+user code and verification URL, then waits for the user to approve the request
+on a trusted device.  This option cannot be combined with
+.B \-\-open
+or
+.BR \-\-no-open .
+Device authorization is a beta OpenAI feature and may need to be enabled in
+ChatGPT security or workspace settings.  Enter the code only after starting
+the login yourself; a code supplied by a website or another person may be a
+phishing attempt.
+.TP
 .B \-\-open
 Request the system desktop opener after printing the authorization URL.
 This is the default.  Browser launch failure does not fail the login command.
@@ -152,10 +171,22 @@ Do not start a browser.  The authorization URL is still printed to standard
 error.
 .TP
 .BI \-\-login-timeout-ms " milliseconds"
-Set the callback and callback-request timeout in milliseconds.  The value must
-be a positive decimal integer no greater than the largest signed integer
-supported by the build.  The default is 300000.
+Set the overall login timeout in milliseconds.  For browser login this covers
+the callback and callback-request waits; for device login it covers code
+request, polling, and the final token exchange.  The value must be a positive
+decimal integer no greater than the largest signed integer supported by the
+build.  The default is 300000 for browser login and 900000 for device login.
 .SH COMMON OAUTH OPTIONS
+.TP
+.BI \-\-oauth-issuer " url"
+Set the OpenAI OAuth issuer root used to construct authorization, device, and
+default token endpoints.  The default is
+.BR https://auth.openai.com .
+This login-only option is useful with a compatible private issuer; use
+.B \-\-oauth-token-url
+when only the final token endpoint differs.  The issuer must use HTTPS, except
+that HTTP is permitted for explicit localhost addresses used during local
+testing.
 .TP
 .BI \-\-oauth-file " path"
 Read or write credentials at the specified path instead of the default
