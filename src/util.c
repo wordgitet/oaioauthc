@@ -166,6 +166,10 @@ write_all(int fd, const void *data, size_t length)
 				continue;
 			return -1;
 		}
+		if (written == 0) {
+			errno = EIO;
+			return -1;
+		}
 		cursor += written;
 		length -= (size_t)written;
 	}
@@ -185,23 +189,27 @@ read_file(const char *path, struct buffer *buffer)
 	char	chunk[4096];
 	ssize_t count;
 	int	fd;
+	int	result;
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
 		return -1;
+	result = -1;
 	while ((count = read(fd, chunk, sizeof(chunk))) != 0) {
 		if (count < 0) {
 			if (errno == EINTR)
 				continue;
-			close(fd);
-			return -1;
+			goto done;
 		}
-		if (buffer_append(buffer, chunk, (size_t)count) == -1) {
-			close(fd);
-			return -1;
-		}
+		if (buffer_append(buffer, chunk, (size_t)count) == -1)
+			goto done;
 	}
-	return close(fd);
+	result = 0;
+
+done:
+	if (close(fd) == -1 && result == 0)
+		return -1;
+	return result;
 }
 
 /*
