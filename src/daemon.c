@@ -596,11 +596,12 @@ daemon_serve(const struct proxy_options *options, const char *directory,
 		waited = waitpid(child, &status, 0);
 	} while (waited == -1 && errno == EINTR);
 	if (waited != child) {
-		set_error(error, length, "could not wait for daemon startup: %s",
-		    strerror(errno));
+		set_error(error, length,
+		    "could not wait for daemon startup: %s", strerror(errno));
 		result = -1;
 	} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		set_error(error, length, "daemon startup process exited unexpectedly");
+		set_error(error, length,
+		    "daemon startup process exited unexpectedly");
 		result = -1;
 	} else if (response[0] != 'R') {
 		newline = strchr(response, '\n');

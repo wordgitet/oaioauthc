@@ -224,8 +224,8 @@ test_empty_base_url(void)
 		if (dup2(descriptors[1], STDERR_FILENO) == -1)
 			_exit(126);
 		close(descriptors[1]);
-		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--base-url",
-		    "", "--codex-version", "9.9.9", "--models", "gpt-test",
+		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "--base-url", "",
+		    "--codex-version", "9.9.9", "--models", "gpt-test",
 		    (char *)NULL);
 		_exit(127);
 	}

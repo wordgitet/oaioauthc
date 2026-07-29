@@ -985,7 +985,7 @@ cleanup:
 /* Reject device responses containing terminal controls or hidden binary data. */
 static int
 test_rejected_device_response(enum device_server_mode mode,
-    const char *expected)
+    const char					     *expected)
 {
 	char   auth_path[128];
 	char   issuer[128];
