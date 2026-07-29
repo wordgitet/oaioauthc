@@ -535,6 +535,7 @@ daemon_serve(const struct proxy_options *options, const char *directory,
 	char		   *cursor;
 	char		   *newline;
 	pid_t		    child;
+	pid_t		    waited;
 	ssize_t		    count;
 	int		    descriptors[2];
 	int		    status;
@@ -591,8 +592,17 @@ daemon_serve(const struct proxy_options *options, const char *directory,
 	}
 	*cursor = '\0';
 	close(descriptors[0]);
-	(void)waitpid(child, &status, 0);
-	if (response[0] != 'R') {
+	do {
+		waited = waitpid(child, &status, 0);
+	} while (waited == -1 && errno == EINTR);
+	if (waited != child) {
+		set_error(error, length, "could not wait for daemon startup: %s",
+		    strerror(errno));
+		result = -1;
+	} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		set_error(error, length, "daemon startup process exited unexpectedly");
+		result = -1;
+	} else if (response[0] != 'R') {
 		newline = strchr(response, '\n');
 		if (newline != NULL)
 			*newline = '\0';
@@ -646,13 +656,17 @@ control_read_response(int fd, struct buffer *response)
 	char	chunk[1024];
 	ssize_t count;
 
-	while ((count = read(fd, chunk, sizeof(chunk))) > 0) {
+	for (;;) {
+		do {
+			count = read(fd, chunk, sizeof(chunk));
+		} while (count == -1 && errno == EINTR);
+		if (count <= 0)
+			return count == 0 ? 0 : -1;
 		if (response->len > CONTROL_LINE_MAX ||
 		    (size_t)count > CONTROL_LINE_MAX - response->len ||
 		    buffer_append(response, chunk, (size_t)count) == -1)
 			return -1;
 	}
-	return count == 0 ? 0 : -1;
 }
 
 /* Resolve paths, send one command, and print the daemon's bounded response. */
