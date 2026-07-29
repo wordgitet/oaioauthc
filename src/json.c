@@ -65,6 +65,31 @@ json_load_string_checked(const char *text, char *error, size_t length)
 	return value;
 }
 
+/*
+** Parse an exact-length JSON buffer and reject data hidden after embedded NULs.
+**
+** Network and file input is not inherently a C string.  Keeping the byte count
+** through this boundary ensures Jansson validates every received byte instead
+** of accepting a valid prefix that happens to precede a NUL.
+*/
+json_t *
+json_load_buffer_checked(const void *data, size_t data_length, char *error,
+    size_t length)
+{
+	json_error_t json_error;
+	json_t	    *value;
+
+	if (data == NULL && data_length != 0) {
+		set_error(error, length, "invalid JSON buffer");
+		return NULL;
+	}
+	value =
+	    json_loadb(data == NULL ? "" : data, data_length, 0, &json_error);
+	if (value == NULL)
+		set_error(error, length, "invalid JSON: %s", json_error.text);
+	return value;
+}
+
 /* Build a local OpenAI-compatible error envelope with an HTTP status field. */
 json_t *
 json_error_object(const char *message, const char *type, int status)
