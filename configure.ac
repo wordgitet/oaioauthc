@@ -22,6 +22,28 @@ AS_IF([test "x$enable_sanitizers" = xyes], [
         [AC_MSG_RESULT([yes])],
         [AC_MSG_FAILURE([AddressSanitizer and UndefinedBehaviorSanitizer are required by --enable-sanitizers])])
 ])
+AC_ARG_ENABLE([fuzzing],
+    [AS_HELP_STRING([--enable-fuzzing],
+        [build Clang libFuzzer targets for JSON and SSE parsers])],
+    [], [enable_fuzzing=no])
+FUZZ_CFLAGS=""
+FUZZ_LDFLAGS=""
+AS_IF([test "x$enable_fuzzing" = xyes], [
+    fuzz_saved_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -fsanitize=fuzzer-no-link,address,undefined"
+    AC_MSG_CHECKING([whether the compiler supports libFuzzer instrumentation])
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [])], [
+        AC_MSG_RESULT([yes])
+    ], [
+        AC_MSG_FAILURE([Clang libFuzzer is required by --enable-fuzzing])
+    ])
+    CFLAGS="$fuzz_saved_CFLAGS"
+    FUZZ_CFLAGS="-fsanitize=fuzzer-no-link,address,undefined"
+    FUZZ_LDFLAGS="-fsanitize=fuzzer,address,undefined"
+])
+AC_SUBST([FUZZ_CFLAGS])
+AC_SUBST([FUZZ_LDFLAGS])
+AM_CONDITIONAL([ENABLE_FUZZING], [test "x$enable_fuzzing" = xyes])
 PKG_PROG_PKG_CONFIG
 PKG_CHECK_MODULES([LIBCURL], [libcurl])
 PKG_CHECK_MODULES([OPENSSL], [openssl])

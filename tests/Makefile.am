@@ -6,6 +6,8 @@ check_PROGRAMS = test_auth test_secret test_images test_json test_sse test_proxy
 	test_login test_local test_daemon
 TESTS = $(check_PROGRAMS)
 noinst_HEADERS = test.h
+EXTRA_DIST = fuzz/fuzz_json.c fuzz/fuzz_sse.c \
+	fuzz/corpus/json/basic.json fuzz/corpus/sse/basic.sse
 test_auth_SOURCES = test_auth.c ../src/auth.c ../src/secret.c ../src/http.c ../src/json.c ../src/util.c
 test_secret_SOURCES = test_secret.c ../src/secret.c ../src/util.c
 test_images_SOURCES = test_images.c ../src/images.c ../src/json.c ../src/util.c
@@ -20,3 +22,20 @@ test_secret_LDADD = $(OPENSSL_LIBS)
 test_images_LDADD = $(LIBCURL_LIBS) $(OPENSSL_LIBS) $(JANSSON_LIBS)
 test_json_LDADD = $(LIBCURL_LIBS) $(OPENSSL_LIBS) $(JANSSON_LIBS)
 test_sse_LDADD = $(LIBCURL_LIBS) $(OPENSSL_LIBS) $(JANSSON_LIBS)
+
+if ENABLE_FUZZING
+noinst_PROGRAMS = fuzz_json fuzz_sse
+fuzz_json_SOURCES = fuzz/fuzz_json.c ../src/json.c ../src/util.c
+fuzz_json_CFLAGS = $(AM_CFLAGS) $(FUZZ_CFLAGS)
+fuzz_json_LDFLAGS = $(FUZZ_LDFLAGS)
+fuzz_json_LDADD = $(JANSSON_LIBS)
+fuzz_sse_SOURCES = fuzz/fuzz_sse.c ../src/sse.c ../src/json.c ../src/util.c
+fuzz_sse_CFLAGS = $(AM_CFLAGS) $(FUZZ_CFLAGS)
+fuzz_sse_LDFLAGS = $(FUZZ_LDFLAGS)
+fuzz_sse_LDADD = $(JANSSON_LIBS)
+
+.PHONY: fuzz-smoke
+fuzz-smoke: fuzz_json fuzz_sse
+	./fuzz_json -runs=1000 $(srcdir)/fuzz/corpus/json
+	./fuzz_sse -runs=1000 $(srcdir)/fuzz/corpus/sse
+endif

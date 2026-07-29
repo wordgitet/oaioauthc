@@ -84,6 +84,17 @@ The daemon stores its lock, status, control socket, and log below
 For a local ASan and UBSan run, configure a clean build with
 `./configure --enable-sanitizers`, then run `make check`.
 
+With Clang, parser fuzz targets are available in a separate clean build:
+
+```sh
+CC=clang ./configure --enable-fuzzing
+make fuzz-smoke
+```
+
+The smoke target runs a bounded corpus pass. Run `tests/fuzz/fuzz_json` or
+`tests/fuzz/fuzz_sse` directly with a longer libFuzzer budget when investigating
+parser changes.
+
 ## Contributor checks
 
 Install the versioned Git hooks for this checkout with:
