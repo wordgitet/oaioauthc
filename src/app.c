@@ -6,7 +6,8 @@
 ** proxy.c.  The login command performs the browser-facing half of OAuth:
 ** it builds a PKCE authorization request, opens a loopback listener, checks
 ** the returned state, exchanges the code, and stores the resulting Codex
-** auth.json session.
+** auth.json session.  It also owns the headless device-auth path, which prints
+** a verification code and delegates bounded polling to auth.c.
 **
 ** The callback listener is restricted to the IPv4 and IPv6 loopback addresses
 ** on port 1455 and accepts exactly one request.  Its parser recognizes only
@@ -57,7 +58,8 @@ usage(FILE *stream)
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--daemon] [--runtime-dir DIR]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
-	    "  oaioauthc login [--oauth-file PATH] [--open|--no-open]\n"
+	    "  oaioauthc login [--device-auth] [--oauth-file PATH]\n"
+	    "                  [--open|--no-open] [--oauth-issuer URL]\n"
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--login-timeout-ms MS]\n"
 	    "  oaioauthc status [--runtime-dir DIR]\n"
@@ -90,6 +92,56 @@ parse_positive_number(const char *value, unsigned long maximum,
 	if (result == 0)
 		return -1;
 	*number = result;
+	return 0;
+}
+
+/* Return non-zero for HTTPS issuer roots or explicit loopback HTTP testing. */
+static int
+oauth_issuer_is_safe(const char *issuer)
+{
+	const unsigned char *cursor;
+	const char	    *authority;
+	const char	    *authority_end;
+	size_t		     authority_length;
+	int		     secure;
+
+	if (issuer == NULL || issuer[0] == '\0')
+		return 0;
+	for (cursor = (const unsigned char *)issuer; *cursor != '\0';
+	    cursor++) {
+		if (*cursor <= 0x20 || *cursor == 0x7f || *cursor == '\\' ||
+		    *cursor == '?' || *cursor == '#')
+			return 0;
+	}
+	if (strncmp(issuer, "https://", 8) == 0) {
+		authority = issuer + 8;
+		secure = 1;
+	} else if (strncmp(issuer, "http://", 7) == 0) {
+		authority = issuer + 7;
+		secure = 0;
+	} else
+		return 0;
+	authority_end = strchr(authority, '/');
+	if (authority_end == NULL)
+		authority_end = authority + strlen(authority);
+	authority_length = (size_t)(authority_end - authority);
+	if (authority_length == 0 ||
+	    memchr(authority, '@', authority_length) != NULL)
+		return 0;
+	if (secure)
+		return 1;
+	if ((authority_length == 9 ||
+		(authority_length > 9 && authority[9] == ':')) &&
+	    memcmp(authority, "localhost", 9) == 0)
+		return 1;
+	if ((authority_length == 9 ||
+		(authority_length > 9 && authority[9] == ':')) &&
+	    memcmp(authority, "127.0.0.1", 9) == 0)
+		return 1;
+	if ((authority_length == 5 ||
+		(authority_length > 5 && authority[5] == ':')) &&
+	    memcmp(authority, "[::1]", 5) == 0)
+		return 1;
 	return 0;
 }
 
@@ -475,7 +527,8 @@ send_callback_response(int fd, int status, const char *content_type,
 ** and saved session survives this function; all other paths release secrets.
 */
 static int
-run_login(const struct proxy_options *options, int should_open, int timeout_ms)
+run_login(const struct proxy_options *options, const char *issuer,
+    int should_open, int timeout_ms)
 {
 	struct sigaction     old_interrupt;
 	struct sigaction     old_terminate;
@@ -542,8 +595,8 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 			    CALLBACK_PORT, strerror(errno));
 		return 1;
 	}
-	if (oauth_request_create(CALLBACK_URI, options->client_id, &oauth,
-		error, sizeof(error)) == -1) {
+	if (oauth_request_create(issuer, CALLBACK_URI, options->client_id,
+		&oauth, error, sizeof(error)) == -1) {
 		(void)fprintf(stderr, "%s\n", error);
 		goto done;
 	}
@@ -724,8 +777,8 @@ run_login(const struct proxy_options *options, int should_open, int timeout_ms)
 		goto done;
 	}
 	result = oauth_exchange_code(code, oauth.code_verifier, CALLBACK_URI,
-	    options->client_id, options->token_url, login_cancel_requested,
-	    NULL, &session, error, sizeof(error));
+	    options->client_id, issuer, options->token_url,
+	    login_cancel_requested, NULL, &session, error, sizeof(error));
 	free(code);
 	code = NULL;
 	free(state);
@@ -770,6 +823,108 @@ done:
 	return result;
 }
 
+/* Persist one successful login while retaining the interactive overwrite
+** rule. */
+static int
+save_login_session(const char *path, int replace, struct auth_session *session,
+    char *error, size_t length)
+{
+	if ((replace ? auth_save(path, session, error, length)
+		     : auth_save_new(path, session, error, length)) == -1)
+		return -1;
+	return 0;
+}
+
+/*
+** Perform the complete headless device authorization transaction.
+**
+** Device login has no loopback listener and never launches a browser.  It
+** prints a verification URL and one-time user code, then polls the issuer's
+** device endpoint until the user approves it elsewhere.  The overall timeout
+** covers the initial request, polling, and final token exchange.  Signal
+** callbacks are passed into every synchronous HTTP operation so Ctrl-C cannot
+** leave a curl transfer running in the background.
+*/
+static int
+run_device_login(const struct proxy_options *options, const char *issuer,
+    int timeout_ms)
+{
+	struct auth_session	 session;
+	struct oauth_device_code device;
+	struct sigaction	 old_interrupt;
+	struct sigaction	 old_terminate;
+	char			 error[256];
+	const char		*path;
+	int			 overwrite;
+	int			 replace_auth;
+	int			 signals_installed;
+	int			 result;
+
+	memset(&session, 0, sizeof(session));
+	memset(&device, 0, sizeof(device));
+	signals_installed = 0;
+	result = 1;
+	path = options->auth_file == NULL ? auth_default_file()
+					  : options->auth_file;
+	if (path == NULL) {
+		(void)fprintf(stderr, "could not determine auth file path\n");
+		return 1;
+	}
+	overwrite = confirm_auth_overwrite(path, &replace_auth);
+	if (overwrite != 0)
+		return overwrite < 0 ? 1 : 0;
+	if (install_login_signals(&old_interrupt, &old_terminate) == -1) {
+		(void)fprintf(stderr,
+		    "could not install login signal handlers: %s\n",
+		    strerror(errno));
+		goto done;
+	}
+	signals_installed = 1;
+	if (oauth_device_code_request(issuer, options->client_id, timeout_ms,
+		login_cancel_requested, NULL, &device, error,
+		sizeof(error)) == -1) {
+		if (login_signal_received != 0)
+			(void)fprintf(stderr, "Device OAuth login cancelled\n");
+		else
+			(void)fprintf(stderr, "%s\n", error);
+		goto done;
+	}
+	(void)fprintf(stderr,
+	    "OpenAI device authorization URL: %s\n"
+	    "OpenAI device authorization code: %s\n"
+	    "Open the URL on a trusted device and enter the code.\n"
+	    "Continue only if you started this login in oaioauthc. "
+	    "If a website or another person gave you this code, cancel.\n",
+	    device.verification_url, device.user_code);
+	if (oauth_device_code_poll(issuer, options->client_id,
+		options->token_url, &device, login_cancel_requested, NULL,
+		&session, error, sizeof(error)) == -1) {
+		if (login_signal_received != 0)
+			(void)fprintf(stderr, "Device OAuth login cancelled\n");
+		else
+			(void)fprintf(stderr, "%s\n", error);
+		goto done;
+	}
+	if (login_signal_received != 0) {
+		(void)fprintf(stderr, "Device OAuth login cancelled\n");
+		goto done;
+	}
+	if (save_login_session(path, replace_auth, &session, error,
+		sizeof(error)) == -1) {
+		(void)fprintf(stderr, "%s\n", error);
+		goto done;
+	}
+	(void)fprintf(stderr, "Credentials saved to %s\n", path);
+	result = 0;
+
+done:
+	oauth_device_code_free(&device);
+	auth_session_free(&session);
+	if (signals_installed)
+		restore_login_signals(&old_interrupt, &old_terminate);
+	return result;
+}
+
 /*
 ** Parse the command line, install process-wide SIGPIPE behavior, and select
 ** login or serve.  options only borrows argv strings, so it stays valid for
@@ -780,11 +935,15 @@ main(int argc, char **argv)
 {
 	struct proxy_options options;
 	const char	    *command;
+	const char	    *oauth_issuer;
 	const char	    *runtime_directory;
 	int		     index;
 	int		     open;
+	int		     open_option_seen;
 	int		     daemon_mode;
+	int		     device_auth;
 	int		     follow_logs;
+	int		     issuer_option_seen;
 	char		     error[256];
 	const char	    *login_timeout_value;
 	unsigned long	     login_timeout;
@@ -806,6 +965,10 @@ main(int argc, char **argv)
 	runtime_directory = NULL;
 	login_timeout = 300000UL;
 	login_timeout_value = NULL;
+	oauth_issuer = oauth_default_issuer();
+	open_option_seen = 0;
+	device_auth = 0;
+	issuer_option_seen = 0;
 	for (; index < argc; index++) {
 		if (strcmp(argv[index], "--host") == 0)
 			options.host =
@@ -834,6 +997,12 @@ main(int argc, char **argv)
 		else if (strcmp(argv[index], "--oauth-token-url") == 0)
 			options.token_url = option_value(&index, argc, argv,
 			    "--oauth-token-url");
+		else if (strcmp(argv[index], "--oauth-issuer") == 0) {
+			oauth_issuer =
+			    option_value(&index, argc, argv, "--oauth-issuer");
+			issuer_option_seen = 1;
+		} else if (strcmp(argv[index], "--device-auth") == 0)
+			device_auth = 1;
 		else if (strcmp(argv[index], "--daemon") == 0)
 			daemon_mode = 1;
 		else if (strcmp(argv[index], "--runtime-dir") == 0)
@@ -852,11 +1021,13 @@ main(int argc, char **argv)
 			    "invalid --debug-json format: %s\n",
 			    argv[index] + 13);
 			return 1;
-		} else if (strcmp(argv[index], "--open") == 0)
+		} else if (strcmp(argv[index], "--open") == 0) {
 			open = 1;
-		else if (strcmp(argv[index], "--no-open") == 0)
+			open_option_seen = 1;
+		} else if (strcmp(argv[index], "--no-open") == 0) {
 			open = 0;
-		else if (strcmp(argv[index], "--login-timeout-ms") == 0)
+			open_option_seen = 1;
+		} else if (strcmp(argv[index], "--login-timeout-ms") == 0)
 			login_timeout_value = option_value(&index, argc, argv,
 			    "--login-timeout-ms");
 		else if (strncmp(argv[index], "--login-timeout-ms=", 19) == 0)
@@ -896,7 +1067,24 @@ main(int argc, char **argv)
 			usage(stderr);
 			return 1;
 		}
-		return run_login(&options, open, (int)login_timeout);
+		if (!oauth_issuer_is_safe(oauth_issuer)) {
+			(void)fprintf(stderr,
+			    "invalid OAuth issuer (use HTTPS, or HTTP only for localhost)\n");
+			return 1;
+		}
+		if (device_auth && open_option_seen) {
+			(void)fprintf(stderr,
+			    "--device-auth cannot be combined with --open or --no-open\n");
+			return 1;
+		}
+		/* Device authorization is intentionally longer than browser login. */
+		if (device_auth && login_timeout_value == NULL)
+			login_timeout = 900000UL;
+		if (device_auth)
+			return run_device_login(&options, oauth_issuer,
+			    (int)login_timeout);
+		return run_login(&options, oauth_issuer, open,
+		    (int)login_timeout);
 	}
 	if (strcmp(command, "status") == 0 || strcmp(command, "stop") == 0 ||
 	    strcmp(command, "logs") == 0) {
@@ -909,7 +1097,8 @@ main(int argc, char **argv)
 		    options.port != NULL || options.models != NULL ||
 		    options.base_url != NULL || options.codex_version != NULL ||
 		    options.auth_file != NULL || options.client_id != NULL ||
-		    options.token_url != NULL ||
+		    options.token_url != NULL || device_auth ||
+		    issuer_option_seen ||
 		    options.debug_json != debug_json_disabled ||
 		    (follow_logs && strcmp(command, "logs") != 0)) {
 			usage(stderr);
@@ -930,7 +1119,8 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	if (strcmp(command, "serve") != 0 || follow_logs) {
+	if (strcmp(command, "serve") != 0 || follow_logs || device_auth ||
+	    issuer_option_seen) {
 		usage(stderr);
 		return 1;
 	}
