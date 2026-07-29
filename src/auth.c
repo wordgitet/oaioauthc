@@ -39,6 +39,7 @@
 #include "auth.h"
 #include "http.h"
 #include "json.h"
+#include "secret.h"
 #include "util.h"
 
 #define DEFAULT_CLIENT_ID    "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -381,9 +382,9 @@ oauth_default_issuer(void)
 void
 auth_session_free(struct auth_session *session)
 {
-	free(session->access_token);
-	free(session->refresh_token);
-	free(session->id_token);
+	secret_free(session->access_token);
+	secret_free(session->refresh_token);
+	secret_free(session->id_token);
 	free(session->account_id);
 	free(session->last_refresh);
 	memset(session, 0, sizeof(*session));
@@ -410,12 +411,13 @@ auth_load(const char *path, struct auth_session *session, char *error,
 	memset(session, 0, sizeof(*session));
 	buffer_init(&buffer);
 	if (read_file(path, &buffer) == -1) {
+		secret_buffer_free(&buffer);
 		set_error(error, length, "could not read auth file: %s",
 		    strerror(errno));
 		return -1;
 	}
 	root = json_load_buffer_checked(buffer.data, buffer.len, error, length);
-	buffer_free(&buffer);
+	secret_buffer_free(&buffer);
 	if (root == NULL || !json_is_object(root)) {
 		json_decref(root);
 		set_error(error, length,
@@ -469,7 +471,7 @@ auth_save_internal(const char *path, const struct auth_session *session,
 	root = replace && read_file(path, &buffer) == 0
 	    ? json_loads(buffer.data, 0, NULL)
 	    : NULL;
-	buffer_free(&buffer);
+	secret_buffer_free(&buffer);
 	if (!json_is_object(root)) {
 		json_decref(root);
 		root = json_object();
@@ -502,7 +504,7 @@ auth_save_internal(const char *path, const struct auth_session *session,
 	result = replace ? write_private_file(path, text)
 			 : write_private_file_new(path, text);
 	if (result == -1) {
-		free(text);
+		secret_free(text);
 		if (!replace && errno == EEXIST)
 			set_error(error, length,
 			    "auth file appeared during login; credentials were not replaced");
@@ -511,7 +513,7 @@ auth_save_internal(const char *path, const struct auth_session *session,
 			    "could not write auth file: %s", strerror(errno));
 		return -1;
 	}
-	free(text);
+	secret_free(text);
 	return 0;
 }
 
@@ -708,16 +710,16 @@ token_response(const char *text, size_t text_length, int require_complete,
 		set_error(error, length, "could not record token refresh time");
 		goto fail;
 	}
-	free(session->access_token);
+	secret_free(session->access_token);
 	session->access_token = new_access_token;
 	new_access_token = NULL;
 	if (refresh_token != NULL) {
-		free(session->refresh_token);
+		secret_free(session->refresh_token);
 		session->refresh_token = new_refresh_token;
 		new_refresh_token = NULL;
 	}
 	if (id_token != NULL) {
-		free(session->id_token);
+		secret_free(session->id_token);
 		session->id_token = new_id_token;
 		new_id_token = NULL;
 	}
@@ -732,10 +734,10 @@ token_response(const char *text, size_t text_length, int require_complete,
 
 fail:
 	free(account);
-	free(new_access_token);
-	free(new_id_token);
+	secret_free(new_access_token);
+	secret_free(new_id_token);
 	free(new_last_refresh);
-	free(new_refresh_token);
+	secret_free(new_refresh_token);
 	json_decref(root);
 	return -1;
 }
@@ -773,17 +775,19 @@ auth_refresh_locked(const char *path, const char *client_id,
 	result =
 	    http_post_json(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
 		text, NULL, NULL, NULL, NULL, NULL, &response, error, length);
-	free(text);
+	secret_free(text);
 	if (result == -1)
 		return -1;
 	if (response.status < 200 || response.status >= 300) {
 		set_error(error, length, "token refresh failed with HTTP %ld",
 		    response.status);
+		secret_clear(response.body, response.body_length);
 		http_response_free(&response);
 		return -1;
 	}
 	result = token_response(response.body, response.body_length, 0, session,
 	    error, length);
+	secret_clear(response.body, response.body_length);
 	http_response_free(&response);
 	if (result == 0)
 		result = auth_save(path, session, error, length);
@@ -941,7 +945,7 @@ oauth_request_create(const char *issuer, const char *redirect_uri,
 		free(escaped_client);
 		free(escaped_redirect);
 		free(authorize_endpoint);
-		buffer_free(&url);
+		secret_buffer_free(&url);
 		oauth_request_free(request);
 		return -1;
 	}
@@ -963,9 +967,9 @@ oauth_request_create(const char *issuer, const char *redirect_uri,
 void
 oauth_request_free(struct oauth_request *request)
 {
-	free(request->authorization_url);
-	free(request->state);
-	free(request->code_verifier);
+	secret_free(request->authorization_url);
+	secret_free(request->state);
+	secret_free(request->code_verifier);
 	memset(request, 0, sizeof(*request));
 }
 
@@ -1040,15 +1044,16 @@ oauth_exchange_code_timeout(const char *code, const char *code_verifier,
 		result = token_response(response.body, response.body_length, 1,
 		    session, error, length);
 	}
+	secret_clear(response.body, response.body_length);
 	http_response_free(&response);
 
 done:
 	free(token_endpoint);
-	free(escaped_code);
+	secret_free(escaped_code);
 	free(escaped_client);
-	free(escaped_verifier);
+	secret_free(escaped_verifier);
 	free(escaped_redirect);
-	buffer_free(&body);
+	secret_buffer_free(&body);
 	return result;
 }
 
@@ -1357,6 +1362,7 @@ oauth_device_code_request(const char *issuer, const char *client_id,
 	if (response.status == 404) {
 		set_error(error, length,
 		    "device authorization is not enabled by this OpenAI account");
+		secret_clear(response.body, response.body_length);
 		http_response_free(&response);
 		goto fail;
 	}
@@ -1364,11 +1370,13 @@ oauth_device_code_request(const char *issuer, const char *client_id,
 		set_error(error, length,
 		    "device authorization request failed with HTTP %ld",
 		    response.status);
+		secret_clear(response.body, response.body_length);
 		http_response_free(&response);
 		goto fail;
 	}
 	root = json_load_buffer_checked(response.body, response.body_length,
 	    error, length);
+	secret_clear(response.body, response.body_length);
 	http_response_free(&response);
 	if (root == NULL)
 		goto fail;
@@ -1405,15 +1413,15 @@ oauth_device_code_request(const char *issuer, const char *client_id,
 	verification_url = NULL;
 	device->interval = interval;
 	free(endpoint);
-	free(body_text);
+	secret_free(body_text);
 	return 0;
 
 fail:
 	free(endpoint);
-	free(body_text);
+	secret_free(body_text);
 	free(verification_url);
-	free(device_auth_id);
-	free(user_code);
+	secret_free(device_auth_id);
+	secret_free(user_code);
 	oauth_device_code_free(device);
 	return -1;
 }
@@ -1423,8 +1431,8 @@ void
 oauth_device_code_free(struct oauth_device_code *device)
 {
 	free(device->verification_url);
-	free(device->user_code);
-	free(device->device_auth_id);
+	secret_free(device->user_code);
+	secret_free(device->device_auth_id);
 	memset(device, 0, sizeof(*device));
 }
 
@@ -1501,7 +1509,7 @@ oauth_device_code_poll(const char *issuer, const char *client_id,
 		result = http_post_json_timeout(endpoint, body_text, NULL, NULL,
 		    NULL, remaining, device_cancelled, &cancel_context,
 		    &response, error, length);
-		free(body_text);
+		secret_free(body_text);
 		if (result == -1) {
 			if (cancel != NULL && cancel(cancel_argument) != 0)
 				set_error(error, length,
@@ -1512,6 +1520,7 @@ oauth_device_code_poll(const char *issuer, const char *client_id,
 			break;
 		}
 		if (response.status == 403 || response.status == 404) {
+			secret_clear(response.body, response.body_length);
 			http_response_free(&response);
 			if (device_wait(device->deadline_ms, device->interval,
 				cancel, cancel_argument, error, length) == -1) {
@@ -1524,12 +1533,14 @@ oauth_device_code_poll(const char *issuer, const char *client_id,
 			set_error(error, length,
 			    "device authorization polling failed with HTTP %ld",
 			    response.status);
+			secret_clear(response.body, response.body_length);
 			http_response_free(&response);
 			result = -1;
 			break;
 		}
 		root = json_load_buffer_checked(response.body,
 		    response.body_length, error, length);
+		secret_clear(response.body, response.body_length);
 		http_response_free(&response);
 		if (root == NULL) {
 			result = -1;

@@ -5,6 +5,7 @@ oaioauthc_SOURCES = \
 	app.c \
 	daemon.c daemon.h \
 	auth.c auth.h \
+	secret.c secret.h \
 	http.c http.h \
 	images.c images.h \
 	json.c json.h \

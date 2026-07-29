@@ -325,6 +325,9 @@ main(void)
 	CHECK(strcmp(session.access_token, "access") == 0);
 	CHECK(strcmp(session.account_id, "acct_1") == 0);
 	auth_session_free(&session);
+	CHECK(session.access_token == NULL && session.refresh_token == NULL &&
+	    session.id_token == NULL && session.account_id == NULL &&
+	    session.last_refresh == NULL);
 	CHECK(write_private_file(path,
 		  "{\"tokens\":{\"access_token\":\"header."
 		  "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9"
@@ -348,6 +351,8 @@ main(void)
 	    NULL);
 	CHECK(request.state != NULL && request.code_verifier != NULL);
 	oauth_request_free(&request);
+	CHECK(request.authorization_url == NULL && request.state == NULL &&
+	    request.code_verifier == NULL);
 	CHECK(test_refresh_serialization() == 0);
 	(void)unlink(path);
 	return 0;

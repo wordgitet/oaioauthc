@@ -26,6 +26,7 @@
 **/*.o
 /src/oaioauthc
 /tests/test_auth
+/tests/test_secret
 /tests/test_daemon
 /tests/test_images
 /tests/test_json
