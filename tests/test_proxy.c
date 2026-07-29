@@ -158,6 +158,59 @@ send_mock_response(int fd, const char *content_type, const char *body)
 	return write_all(fd, body, strlen(body));
 }
 
+/* Write an upstream error response while retaining the mock's fixed framing. */
+static int
+send_mock_error(int fd, int status, const char *body)
+{
+	char header[256];
+	int  length;
+
+	length = snprintf(header, sizeof(header),
+	    "HTTP/1.1 %d Test\r\nContent-Type: application/json\r\n"
+	    "Content-Length: %zu\r\nConnection: close\r\n\r\n", status,
+	    strlen(body));
+	if (length < 0 || (size_t)length >= sizeof(header))
+		return (-1);
+	if (write_all(fd, header, (size_t)length) == -1)
+		return (-1);
+	return (write_all(fd, body, strlen(body)));
+}
+
+/* Emit deliberately awkward SSE fragments to exercise transport boundaries. */
+static int
+send_mock_stream(int fd, const char *body)
+{
+	static const size_t fragments[] = { 1, 7, 3, 19 };
+	struct timespec     delay;
+	char		 header[256];
+	int		 length;
+	size_t		 index;
+	size_t		 offset;
+	size_t		 fragment;
+
+	length = snprintf(header, sizeof(header),
+	    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+	    "Content-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+	if (length < 0 || (size_t)length >= sizeof(header) ||
+	    write_all(fd, header, (size_t)length) == -1)
+		return (-1);
+	delay.tv_sec = 0;
+	delay.tv_nsec = 1000000;
+	offset = 0;
+	index = 0;
+	while (offset < strlen(body)) {
+		fragment = fragments[index++ %
+		    (sizeof(fragments) / sizeof(fragments[0]))];
+		if (fragment > strlen(body) - offset)
+			fragment = strlen(body) - offset;
+		if (write_all(fd, body + offset, fragment) == -1)
+			return (-1);
+		offset += fragment;
+		(void)nanosleep(&delay, NULL);
+	}
+	return (0);
+}
+
 /*
 ** Run the deterministic Codex stand-in until the parent terminates it.
 **
@@ -187,6 +240,14 @@ run_mock_upstream(const char *port, int ready_fd)
 	static const char image[] =
 	    "{\"created\":1,\"data\":[{\"b64_json\":\"AQID\"}],"
 	    "\"usage\":{\"total_tokens\":5}}";
+	static const char truncated_events[] =
+	    "data: {\"type\":\"response.created\",\"response\":{\"id\":"
+	    "\"resp_truncated\"}}\n\n"
+	    "data: {\"type\":\"response.output_text.delta\","
+	    "\"delta\":\"incomplete\"}\n\n";
+	static const char upstream_error[] =
+	    "{\"error\":{\"message\":\"mock upstream rejected request\","
+	    "\"type\":\"rate_limit_error\"}}";
 	char request[32768];
 	char ready;
 	int  client_fd;
@@ -208,9 +269,21 @@ run_mock_upstream(const char *port, int ready_fd)
 			if (strncmp(request, "GET /models?", 12) == 0)
 				(void)send_mock_response(client_fd,
 				    "application/json", models);
-			else if (strncmp(request, "POST /responses ", 16) == 0)
-				(void)send_mock_response(client_fd,
-				    "text/event-stream", events);
+			else if (strncmp(request, "POST /responses ", 16) == 0) {
+				if (strstr(request, "please fail upstream") != NULL)
+					(void)send_mock_error(client_fd, 429, upstream_error);
+				else if (strstr(request, "please truncate upstream") !=
+				    NULL)
+					(void)send_mock_stream(client_fd, truncated_events);
+				else if (strstr(request, "continue") != NULL &&
+				    (strstr(request, "\"type\":\"output_text\"") ==
+				    NULL || strstr(request, "\"text\":\"hello\"") ==
+				    NULL))
+					(void)send_mock_error(client_fd, 500,
+					    "{\"error\":\"assistant history was not normalized\"}");
+				else
+					(void)send_mock_stream(client_fd, events);
+			}
 			else if (strncmp(request, "POST /images/generations ",
 				     25) == 0 &&
 			    strstr(request, "\"model\":\"image-model\"") !=
@@ -458,6 +531,15 @@ main(void)
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
 	REQUIRE(strstr(response, "\"reasoning_tokens\":1") != NULL);
 	REQUIRE(strstr(response, "data: [DONE]") != NULL);
+	REQUIRE(request_json(port, "/v1/responses",
+	    "{\"model\":\"gpt-test\",\"input\":\"please fail upstream\"}",
+	    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "429 Error") != NULL);
+	REQUIRE(strstr(response, "mock upstream rejected request") != NULL);
+	REQUIRE(request_json(port, "/v1/responses",
+	    "{\"model\":\"gpt-test\",\"input\":\"please truncate upstream\"}",
+	    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "502 Error") != NULL);
 	REQUIRE(request_json(port, "/v1/images/generations",
 		    "{\"model\":\"image-model\",\"prompt\":\"draw a square\","
 		    "\"response_format\":\"b64_json\",\"ignored\":true}",
