@@ -11,6 +11,7 @@
 #define OAIOAUTHC_AUTH_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
 ** Credentials and routing metadata loaded from Codex auth.json.
@@ -39,12 +40,31 @@ struct oauth_request {
 	char *code_verifier;
 };
 
+/*
+** The short-lived values returned by the headless device authorization
+** endpoint.  The server supplies the device-auth id and user code, while this
+** structure owns their copied allocations.  Neither is a bearer credential,
+** but both are still released promptly after polling.  interval is the
+** server's suggested delay between pending polls in seconds.  deadline_ms is
+** an internal monotonic deadline shared by the request and polling phases.
+*/
+struct oauth_device_code {
+	char	     *verification_url;
+	char	     *user_code;
+	char	     *device_auth_id;
+	int64_t	      deadline_ms;
+	unsigned long interval;
+};
+
 /* Return non-zero when a synchronous OAuth transfer should be cancelled. */
 typedef int (*oauth_cancel_callback)(void *);
 
 /* Return the cached default CODEX_HOME/auth.json or ~/.codex/auth.json path. */
 const char *
 auth_default_file(void);
+/* Return the default OpenAI OAuth issuer used by browser and device login. */
+const char *
+oauth_default_issuer(void);
 /* Release every auth_session allocation and reset all members to NULL. */
 void
 auth_session_free(struct auth_session *);
@@ -66,15 +86,27 @@ auth_refresh(const char *, const char *, const char *, struct auth_session *,
     char *, size_t);
 /* Build a PKCE authorization request; request owns all outputs on success. */
 int
-oauth_request_create(const char *, const char *, struct oauth_request *, char *,
-    size_t);
+oauth_request_create(const char *, const char *, const char *,
+    struct oauth_request *, char *, size_t);
 /* Release all oauth_request allocations and reset its members. */
 void
 oauth_request_free(struct oauth_request *);
-/* Exchange one state-validated code; session owns credentials on success. */
+/* Exchange one validated authorization code; session owns credentials. */
 int
 oauth_exchange_code(const char *, const char *, const char *, const char *,
-    const char *, oauth_cancel_callback, void *, struct auth_session *, char *,
-    size_t);
+    const char *, const char *, oauth_cancel_callback, void *,
+    struct auth_session *, char *, size_t);
+/* Request a short-lived device code from an issuer. */
+int
+oauth_device_code_request(const char *, const char *, int,
+    oauth_cancel_callback, void *, struct oauth_device_code *, char *, size_t);
+/* Release every device-code allocation and reset it for safe reuse. */
+void
+oauth_device_code_free(struct oauth_device_code *);
+/* Poll a device code, exchange its authorization code, and fill session. */
+int
+oauth_device_code_poll(const char *, const char *, const char *,
+    const struct oauth_device_code *, oauth_cancel_callback, void *,
+    struct auth_session *, char *, size_t);
 
 #endif
