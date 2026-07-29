@@ -15,12 +15,21 @@
 int
 main(void)
 {
-	char	error[256];
-	json_t *request;
-	json_t *chat;
-	json_t *converted;
-	json_t *model;
-	int	use_lite;
+	static const char binary_json[] = "{}\0{}";
+	char		  error[256];
+	json_t		 *request;
+	json_t		 *chat;
+	json_t		 *converted;
+	json_t		 *model;
+	int		  use_lite;
+
+	request = json_load_buffer_checked(binary_json, sizeof(binary_json) - 1,
+	    error, sizeof(error));
+	CHECK(request == NULL);
+	request =
+	    json_load_buffer_checked(binary_json, 2, error, sizeof(error));
+	CHECK(request != NULL);
+	json_decref(request);
 
 	request = json_load_string_checked(
 	    "{\"model\":\"gpt-5.2\",\"input\":\"Hello\","
