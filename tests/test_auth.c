@@ -342,8 +342,8 @@ main(void)
 	CHECK(auth_session_needs_refresh(&session) == 1);
 	auth_session_free(&session);
 	memset(&request, 0, sizeof(request));
-	CHECK(oauth_request_create("http://localhost:1455/auth/callback", NULL,
-		  &request, error, sizeof(error)) == 0);
+	CHECK(oauth_request_create(NULL, "http://localhost:1455/auth/callback",
+		  NULL, &request, error, sizeof(error)) == 0);
 	CHECK(strstr(request.authorization_url, "code_challenge_method=S256") !=
 	    NULL);
 	CHECK(request.state != NULL && request.code_verifier != NULL);
