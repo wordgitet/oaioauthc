@@ -18,6 +18,9 @@ json_dump_compact(json_t *);
 /* Parse an owned-reference JSON value or provide a readable parse error. */
 json_t *
 json_load_string_checked(const char *, char *, size_t);
+/* Parse an exact-length JSON buffer without accepting an embedded-NUL prefix. */
+json_t *
+json_load_buffer_checked(const void *, size_t, char *, size_t);
 /* Construct the local error envelope used for proxy-generated failures. */
 json_t *
 json_error_object(const char *, const char *, int);
