@@ -569,35 +569,26 @@ read_request(int fd, struct request *request)
 	while ((header_end = buffer.data == NULL
 		       ? NULL
 		       : strstr(buffer.data, "\r\n\r\n")) == NULL) {
-		if (read_more(fd, &buffer, MAX_HEADER_SIZE) == -1) {
-			buffer_free(&buffer);
-			return -1;
-		}
+		if (read_more(fd, &buffer, MAX_HEADER_SIZE) == -1)
+			goto fail;
 	}
 	body_offset = (size_t)(header_end - buffer.data) + 4;
 	*header_end = '\0';
 	line = buffer.data;
 	line_end = strstr(line, "\r\n");
-	if (line_end == NULL) {
-		buffer_free(&buffer);
-		return -1;
-	}
+	if (line_end == NULL)
+		goto fail;
 	*line_end = '\0';
 	method = strtok(line, " ");
 	path = strtok(NULL, " ");
 	version = strtok(NULL, " ");
 	if (method == NULL || path == NULL || version == NULL ||
-	    strcmp(version, "HTTP/1.1") != 0) {
-		buffer_free(&buffer);
-		return -1;
-	}
+	    strcmp(version, "HTTP/1.1") != 0)
+		goto fail;
 	request->method = oaio_strdup(method);
 	request->path = oaio_strdup(path);
-	if (request->method == NULL || request->path == NULL) {
-		request_free(request);
-		buffer_free(&buffer);
-		return -1;
-	}
+	if (request->method == NULL || request->path == NULL)
+		goto fail;
 	query = strchr(request->path, '?');
 	if (query != NULL)
 		*query = '\0';
@@ -616,11 +607,8 @@ read_request(int fd, struct request *request)
 			*line_end = '\0';
 		}
 		colon = strchr(header, ':');
-		if (colon == NULL || colon == header) {
-			request_free(request);
-			buffer_free(&buffer);
-			return -1;
-		}
+		if (colon == NULL || colon == header)
+			goto fail;
 		*colon = '\0';
 		value = colon + 1;
 		while (*value == ' ' || *value == '\t')
@@ -631,84 +619,54 @@ read_request(int fd, struct request *request)
 			*--value_end = '\0';
 		if (strcasecmp(header, "Content-Length") == 0) {
 			if (parse_content_length(value, &parsed_length) == -1 ||
-			    (has_content_length && parsed_length != length)) {
-				request_free(request);
-				buffer_free(&buffer);
-				return -1;
-			}
+			    (has_content_length && parsed_length != length))
+				goto fail;
 			length = parsed_length;
 			has_content_length = 1;
 		} else if (strcasecmp(header, "Transfer-Encoding") == 0) {
 			chunked = strcasecmp(value, "chunked") == 0;
-			if (!chunked) {
-				request_free(request);
-				buffer_free(&buffer);
-				return -1;
-			}
+			if (!chunked)
+				goto fail;
 		} else if (strcasecmp(header, "Expect") == 0) {
 			expect_continue = strcasecmp(value, "100-continue") ==
 			    0;
-			if (!expect_continue) {
-				request_free(request);
-				buffer_free(&buffer);
-				return -1;
-			}
+			if (!expect_continue)
+				goto fail;
 		} else if (strcasecmp(header, "Content-Type") == 0) {
 			if (request->content_type != NULL &&
-			    strcasecmp(request->content_type, value) != 0) {
-				request_free(request);
-				buffer_free(&buffer);
-				return -1;
-			}
+			    strcasecmp(request->content_type, value) != 0)
+				goto fail;
 			if (request->content_type == NULL) {
 				request->content_type = oaio_strdup(value);
-				if (request->content_type == NULL) {
-					request_free(request);
-					buffer_free(&buffer);
-					return -1;
-				}
+				if (request->content_type == NULL)
+					goto fail;
 			}
 		}
 		if (last_header)
 			break;
 		header = line_end + 2;
 	}
-	if (chunked && has_content_length) {
-		request_free(request);
-		buffer_free(&buffer);
-		return -1;
-	}
+	if (chunked && has_content_length)
+		goto fail;
 	body_limit = strcmp(request->path, "/v1/images/edits") == 0
 	    ? IMAGE_MAX_EDIT_BODY
 	    : MAX_REQUEST_SIZE;
-	if (length > body_limit || body_offset > (size_t)-1 - body_limit) {
-		request_free(request);
-		buffer_free(&buffer);
-		return -1;
-	}
+	if (length > body_limit || body_offset > (size_t)-1 - body_limit)
+		goto fail;
 	raw_limit = body_offset + body_limit;
 	if (expect_continue &&
-	    write_all(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25) == -1) {
-		request_free(request);
-		buffer_free(&buffer);
-		return -1;
-	}
+	    write_all(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25) == -1)
+		goto fail;
 	if (chunked) {
 		if (read_chunked_body(fd, &buffer, body_offset, body_limit,
-			raw_limit, request) == -1) {
-			request_free(request);
-			buffer_free(&buffer);
-			return -1;
-		}
+			raw_limit, request) == -1)
+			goto fail;
 		buffer_free(&buffer);
 		return 0;
 	}
 	request->body = malloc(length + 1);
-	if (request->body == NULL) {
-		request_free(request);
-		buffer_free(&buffer);
-		return -1;
-	}
+	if (request->body == NULL)
+		goto fail;
 	copied = buffer.len - body_offset;
 	if (copied > length)
 		copied = length;
@@ -718,17 +676,19 @@ read_request(int fd, struct request *request)
 			count =
 			    read(fd, request->body + copied, length - copied);
 		} while (count == -1 && errno == EINTR);
-		if (count <= 0) {
-			request_free(request);
-			buffer_free(&buffer);
-			return -1;
-		}
+		if (count <= 0)
+			goto fail;
 		copied += (size_t)count;
 	}
 	request->body[length] = '\0';
 	request->body_length = length;
 	buffer_free(&buffer);
 	return 0;
+
+fail:
+	request_free(request);
+	buffer_free(&buffer);
+	return -1;
 }
 
 /* Join configured upstream base URL and endpoint suffix into an owned URL. */
