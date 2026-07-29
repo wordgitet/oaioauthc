@@ -6,6 +6,8 @@
 ** credentials without discarding unknown Codex fields, and derives an account
 ** id from a JWT claim when the token response does not name one explicitly.
 ** The account id is routing metadata required by the Codex backend.
+** It also implements the issuer-aware browser PKCE request and the Codex
+** headless device-code request, polling, and final token exchange.
 **
 ** auth_session and oauth_request own all of their string members.  Creation
 ** and load functions transfer those allocations to the caller; the matching
@@ -22,9 +24,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
+#include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,10 +41,39 @@
 #include "json.h"
 #include "util.h"
 
-#define DEFAULT_CLIENT_ID "app_EMoamEEZ73f0CkXaXp7hrann"
-#define DEFAULT_ISSUER	  "https://auth.openai.com"
-#define DEFAULT_TOKEN_URL "https://auth.openai.com/oauth/token"
-#define REFRESH_INTERVAL  3300
+#define DEFAULT_CLIENT_ID    "app_EMoamEEZ73f0CkXaXp7hrann"
+#define DEFAULT_ISSUER	     "https://auth.openai.com"
+#define DEFAULT_TOKEN_URL    "https://auth.openai.com/oauth/token"
+#define ACCOUNT_ID_MAX	     4096
+#define DEVICE_AUTH_ID_MAX   4096
+#define DEVICE_CODE_MAX	     8192
+#define DEVICE_USER_CODE_MAX 64
+#define OAUTH_TOKEN_MAX	     (1024 * 1024)
+#define REFRESH_INTERVAL     3300
+
+/* Join an issuer root to a protocol path without producing a double slash. */
+static char *
+issuer_endpoint(const char *issuer, const char *path)
+{
+	const char *base;
+	size_t	    base_length;
+	size_t	    path_length;
+	char	   *result;
+
+	base = issuer == NULL || issuer[0] == '\0' ? DEFAULT_ISSUER : issuer;
+	base_length = strlen(base);
+	while (base_length > 0 && base[base_length - 1] == '/')
+		base_length--;
+	path_length = strlen(path);
+	if (base_length > (size_t)-1 - path_length - 1)
+		return NULL;
+	result = malloc(base_length + path_length + 1);
+	if (result == NULL)
+		return NULL;
+	memcpy(result, base, base_length);
+	memcpy(result + base_length, path, path_length + 1);
+	return result;
+}
 
 /* Format an optional caller-owned diagnostic buffer without allocating. */
 static void
@@ -52,6 +86,30 @@ set_error(char *error, size_t length, const char *format, ...)
 	va_start(ap, format);
 	(void)vsnprintf(error, length, format, ap);
 	va_end(ap);
+}
+
+/*
+** Borrow one non-empty JSON string only when every byte is visible to C APIs.
+**
+** Jansson strings can contain embedded NUL bytes.  Rejecting those values
+** prevents validation, logging, or form encoding from seeing a shorter string
+** than the JSON parser accepted.  The size cap also bounds later copies.
+*/
+static int
+json_bounded_string(json_t *value, size_t maximum, const char **text)
+{
+	const char *string;
+	size_t	    string_length;
+
+	string = json_string_value(value);
+	if (string == NULL)
+		return -1;
+	string_length = json_string_length(value);
+	if (string_length == 0 || string_length > maximum ||
+	    strlen(string) != string_length)
+		return -1;
+	*text = string;
+	return 0;
 }
 
 /*
@@ -80,6 +138,26 @@ base64url(const unsigned char *data, size_t length)
 	}
 	encoded[strcspn(encoded, "=")] = '\0';
 	return encoded;
+}
+
+/* Verify that a device response did not pair a code with the wrong verifier. */
+static int
+device_pkce_matches(const char *code_verifier, const char *code_challenge)
+{
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int  digest_length;
+	char	     *computed;
+	int	      result;
+
+	if (EVP_Digest(code_verifier, strlen(code_verifier), digest,
+		&digest_length, EVP_sha256(), NULL) != 1)
+		return -1;
+	computed = base64url(digest, digest_length);
+	if (computed == NULL)
+		return -1;
+	result = strcmp(computed, code_challenge) == 0 ? 0 : -1;
+	free(computed);
+	return result;
 }
 
 /* Obtain cryptographically random bytes, then return their Base64url form. */
@@ -292,6 +370,13 @@ auth_default_file(void)
 	return path;
 }
 
+/* Expose the stable issuer default without duplicating it in the CLI. */
+const char *
+oauth_default_issuer(void)
+{
+	return DEFAULT_ISSUER;
+}
+
 /* Release every credential string and zero the session for safe reuse. */
 void
 auth_session_free(struct auth_session *session)
@@ -329,7 +414,7 @@ auth_load(const char *path, struct auth_session *session, char *error,
 		    strerror(errno));
 		return -1;
 	}
-	root = json_load_string_checked(buffer.data, error, length);
+	root = json_load_buffer_checked(buffer.data, buffer.len, error, length);
 	buffer_free(&buffer);
 	if (root == NULL || !json_is_object(root)) {
 		json_decref(root);
@@ -535,10 +620,11 @@ check_last_refresh:
 ** fallback order as auth_load.  session remains caller-owned on all paths.
 */
 static int
-token_response(const char *text, struct auth_session *session, char *error,
-    size_t length)
+token_response(const char *text, size_t text_length, int require_complete,
+    struct auth_session *session, char *error, size_t length)
 {
 	json_t	   *root;
+	json_t	   *field;
 	const char *access_token;
 	const char *account_id;
 	const char *id_token;
@@ -554,19 +640,40 @@ token_response(const char *text, struct auth_session *session, char *error,
 	new_id_token = NULL;
 	new_last_refresh = NULL;
 	new_refresh_token = NULL;
-	root = json_load_string_checked(text, error, length);
+	root = json_load_buffer_checked(text, text_length, error, length);
 	if (root == NULL)
 		return -1;
-	access_token = json_string_value(json_object_get(root, "access_token"));
-	if (access_token == NULL) {
-		set_error(error, length, "token response has no access_token");
+	field = json_object_get(root, "access_token");
+	if (json_bounded_string(field, OAUTH_TOKEN_MAX, &access_token) == -1) {
+		set_error(error, length,
+		    "token response has no usable access_token");
 		goto fail;
 	}
 	new_access_token = oaio_strdup(access_token);
-	refresh_token = json_string_value(json_object_get(root, "refresh_token"));
+	field = json_object_get(root, "refresh_token");
+	refresh_token = NULL;
+	if (field != NULL &&
+	    json_bounded_string(field, OAUTH_TOKEN_MAX, &refresh_token) == -1) {
+		set_error(error, length,
+		    "token response has invalid refresh_token");
+		goto fail;
+	}
+	field = json_object_get(root, "id_token");
+	id_token = NULL;
+	if (field != NULL &&
+	    json_bounded_string(field, OAUTH_TOKEN_MAX, &id_token) == -1) {
+		set_error(error, length, "token response has invalid id_token");
+		goto fail;
+	}
+	if (require_complete &&
+	    (refresh_token == NULL || refresh_token[0] == '\0' ||
+		id_token == NULL || id_token[0] == '\0')) {
+		set_error(error, length,
+		    "token response is missing initial OAuth credentials");
+		goto fail;
+	}
 	if (refresh_token != NULL)
 		new_refresh_token = oaio_strdup(refresh_token);
-	id_token = json_string_value(json_object_get(root, "id_token"));
 	if (id_token != NULL)
 		new_id_token = oaio_strdup(id_token);
 	if (new_access_token == NULL ||
@@ -575,9 +682,17 @@ token_response(const char *text, struct auth_session *session, char *error,
 		set_error(error, length, "could not allocate token response");
 		goto fail;
 	}
-	account_id = json_string_value(json_object_get(root, "account_id"));
+	field = json_object_get(root, "account_id");
+	account_id = NULL;
+	if (field != NULL &&
+	    json_bounded_string(field, ACCOUNT_ID_MAX, &account_id) == -1) {
+		set_error(error, length,
+		    "token response has invalid account_id");
+		goto fail;
+	}
 	account = account_id == NULL
-	    ? jwt_account_id(id_token == NULL ? session->id_token : new_id_token)
+	    ? jwt_account_id(
+		  id_token == NULL ? session->id_token : new_id_token)
 	    : oaio_strdup(account_id);
 	if (account == NULL)
 		account = jwt_account_id(new_access_token);
@@ -657,7 +772,7 @@ auth_refresh_locked(const char *path, const char *client_id,
 		return -1;
 	result =
 	    http_post_json(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-		text, NULL, NULL, NULL, &response, error, length);
+		text, NULL, NULL, NULL, NULL, NULL, &response, error, length);
 	free(text);
 	if (result == -1)
 		return -1;
@@ -667,7 +782,8 @@ auth_refresh_locked(const char *path, const char *client_id,
 		http_response_free(&response);
 		return -1;
 	}
-	result = token_response(response.body, session, error, length);
+	result = token_response(response.body, response.body_length, 0, session,
+	    error, length);
 	http_response_free(&response);
 	if (result == 0)
 		result = auth_save(path, session, error, length);
@@ -758,8 +874,8 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 			    session, error, length);
 	}
 	if (close(lock_fd) == -1 && result == 0) {
-		set_error(error, length, "could not release auth refresh lock: %s",
-		    strerror(errno));
+		set_error(error, length,
+		    "could not release auth refresh lock: %s", strerror(errno));
 		return -1;
 	}
 	return (result);
@@ -772,13 +888,16 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 ** are owned by the caller.  Failure leaves request safe for oauth_request_free.
 */
 int
-oauth_request_create(const char *redirect_uri, const char *client_id,
-    struct oauth_request *request, char *error, size_t length)
+oauth_request_create(const char *issuer, const char *redirect_uri,
+    const char *client_id, struct oauth_request *request, char *error,
+    size_t length)
 {
 	unsigned char digest[EVP_MAX_MD_SIZE];
 	unsigned int  digest_length;
 	char	     *challenge;
+	char	     *escaped_client;
 	char	     *escaped_redirect;
+	char	     *authorize_endpoint;
 	struct buffer url;
 
 	/* state prevents callback substitution; S256 binds the code to this client. */
@@ -793,14 +912,17 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 		return -1;
 	}
 	challenge = base64url(digest, digest_length);
+	escaped_client = http_form_encode(
+	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
 	escaped_redirect = http_form_encode(redirect_uri);
+	authorize_endpoint = issuer_endpoint(issuer, "/oauth/authorize");
 	buffer_init(&url);
-	if (challenge == NULL || escaped_redirect == NULL ||
-	    buffer_append_string(&url,
-		DEFAULT_ISSUER
-		"/oauth/authorize?response_type=code&client_id=") == -1 ||
-	    buffer_append_string(&url,
-		client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
+	if (challenge == NULL || escaped_client == NULL ||
+	    escaped_redirect == NULL || authorize_endpoint == NULL ||
+	    buffer_append_string(&url, authorize_endpoint) == -1 ||
+	    buffer_append_string(&url, "?response_type=code&client_id=") ==
+		-1 ||
+	    buffer_append_string(&url, escaped_client) == -1 ||
 	    buffer_append_string(&url, "&redirect_uri=") == -1 ||
 	    buffer_append_string(&url, escaped_redirect) == -1 ||
 	    buffer_append_string(&url,
@@ -813,15 +935,27 @@ oauth_request_create(const char *redirect_uri, const char *client_id,
 		"&code_challenge_method=S256"
 		"&id_token_add_organizations=true"
 		"&codex_cli_simplified_flow=true") == -1) {
+		set_error(error, length,
+		    "could not build OAuth authorization URL");
 		free(challenge);
+		free(escaped_client);
 		free(escaped_redirect);
+		free(authorize_endpoint);
 		buffer_free(&url);
 		oauth_request_free(request);
 		return -1;
 	}
 	free(challenge);
+	free(escaped_client);
 	free(escaped_redirect);
+	free(authorize_endpoint);
 	request->authorization_url = buffer_steal(&url);
+	if (request->authorization_url == NULL) {
+		set_error(error, length,
+		    "could not allocate OAuth authorization URL");
+		oauth_request_free(request);
+		return -1;
+	}
 	return 0;
 }
 
@@ -836,52 +970,66 @@ oauth_request_free(struct oauth_request *request)
 }
 
 /*
-** Exchange the validated authorization code for OAuth credentials.
+** Exchange a validated authorization code within an optional transfer budget.
 **
 ** Every form value is encoded independently before assembly.  This function
 ** only updates session after a 2xx token response passes token_response; it
 ** deliberately does not save auth.json because the interactive caller chooses
 ** the destination path after the exchange succeeds.
 */
-int
-oauth_exchange_code(const char *code, const char *code_verifier,
-    const char *redirect_uri, const char *client_id, const char *token_url,
-    oauth_cancel_callback cancel, void *cancel_argument,
-    struct auth_session *session, char *error, size_t length)
+static int
+oauth_exchange_code_timeout(const char *code, const char *code_verifier,
+    const char *redirect_uri, const char *client_id, const char *issuer,
+    const char *token_url, int timeout_ms, oauth_cancel_callback cancel,
+    void *cancel_argument, struct auth_session *session, char *error,
+    size_t length)
 {
 	char		    *escaped_code;
+	char		    *escaped_client;
 	char		    *escaped_verifier;
 	char		    *escaped_redirect;
+	char		    *token_endpoint;
 	struct buffer	     body;
 	struct http_response response;
 	int		     result;
 
 	result = -1;
 	buffer_init(&body);
+	token_endpoint = NULL;
 	escaped_code = http_form_encode(code);
+	escaped_client = http_form_encode(
+	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
 	escaped_verifier = http_form_encode(code_verifier);
 	escaped_redirect = http_form_encode(redirect_uri);
-	if (escaped_code == NULL || escaped_verifier == NULL ||
-	    escaped_redirect == NULL) {
-		set_error(error, length, "could not encode OAuth token request");
+	if (escaped_code == NULL || escaped_client == NULL ||
+	    escaped_verifier == NULL || escaped_redirect == NULL) {
+		set_error(error, length,
+		    "could not encode OAuth token request");
 		goto done;
 	}
 	if (buffer_append_string(&body,
-	    "grant_type=authorization_code&code=") == -1 ||
+		"grant_type=authorization_code&code=") == -1 ||
 	    buffer_append_string(&body, escaped_code) == -1 ||
 	    buffer_append_string(&body, "&redirect_uri=") == -1 ||
 	    buffer_append_string(&body, escaped_redirect) == -1 ||
 	    buffer_append_string(&body, "&client_id=") == -1 ||
-	    buffer_append_string(&body,
-		client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
+	    buffer_append_string(&body, escaped_client) == -1 ||
 	    buffer_append_string(&body, "&code_verifier=") == -1 ||
 	    buffer_append_string(&body, escaped_verifier) == -1) {
 		set_error(error, length, "could not build OAuth token request");
 		goto done;
 	}
-	result =
-	    http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
-		body.data, cancel, cancel_argument, &response, error, length);
+	if (token_url == NULL) {
+		token_endpoint = issuer_endpoint(issuer, "/oauth/token");
+		if (token_endpoint == NULL) {
+			set_error(error, length,
+			    "could not allocate OAuth token endpoint");
+			goto done;
+		}
+	}
+	result = http_post_form_timeout(
+	    token_url == NULL ? token_endpoint : token_url, body.data,
+	    timeout_ms, cancel, cancel_argument, &response, error, length);
 	if (result == -1)
 		goto done;
 	if (response.status < 200 || response.status >= 300) {
@@ -889,14 +1037,557 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 		    response.status);
 		result = -1;
 	} else {
-		result = token_response(response.body, session, error, length);
+		result = token_response(response.body, response.body_length, 1,
+		    session, error, length);
 	}
 	http_response_free(&response);
 
 done:
+	free(token_endpoint);
 	free(escaped_code);
+	free(escaped_client);
 	free(escaped_verifier);
 	free(escaped_redirect);
 	buffer_free(&body);
+	return result;
+}
+
+/* Exchange a browser authorization code without imposing a new HTTP deadline. */
+int
+oauth_exchange_code(const char *code, const char *code_verifier,
+    const char *redirect_uri, const char *client_id, const char *issuer,
+    const char *token_url, oauth_cancel_callback cancel, void *cancel_argument,
+    struct auth_session *session, char *error, size_t length)
+{
+	return oauth_exchange_code_timeout(code, code_verifier, redirect_uri,
+	    client_id, issuer, token_url, 0, cancel, cancel_argument, session,
+	    error, length);
+}
+
+/* Parse the decimal polling interval supplied by the device endpoint. */
+static int
+parse_device_interval(json_t *value, unsigned long *interval)
+{
+	const unsigned char *cursor;
+	const char	    *text;
+	json_int_t	     integer;
+	size_t		     text_length;
+	unsigned long	     digit;
+	unsigned long	     parsed;
+
+	if (json_is_integer(value)) {
+		integer = json_integer_value(value);
+		if (integer < 0 || (uintmax_t)integer > ULONG_MAX)
+			return -1;
+		*interval = (unsigned long)integer;
+		return 0;
+	}
+	text = json_string_value(value);
+	if (text == NULL || text[0] == '\0')
+		return -1;
+	text_length = json_string_length(value);
+	if (text_length > 64 || strlen(text) != text_length)
+		return -1;
+	parsed = 0;
+	cursor = (const unsigned char *)text;
+	while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
+	    *cursor == '\n' || *cursor == '\f' || *cursor == '\v')
+		cursor++;
+	if (*cursor == '\0')
+		return -1;
+	for (; *cursor >= '0' && *cursor <= '9'; cursor++) {
+		digit = (unsigned long)(*cursor - '0');
+		if (parsed > (ULONG_MAX - digit) / 10)
+			return -1;
+		parsed = parsed * 10 + digit;
+	}
+	while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
+	    *cursor == '\n' || *cursor == '\f' || *cursor == '\v')
+		cursor++;
+	if (*cursor != '\0')
+		return -1;
+	*interval = parsed;
+	return 0;
+}
+
+/* Accept only the printable alphabet used by OpenAI one-time device codes. */
+static int
+device_user_code_valid(const char *code)
+{
+	const unsigned char *cursor;
+
+	for (cursor = (const unsigned char *)code; *cursor != '\0'; cursor++) {
+		if ((*cursor >= 'A' && *cursor <= 'Z') ||
+		    (*cursor >= 'a' && *cursor <= 'z') ||
+		    (*cursor >= '0' && *cursor <= '9') || *cursor == '-')
+			continue;
+		return 0;
+	}
+	return 1;
+}
+
+/* Enforce the RFC 7636 verifier alphabet and length before token exchange. */
+static int
+device_verifier_valid(const char *verifier)
+{
+	const unsigned char *cursor;
+	size_t		     verifier_length;
+
+	verifier_length = strlen(verifier);
+	if (verifier_length < 43 || verifier_length > 128)
+		return 0;
+	for (cursor = (const unsigned char *)verifier; *cursor != '\0';
+	    cursor++) {
+		if ((*cursor >= 'A' && *cursor <= 'Z') ||
+		    (*cursor >= 'a' && *cursor <= 'z') ||
+		    (*cursor >= '0' && *cursor <= '9') || *cursor == '-' ||
+		    *cursor == '.' || *cursor == '_' || *cursor == '~')
+			continue;
+		return 0;
+	}
+	return 1;
+}
+
+/* Return the current monotonic clock in milliseconds for deadline arithmetic. */
+static int64_t
+monotonic_ms(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+		return -1;
+	if (now.tv_sec < 0 || (uintmax_t)now.tv_sec > INT64_MAX / 1000) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* Return a bounded number of milliseconds before an absolute deadline. */
+static int
+device_remaining_ms(int64_t deadline_ms)
+{
+	int64_t now;
+	int64_t remaining;
+
+	now = monotonic_ms();
+	if (now == -1)
+		return -1;
+	remaining = deadline_ms - now;
+	if (remaining <= 0)
+		return 0;
+	if (remaining > INT_MAX)
+		return INT_MAX;
+	return (int)remaining;
+}
+
+/* State shared by curl progress callbacks during one bounded device login. */
+struct device_cancel_context {
+	oauth_cancel_callback callback;
+	void		     *argument;
+	int64_t		      deadline_ms;
+};
+
+/* Stop a device transfer on signal cancellation or at its overall deadline. */
+static int
+device_cancelled(void *argument)
+{
+	struct device_cancel_context *context;
+	int			      remaining;
+
+	context = argument;
+	if (context->callback != NULL &&
+	    context->callback(context->argument) != 0)
+		return 1;
+	remaining = device_remaining_ms(context->deadline_ms);
+	return remaining == -1 || remaining == 0;
+}
+
+/* Wait in short cancellable slices instead of sleeping for the whole
+** interval. */
+static int
+device_wait(int64_t deadline_ms, unsigned long interval,
+    oauth_cancel_callback callback, void *argument, char *error, size_t length)
+{
+	int64_t now;
+	int64_t wait_deadline;
+	int	remaining;
+	int	wait_ms;
+	int	slice;
+
+	/* A zero server interval is legal; one second prevents a hot loop. */
+	if (interval == 0)
+		interval = 1;
+	wait_ms = interval > (unsigned long)INT_MAX / 1000
+	    ? INT_MAX
+	    : (int)(interval * 1000);
+	now = monotonic_ms();
+	if (now == -1) {
+		set_error(error, length,
+		    "could not start device OAuth wait: %s", strerror(errno));
+		return -1;
+	}
+	wait_deadline = now > INT64_MAX - wait_ms ? INT64_MAX : now + wait_ms;
+	for (;;) {
+		if (callback != NULL && callback(argument) != 0) {
+			set_error(error, length,
+			    "device OAuth login cancelled");
+			return -1;
+		}
+		remaining = device_remaining_ms(deadline_ms);
+		if (remaining == -1) {
+			set_error(error, length,
+			    "could not update device OAuth timeout: %s",
+			    strerror(errno));
+			return -1;
+		}
+		if (remaining == 0) {
+			set_error(error, length,
+			    "device OAuth login timed out waiting for approval");
+			return -1;
+		}
+		now = monotonic_ms();
+		if (now == -1) {
+			set_error(error, length,
+			    "could not update device OAuth wait: %s",
+			    strerror(errno));
+			return -1;
+		}
+		if (now >= wait_deadline)
+			return 0;
+		slice = wait_deadline - now > INT_MAX
+		    ? INT_MAX
+		    : (int)(wait_deadline - now);
+		if (slice > remaining)
+			slice = remaining;
+		/* 100 ms slices make SIGTERM responsive even during a long wait. */
+		if (slice > 100)
+			slice = 100;
+		if (poll(NULL, 0, slice) == -1 && errno != EINTR) {
+			set_error(error, length,
+			    "could not wait for device OAuth approval: %s",
+			    strerror(errno));
+			return -1;
+		}
+	}
+}
+
+/*
+** Request the user code used by a headless device login.
+**
+** The endpoint deliberately returns a display URL rather than asking this
+** process to launch a browser.  The short user code can therefore be entered
+** on any other trusted device, while the device-auth id remains private to
+** the subsequent polling exchange.
+*/
+int
+oauth_device_code_request(const char *issuer, const char *client_id,
+    int timeout_ms, oauth_cancel_callback cancel, void *cancel_argument,
+    struct oauth_device_code *device, char *error, size_t length)
+{
+	char		    *body_text;
+	char		    *endpoint;
+	char		    *verification_url;
+	char		    *device_auth_id;
+	char		    *user_code;
+	const char	    *text;
+	json_t		    *body;
+	json_t		    *field;
+	json_t		    *root;
+	struct http_response response;
+	int64_t		     now;
+	unsigned long	     interval;
+	int		     remaining;
+	int		     result;
+
+	if (device == NULL || timeout_ms <= 0) {
+		set_error(error, length,
+		    "invalid device authorization timeout");
+		return -1;
+	}
+	memset(device, 0, sizeof(*device));
+	body = NULL;
+	body_text = NULL;
+	endpoint = NULL;
+	verification_url = NULL;
+	device_auth_id = NULL;
+	user_code = NULL;
+	now = monotonic_ms();
+	if (now == -1) {
+		set_error(error, length,
+		    "could not start device OAuth timeout: %s",
+		    strerror(errno));
+		return -1;
+	}
+	if (now > INT64_MAX - timeout_ms) {
+		set_error(error, length, "device OAuth timeout is too large");
+		return -1;
+	}
+	device->deadline_ms = now + timeout_ms;
+	body = json_pack("{s:s}", "client_id",
+	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
+	if (body == NULL || (body_text = json_dump_compact(body)) == NULL) {
+		json_decref(body);
+		set_error(error, length,
+		    "could not build device authorization request");
+		return -1;
+	}
+	json_decref(body);
+	endpoint = issuer_endpoint(issuer, "/api/accounts/deviceauth/usercode");
+	if (endpoint == NULL) {
+		set_error(error, length,
+		    "could not allocate device authorization endpoint");
+		goto fail;
+	}
+	remaining = device_remaining_ms(device->deadline_ms);
+	if (remaining == -1) {
+		set_error(error, length,
+		    "could not update device OAuth timeout: %s",
+		    strerror(errno));
+		goto fail;
+	}
+	if (remaining == 0) {
+		set_error(error, length, "device OAuth login timed out");
+		goto fail;
+	}
+	result = http_post_json_timeout(endpoint, body_text, NULL, NULL, NULL,
+	    remaining, cancel, cancel_argument, &response, error, length);
+	if (result == -1)
+		goto fail;
+	if (response.status == 404) {
+		set_error(error, length,
+		    "device authorization is not enabled by this OpenAI account");
+		http_response_free(&response);
+		goto fail;
+	}
+	if (response.status < 200 || response.status >= 300) {
+		set_error(error, length,
+		    "device authorization request failed with HTTP %ld",
+		    response.status);
+		http_response_free(&response);
+		goto fail;
+	}
+	root = json_load_buffer_checked(response.body, response.body_length,
+	    error, length);
+	http_response_free(&response);
+	if (root == NULL)
+		goto fail;
+	field = json_object_get(root, "device_auth_id");
+	if (json_bounded_string(field, DEVICE_AUTH_ID_MAX, &text) == 0)
+		device_auth_id = oaio_strdup(text);
+	field = json_object_get(root, "user_code");
+	if (field == NULL)
+		field = json_object_get(root, "usercode");
+	if (json_bounded_string(field, DEVICE_USER_CODE_MAX, &text) == 0)
+		user_code = oaio_strdup(text);
+	interval = 0;
+	if (json_object_get(root, "interval") != NULL &&
+	    parse_device_interval(json_object_get(root, "interval"),
+		&interval) == -1) {
+		set_error(error, length,
+		    "device authorization response has an invalid interval");
+		json_decref(root);
+		goto fail;
+	}
+	json_decref(root);
+	verification_url = issuer_endpoint(issuer, "/codex/device");
+	if (device_auth_id == NULL || user_code == NULL ||
+	    !device_user_code_valid(user_code) || verification_url == NULL) {
+		set_error(error, length,
+		    "device authorization response has invalid required fields");
+		goto fail;
+	}
+	device->device_auth_id = device_auth_id;
+	device_auth_id = NULL;
+	device->user_code = user_code;
+	user_code = NULL;
+	device->verification_url = verification_url;
+	verification_url = NULL;
+	device->interval = interval;
+	free(endpoint);
+	free(body_text);
+	return 0;
+
+fail:
+	free(endpoint);
+	free(body_text);
+	free(verification_url);
+	free(device_auth_id);
+	free(user_code);
+	oauth_device_code_free(device);
+	return -1;
+}
+
+/* Release a completed or partially parsed device authorization response. */
+void
+oauth_device_code_free(struct oauth_device_code *device)
+{
+	free(device->verification_url);
+	free(device->user_code);
+	free(device->device_auth_id);
+	memset(device, 0, sizeof(*device));
+}
+
+/*
+** Poll the device endpoint until approval, timeout, cancellation, or failure.
+**
+** HTTP 403 and 404 are the protocol's ordinary "still pending" responses.
+** Every other non-2xx status is fatal.  On success the endpoint supplies a
+** one-time authorization code and verifier, which are immediately exchanged
+** through the normal OAuth token endpoint and never written to disk.
+*/
+int
+oauth_device_code_poll(const char *issuer, const char *client_id,
+    const char *token_url, const struct oauth_device_code *device,
+    oauth_cancel_callback cancel, void *cancel_argument,
+    struct auth_session *session, char *error, size_t length)
+{
+	struct device_cancel_context cancel_context;
+	struct http_response	     response;
+	char			    *body_text;
+	char			    *endpoint;
+	char			    *redirect_uri;
+	const char		    *authorization_code;
+	const char		    *code_challenge;
+	const char		    *code_verifier;
+	json_t			    *body;
+	json_t			    *field;
+	json_t			    *root;
+	int			     remaining;
+	int			     result;
+
+	if (device == NULL || device->device_auth_id == NULL ||
+	    device->user_code == NULL || device->deadline_ms <= 0) {
+		set_error(error, length, "invalid device authorization state");
+		return -1;
+	}
+	endpoint = issuer_endpoint(issuer, "/api/accounts/deviceauth/token");
+	redirect_uri = issuer_endpoint(issuer, "/deviceauth/callback");
+	if (endpoint == NULL || redirect_uri == NULL) {
+		set_error(error, length,
+		    "could not allocate device authorization endpoint");
+		free(endpoint);
+		free(redirect_uri);
+		return -1;
+	}
+	cancel_context.callback = cancel;
+	cancel_context.argument = cancel_argument;
+	cancel_context.deadline_ms = device->deadline_ms;
+	for (;;) {
+		remaining = device_remaining_ms(device->deadline_ms);
+		if (remaining == -1) {
+			set_error(error, length,
+			    "could not update device OAuth timeout: %s",
+			    strerror(errno));
+			result = -1;
+			break;
+		}
+		if (remaining == 0) {
+			set_error(error, length,
+			    "device OAuth login timed out waiting for approval");
+			result = -1;
+			break;
+		}
+		body = json_pack("{s:s,s:s}", "device_auth_id",
+		    device->device_auth_id, "user_code", device->user_code);
+		body_text = body == NULL ? NULL : json_dump_compact(body);
+		json_decref(body);
+		if (body_text == NULL) {
+			set_error(error, length,
+			    "could not build device polling request");
+			result = -1;
+			break;
+		}
+		result = http_post_json_timeout(endpoint, body_text, NULL, NULL,
+		    NULL, remaining, device_cancelled, &cancel_context,
+		    &response, error, length);
+		free(body_text);
+		if (result == -1) {
+			if (cancel != NULL && cancel(cancel_argument) != 0)
+				set_error(error, length,
+				    "device OAuth login cancelled");
+			else if (device_remaining_ms(device->deadline_ms) == 0)
+				set_error(error, length,
+				    "device OAuth login timed out waiting for approval");
+			break;
+		}
+		if (response.status == 403 || response.status == 404) {
+			http_response_free(&response);
+			if (device_wait(device->deadline_ms, device->interval,
+				cancel, cancel_argument, error, length) == -1) {
+				result = -1;
+				break;
+			}
+			continue;
+		}
+		if (response.status < 200 || response.status >= 300) {
+			set_error(error, length,
+			    "device authorization polling failed with HTTP %ld",
+			    response.status);
+			http_response_free(&response);
+			result = -1;
+			break;
+		}
+		root = json_load_buffer_checked(response.body,
+		    response.body_length, error, length);
+		http_response_free(&response);
+		if (root == NULL) {
+			result = -1;
+			break;
+		}
+		authorization_code = NULL;
+		code_challenge = NULL;
+		code_verifier = NULL;
+		field = json_object_get(root, "authorization_code");
+		result = json_bounded_string(field, DEVICE_CODE_MAX,
+		    &authorization_code);
+		field = json_object_get(root, "code_challenge");
+		if (result == 0)
+			result =
+			    json_bounded_string(field, 128, &code_challenge);
+		field = json_object_get(root, "code_verifier");
+		if (result == 0)
+			result =
+			    json_bounded_string(field, 128, &code_verifier);
+		if (result == -1 || !device_verifier_valid(code_verifier)) {
+			set_error(error, length,
+			    "device authorization response has invalid PKCE fields");
+			json_decref(root);
+			result = -1;
+			break;
+		}
+		/* Bind the one-time code to the verifier before sending it onward. */
+		if (device_pkce_matches(code_verifier, code_challenge) == -1) {
+			set_error(error, length,
+			    "device authorization response has invalid PKCE");
+			json_decref(root);
+			result = -1;
+			break;
+		}
+		remaining = device_remaining_ms(device->deadline_ms);
+		if (remaining <= 0) {
+			set_error(error, length,
+			    "device OAuth login timed out waiting for approval");
+			json_decref(root);
+			result = -1;
+			break;
+		}
+		result = oauth_exchange_code_timeout(authorization_code,
+		    code_verifier, redirect_uri, client_id, issuer, token_url,
+		    remaining, device_cancelled, &cancel_context, session,
+		    error, length);
+		if (result == -1) {
+			if (cancel != NULL && cancel(cancel_argument) != 0)
+				set_error(error, length,
+				    "device OAuth login cancelled");
+			else if (device_remaining_ms(device->deadline_ms) == 0)
+				set_error(error, length,
+				    "device OAuth login timed out waiting for approval");
+		}
+		json_decref(root);
+		break;
+	}
+	free(endpoint);
+	free(redirect_uri);
 	return result;
 }
