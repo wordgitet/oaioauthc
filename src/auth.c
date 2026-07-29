@@ -539,51 +539,90 @@ token_response(const char *text, struct auth_session *session, char *error,
     size_t length)
 {
 	json_t	   *root;
-	const char *value;
+	const char *access_token;
+	const char *account_id;
+	const char *id_token;
+	const char *refresh_token;
 	char	   *account;
+	char	   *new_access_token;
+	char	   *new_id_token;
+	char	   *new_last_refresh;
+	char	   *new_refresh_token;
 
+	account = NULL;
+	new_access_token = NULL;
+	new_id_token = NULL;
+	new_last_refresh = NULL;
+	new_refresh_token = NULL;
 	root = json_load_string_checked(text, error, length);
 	if (root == NULL)
 		return -1;
-	value = json_string_value(json_object_get(root, "access_token"));
-	if (value == NULL) {
-		json_decref(root);
+	access_token = json_string_value(json_object_get(root, "access_token"));
+	if (access_token == NULL) {
 		set_error(error, length, "token response has no access_token");
-		return -1;
+		goto fail;
 	}
-	free(session->access_token);
-	session->access_token = oaio_strdup(value);
-	value = json_string_value(json_object_get(root, "refresh_token"));
-	if (value != NULL) {
-		free(session->refresh_token);
-		session->refresh_token = oaio_strdup(value);
+	new_access_token = oaio_strdup(access_token);
+	refresh_token = json_string_value(json_object_get(root, "refresh_token"));
+	if (refresh_token != NULL)
+		new_refresh_token = oaio_strdup(refresh_token);
+	id_token = json_string_value(json_object_get(root, "id_token"));
+	if (id_token != NULL)
+		new_id_token = oaio_strdup(id_token);
+	if (new_access_token == NULL ||
+	    (refresh_token != NULL && new_refresh_token == NULL) ||
+	    (id_token != NULL && new_id_token == NULL)) {
+		set_error(error, length, "could not allocate token response");
+		goto fail;
 	}
-	value = json_string_value(json_object_get(root, "id_token"));
-	if (value != NULL) {
-		free(session->id_token);
-		session->id_token = oaio_strdup(value);
-	}
-	value = json_string_value(json_object_get(root, "account_id"));
-	account = value == NULL ? jwt_account_id(session->id_token)
-				: oaio_strdup(value);
+	account_id = json_string_value(json_object_get(root, "account_id"));
+	account = account_id == NULL
+	    ? jwt_account_id(id_token == NULL ? session->id_token : new_id_token)
+	    : oaio_strdup(account_id);
 	if (account == NULL)
-		account = jwt_account_id(session->access_token);
+		account = jwt_account_id(new_access_token);
 	if (account == NULL && session->account_id != NULL)
 		account = oaio_strdup(session->account_id);
 	if (account == NULL) {
-		json_decref(root);
 		set_error(error, length,
 		    "token response has no ChatGPT account id");
-		return -1;
+		goto fail;
+	}
+	new_last_refresh = current_timestamp();
+	if (new_last_refresh == NULL) {
+		set_error(error, length, "could not record token refresh time");
+		goto fail;
+	}
+	free(session->access_token);
+	session->access_token = new_access_token;
+	new_access_token = NULL;
+	if (refresh_token != NULL) {
+		free(session->refresh_token);
+		session->refresh_token = new_refresh_token;
+		new_refresh_token = NULL;
+	}
+	if (id_token != NULL) {
+		free(session->id_token);
+		session->id_token = new_id_token;
+		new_id_token = NULL;
 	}
 	free(session->account_id);
 	session->account_id = account;
+	account = NULL;
 	free(session->last_refresh);
-	session->last_refresh = current_timestamp();
+	session->last_refresh = new_last_refresh;
+	new_last_refresh = NULL;
 	json_decref(root);
-	return session->access_token == NULL || session->last_refresh == NULL
-	    ? -1
-	    : 0;
+	return 0;
+
+fail:
+	free(account);
+	free(new_access_token);
+	free(new_id_token);
+	free(new_last_refresh);
+	free(new_refresh_token);
+	json_decref(root);
+	return -1;
 }
 
 /*
@@ -718,7 +757,11 @@ auth_refresh(const char *path, const char *client_id, const char *token_url,
 			result = auth_refresh_locked(path, client_id, token_url,
 			    session, error, length);
 	}
-	close(lock_fd);
+	if (close(lock_fd) == -1 && result == 0) {
+		set_error(error, length, "could not release auth refresh lock: %s",
+		    strerror(errno));
+		return -1;
+	}
 	return (result);
 }
 
@@ -813,43 +856,47 @@ oauth_exchange_code(const char *code, const char *code_verifier,
 	struct http_response response;
 	int		     result;
 
+	result = -1;
+	buffer_init(&body);
 	escaped_code = http_form_encode(code);
 	escaped_verifier = http_form_encode(code_verifier);
 	escaped_redirect = http_form_encode(redirect_uri);
 	if (escaped_code == NULL || escaped_verifier == NULL ||
 	    escaped_redirect == NULL) {
-		free(escaped_code);
-		free(escaped_verifier);
-		free(escaped_redirect);
-		return -1;
+		set_error(error, length, "could not encode OAuth token request");
+		goto done;
 	}
-	buffer_init(&body);
-	(void)buffer_append_string(&body,
-	    "grant_type=authorization_code&code=");
-	(void)buffer_append_string(&body, escaped_code);
-	(void)buffer_append_string(&body, "&redirect_uri=");
-	(void)buffer_append_string(&body, escaped_redirect);
-	(void)buffer_append_string(&body, "&client_id=");
-	(void)buffer_append_string(&body,
-	    client_id == NULL ? DEFAULT_CLIENT_ID : client_id);
-	(void)buffer_append_string(&body, "&code_verifier=");
-	(void)buffer_append_string(&body, escaped_verifier);
-	free(escaped_code);
-	free(escaped_verifier);
-	free(escaped_redirect);
+	if (buffer_append_string(&body,
+	    "grant_type=authorization_code&code=") == -1 ||
+	    buffer_append_string(&body, escaped_code) == -1 ||
+	    buffer_append_string(&body, "&redirect_uri=") == -1 ||
+	    buffer_append_string(&body, escaped_redirect) == -1 ||
+	    buffer_append_string(&body, "&client_id=") == -1 ||
+	    buffer_append_string(&body,
+		client_id == NULL ? DEFAULT_CLIENT_ID : client_id) == -1 ||
+	    buffer_append_string(&body, "&code_verifier=") == -1 ||
+	    buffer_append_string(&body, escaped_verifier) == -1) {
+		set_error(error, length, "could not build OAuth token request");
+		goto done;
+	}
 	result =
 	    http_post_form(token_url == NULL ? DEFAULT_TOKEN_URL : token_url,
 		body.data, cancel, cancel_argument, &response, error, length);
-	buffer_free(&body);
 	if (result == -1)
-		return -1;
+		goto done;
 	if (response.status < 200 || response.status >= 300) {
 		set_error(error, length, "token exchange failed with HTTP %ld",
 		    response.status);
-		http_response_free(&response);
-		return -1;
+		result = -1;
+	} else {
+		result = token_response(response.body, session, error, length);
 	}
-	result = token_response(response.body, session, error, length);
 	http_response_free(&response);
+
+done:
+	free(escaped_code);
+	free(escaped_verifier);
+	free(escaped_redirect);
+	buffer_free(&body);
 	return result;
 }
