@@ -37,6 +37,7 @@
 #include "config.h"
 #include "daemon.h"
 #include "proxy.h"
+#include "secret.h"
 #include "util.h"
 
 #define CALLBACK_PORT	   1455
@@ -390,11 +391,12 @@ hex_value(char character)
 }
 
 /*
-** Return a decoded query parameter value owned by the caller.
+** Return a decoded OAuth callback query parameter owned by the caller.
 **
 ** The search is exact on the parameter name.  Percent escapes and '+' follow
 ** form-query rules, while malformed escapes and decoded NUL bytes are rejected
 ** so callers never compare truncated security-sensitive values such as state.
+** The caller releases a returned code or state with secret_free().
 */
 static char *
 query_value(const char *target, const char *name)
@@ -452,8 +454,18 @@ query_value(const char *target, const char *name)
 	return buffer_steal(&value);
 
 fail:
-	buffer_free(&value);
+	secret_buffer_free(&value);
 	return NULL;
+}
+
+/* Clear decoded OAuth callback values and invalidate the caller's pointers. */
+static void
+oauth_callback_values_free(char **code, char **state)
+{
+	secret_free(*code);
+	secret_free(*state);
+	*code = NULL;
+	*state = NULL;
 }
 
 /* Emit the small browser-facing success or callback-validation response. */
@@ -709,19 +721,12 @@ run_login(const struct proxy_options *options, const char *issuer,
 		target[strlen("/auth/callback")] != '\0') ||
 	    version == NULL ||
 	    strncmp(version, "HTTP/1.", strlen("HTTP/1.")) != 0) {
-		free(code);
-		free(state);
-		code = NULL;
-		state = NULL;
+		oauth_callback_values_free(&code, &state);
 	}
-	if (code == NULL || state == NULL || strcmp(state, oauth.state) != 0) {
+	if (code == NULL || !secret_equal(state, oauth.state)) {
 		body = "Invalid OAuth callback";
 		(void)send_callback_response(client_fd, 400,
 		    "text/plain; charset=utf-8", body);
-		free(code);
-		code = NULL;
-		free(state);
-		state = NULL;
 		goto done;
 	}
 	body =
@@ -737,10 +742,7 @@ run_login(const struct proxy_options *options, const char *issuer,
 	result = oauth_exchange_code(code, oauth.code_verifier, CALLBACK_URI,
 	    options->client_id, issuer, options->token_url,
 	    login_cancel_requested, NULL, &session, error, sizeof(error));
-	free(code);
-	code = NULL;
-	free(state);
-	state = NULL;
+	oauth_callback_values_free(&code, &state);
 	oauth_request_free(&oauth);
 	if (result == -1) {
 		if (login_signal_received != 0)
@@ -769,8 +771,8 @@ run_login(const struct proxy_options *options, const char *issuer,
 	result = 0;
 
 done:
-	free(code);
-	free(state);
+	oauth_callback_values_free(&code, &state);
+	secret_clear(request, sizeof(request));
 	if (client_fd != -1)
 		close(client_fd);
 	close_callback_listeners(listeners);

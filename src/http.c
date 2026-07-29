@@ -21,6 +21,7 @@
 #include <strings.h>
 
 #include "http.h"
+#include "secret.h"
 #include "util.h"
 
 #define MAX_RESPONSE_SIZE (64 * 1024 * 1024)
@@ -71,7 +72,12 @@ append_header(struct curl_slist **headers, const char *value)
 	return 0;
 }
 
-/* Build "name + value" as one curl header and release the temporary buffer. */
+/*
+** Build one header from a name and value.
+**
+** The only callers supply bearer or account values.  Clear the temporary
+** string because libcurl has copied it into the header list by this point.
+*/
 static int
 append_header_value(struct curl_slist **headers, const char *name,
     const char *value)
@@ -85,8 +91,21 @@ append_header_value(struct curl_slist **headers, const char *name,
 		result = buffer_append_string(&header, value);
 	if (result == 0)
 		result = append_header(headers, header.data);
-	buffer_free(&header);
+	secret_buffer_free(&header);
 	return (result);
+}
+
+/* Clear each libcurl-owned header string before releasing the list. */
+static void
+headers_free(struct curl_slist *headers)
+{
+	struct curl_slist *header;
+
+	for (header = headers; header != NULL; header = header->next) {
+		if (header->data != NULL)
+			secret_clear(header->data, strlen(header->data) + 1);
+	}
+	curl_slist_free_all(headers);
 }
 
 /*
@@ -289,10 +308,10 @@ request(const char *url, const char *method, const char *body,
 	result = 0;
 
 cleanup:
-	curl_slist_free_all(headers);
+	headers_free(headers);
 	curl_easy_cleanup(curl);
 	if (result != 0) {
-		buffer_free(&response_body);
+		secret_buffer_free(&response_body);
 		http_response_free(response);
 	}
 	return result;
@@ -392,6 +411,8 @@ http_form_encode(const char *value)
 		return NULL;
 	escaped = curl_easy_escape(curl, value, 0);
 	copy = escaped == NULL ? NULL : oaio_strdup(escaped);
+	if (escaped != NULL)
+		secret_clear(escaped, strlen(escaped) + 1);
 	curl_free(escaped);
 	curl_easy_cleanup(curl);
 	return copy;

@@ -545,6 +545,44 @@ send_callback(const char *state)
 	return close(fd);
 }
 
+/* Submit a state-mismatched callback and require the browser-facing rejection. */
+static int
+send_invalid_callback(void)
+{
+	static const char request[] =
+	    "GET /auth/callback?code=untrusted-code&state=wrong HTTP/1.1\r\n"
+	    "Host: localhost\r\n\r\n";
+	char	response[512];
+	int	fd;
+	size_t	used;
+	ssize_t count;
+
+	fd = open_callback();
+	if (fd == -1)
+		return -1;
+	if (write_all(fd, request, sizeof(request) - 1) == -1) {
+		close(fd);
+		return -1;
+	}
+	used = 0;
+	while (used + 1 < sizeof(response)) {
+		count = read(fd, response + used, sizeof(response) - used - 1);
+		if (count == -1 && errno == EINTR)
+			continue;
+		if (count < 0) {
+			close(fd);
+			return -1;
+		}
+		if (count == 0)
+			break;
+		used += (size_t)count;
+	}
+	response[used] = '\0';
+	if (close(fd) == -1)
+		return -1;
+	return strstr(response, "HTTP/1.1 400 Bad Request") == NULL ? -1 : 0;
+}
+
 /* Bind a dynamic loopback token endpoint and return its URL. */
 static int
 open_token_listener(char *url, size_t length)
@@ -789,6 +827,50 @@ test_slow_callback(void)
 cleanup:
 	if (callback_fd != -1)
 		close(callback_fd);
+	if (output_fd != -1)
+		close(output_fd);
+	if (child > 0) {
+		(void)kill(child, SIGKILL);
+		(void)waitpid(child, &status, 0);
+	}
+	(void)unlink(auth_path);
+	return result;
+}
+
+/* Reject a state-mismatched callback without exchanging or saving credentials. */
+static int
+test_invalid_callback(void)
+{
+	char   auth_path[128];
+	char   output[OUTPUT_SIZE];
+	int    output_fd;
+	int    result;
+	int    status;
+	pid_t  child;
+	size_t used;
+
+	child = -1;
+	output_fd = -1;
+	result = 1;
+	used = 0;
+	(void)snprintf(auth_path, sizeof(auth_path),
+	    "/tmp/oaioauthc-login-invalid-%ld.json", (long)getpid());
+	(void)unlink(auth_path);
+	output_fd = start_login("5000", auth_path, NULL, &child);
+	REQUIRE(output_fd != -1);
+	REQUIRE(read_until(output_fd, output, sizeof(output), &used,
+		    "OpenAI OAuth login URL", 2000) == 0);
+	REQUIRE(send_invalid_callback() == 0);
+	REQUIRE(wait_child(child, &status, 2000) == 1);
+	child = -1;
+	REQUIRE(drain_output(output_fd, output, sizeof(output), &used) == 0);
+	close(output_fd);
+	output_fd = -1;
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+	REQUIRE(access(auth_path, F_OK) == -1 && errno == ENOENT);
+	result = 0;
+
+cleanup:
 	if (output_fd != -1)
 		close(output_fd);
 	if (child > 0) {
@@ -1175,6 +1257,7 @@ main(void)
 	CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
 	CHECK(test_basic_login() == 0);
 	CHECK(test_slow_callback() == 0);
+	CHECK(test_invalid_callback() == 0);
 	CHECK(test_exchange_cancellation() == 0);
 	CHECK(test_concurrent_auth_creation() == 0);
 	CHECK(test_unsafe_issuer() == 0);

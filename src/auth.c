@@ -172,10 +172,12 @@ random_urlsafe(size_t length)
 	if (bytes == NULL)
 		return NULL;
 	if (RAND_bytes(bytes, (int)length) != 1) {
+		secret_clear(bytes, length);
 		free(bytes);
 		return NULL;
 	}
 	encoded = base64url(bytes, length);
+	secret_clear(bytes, length);
 	free(bytes);
 	return encoded;
 }
@@ -315,20 +317,22 @@ jwt_account_id(const char *token)
 	}
 	decoded = malloc(strlen(payload) + 1);
 	if (decoded == NULL) {
-		free(payload);
+		secret_free(payload);
 		return NULL;
 	}
 	decoded_length = EVP_DecodeBlock(decoded, (unsigned char *)payload,
 	    (int)strlen(payload));
 	if (decoded_length < 0) {
+		secret_clear(decoded, strlen(payload) + 1);
 		free(decoded);
-		free(payload);
+		secret_free(payload);
 		return NULL;
 	}
 	decoded[decoded_length] = '\0';
 	claims = json_loads((char *)decoded, 0, &json_error);
+	secret_clear(decoded, strlen(payload) + 1);
 	free(decoded);
-	free(payload);
+	secret_free(payload);
 	if (claims == NULL)
 		return NULL;
 	auth = json_object_get(claims, "https://api.openai.com/auth");
@@ -585,18 +589,20 @@ auth_session_needs_refresh(const struct auth_session *session)
 	}
 	decoded = malloc(payload_length + 1);
 	if (decoded == NULL) {
-		free(payload);
+		secret_free(payload);
 		goto check_last_refresh;
 	}
 	decoded_length = EVP_DecodeBlock(decoded, (unsigned char *)payload,
 	    (int)payload_length);
-	free(payload);
+	secret_free(payload);
 	if (decoded_length < 0) {
+		secret_clear(decoded, payload_length + 1);
 		free(decoded);
 		goto check_last_refresh;
 	}
 	decoded[decoded_length] = '\0';
 	claims = json_loads((char *)decoded, 0, NULL);
+	secret_clear(decoded, payload_length + 1);
 	free(decoded);
 	if (!json_is_object(claims)) {
 		json_decref(claims);
