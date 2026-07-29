@@ -192,7 +192,7 @@ static int
 request(const char *url, const char *method, const char *body,
     const char *authorization, const char *account_id, const char *extra_header,
     const char *content_type, http_write_callback callback, void *argument,
-    http_cancel_callback cancel, void *cancel_argument,
+    int timeout_ms, http_cancel_callback cancel, void *cancel_argument,
     struct http_response *response, char *error, size_t error_length)
 {
 	CURL		     *curl;
@@ -251,6 +251,8 @@ request(const char *url, const char *method, const char *body,
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);
+	if (timeout_ms > 0)
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
 	if (cancel != NULL) {
 		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
@@ -269,6 +271,7 @@ request(const char *url, const char *method, const char *body,
 		goto cleanup;
 	}
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response->status);
+	response->body_length = response_body.len;
 	response->body = buffer_steal(&response_body);
 	if (response->body == NULL) {
 		set_error(error, error_length,
@@ -291,11 +294,24 @@ cleanup:
 int
 http_post_json(const char *url, const char *body, const char *authorization,
     const char *account_id, const char *extra_header,
+    http_cancel_callback cancel, void *cancel_argument,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, authorization, account_id,
-	    extra_header, NULL, NULL, NULL, NULL, NULL, response, error,
-	    error_length);
+	    extra_header, NULL, NULL, NULL, 0, cancel, cancel_argument,
+	    response, error, error_length);
+}
+
+/* POST JSON with a strict whole-transfer timeout and optional cancellation. */
+int
+http_post_json_timeout(const char *url, const char *body,
+    const char *authorization, const char *account_id, const char *extra_header,
+    int timeout_ms, http_cancel_callback cancel, void *cancel_argument,
+    struct http_response *response, char *error, size_t error_length)
+{
+	return request(url, "POST", body, authorization, account_id,
+	    extra_header, NULL, NULL, NULL, timeout_ms, cancel, cancel_argument,
+	    response, error, error_length);
 }
 
 /* POST JSON and deliver successful response fragments to callback. */
@@ -306,8 +322,8 @@ http_post_json_stream(const char *url, const char *body,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "POST", body, authorization, account_id,
-	    extra_header, NULL, callback, argument, NULL, NULL, response, error,
-	    error_length);
+	    extra_header, NULL, callback, argument, 0, NULL, NULL, response,
+	    error, error_length);
 }
 
 /* POST an OAuth URL-encoded body without Codex authorization headers. */
@@ -317,8 +333,19 @@ http_post_form(const char *url, const char *body, http_cancel_callback cancel,
     size_t error_length)
 {
 	return request(url, "POST", body, NULL, NULL, NULL,
-	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL,
+	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL, 0,
 	    cancel, cancel_argument, response, error, error_length);
+}
+
+/* POST an OAuth form with a strict whole-transfer timeout. */
+int
+http_post_form_timeout(const char *url, const char *body, int timeout_ms,
+    http_cancel_callback cancel, void *cancel_argument,
+    struct http_response *response, char *error, size_t error_length)
+{
+	return request(url, "POST", body, NULL, NULL, NULL,
+	    "Content-Type: application/x-www-form-urlencoded", NULL, NULL,
+	    timeout_ms, cancel, cancel_argument, response, error, error_length);
 }
 
 /* GET an authenticated Codex resource into a bounded buffered response. */
@@ -327,7 +354,7 @@ http_get(const char *url, const char *authorization, const char *account_id,
     struct http_response *response, char *error, size_t error_length)
 {
 	return request(url, "GET", NULL, authorization, account_id, NULL, NULL,
-	    NULL, NULL, NULL, NULL, response, error, error_length);
+	    NULL, NULL, 0, NULL, NULL, response, error, error_length);
 }
 
 /* Release both response allocations and reset the structure for safe reuse. */
