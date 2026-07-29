@@ -1,0 +1,4 @@
+#!/bin/sh
+# Reject whitespace errors in exactly the changes about to be committed.
+
+exec git diff --cached --check

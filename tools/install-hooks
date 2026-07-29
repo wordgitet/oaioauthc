@@ -1,0 +1,8 @@
+#!/bin/sh
+# Enable the repository's versioned Git hooks for this working tree.
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+git -C "$repo_root" config --local core.hooksPath "$repo_root/.githooks"
+printf '%s\n' "Installed oaioauthc hooks from $repo_root/.githooks"

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Build every distinct commit supplied by Git in a temporary exported tree.
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/oaioauthc-pre-push.XXXXXX")
+seen="$temporary/seen"
+
+cleanup()
+{
+	rm -rf "$temporary"
+}
+
+trap cleanup EXIT HUP INT TERM
+:
+>"$seen"
+while read -r local_ref local_oid remote_ref remote_oid; do
+	case "$local_oid" in
+	0000000000000000000000000000000000000000)
+		continue
+		;;
+	esac
+	if grep -qx "$local_oid" "$seen"; then
+		continue
+	fi
+	git cat-file -e "$local_oid^{commit}"
+	printf '%s\n' "$local_oid" >>"$seen"
+	directory="$temporary/$local_oid"
+	mkdir "$directory"
+	git archive "$local_oid" | tar -x -C "$directory"
+	"$directory/tools/check-tree" "$directory"
+done
+
+if [ ! -s "$seen" ]; then
+	printf '%s\n' "pre-push: no commits to verify" >&2
+fi

@@ -84,6 +84,25 @@ The daemon stores its lock, status, control socket, and log below
 For a local ASan and UBSan run, configure a clean build with
 `./configure --enable-sanitizers`, then run `make check`.
 
+## Contributor checks
+
+Install the versioned Git hooks for this checkout with:
+
+```sh
+tools/install-hooks
+```
+
+The pre-commit hook rejects staged whitespace errors. The pre-push hook exports
+each pushed commit to a temporary directory and runs the normal Autotools build
+and test suite there, so it does not alter your working tree. Hooks are local
+developer safeguards and may be bypassed; run the fuller checks when preparing
+a release:
+
+```sh
+tools/check-tree --sanitizers .
+tools/check-tree --distcheck .
+```
+
 This project is unaffiliated with OpenAI.
 
 ## License
