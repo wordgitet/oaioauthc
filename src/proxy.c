@@ -1340,19 +1340,19 @@ handle_responses(int fd, const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog,
     const char *body, int as_chat)
 {
-	json_t		       *request;
-	json_t		       *upstream_request;
-	json_t		       *completed;
-	json_t		       *model;
-	char		       *request_text;
-	char		       *url;
-	struct http_response	response;
-	char			error[256];
-	int			want_stream;
-	int			use_lite;
-	int			result;
-	struct stream_client	client;
-	struct sse_chat_stream *chat_stream;
+	json_t			   *request;
+	json_t			   *upstream_request;
+	json_t			   *completed;
+	json_t			   *model;
+	char			   *request_text;
+	char			   *url;
+	struct http_response	    response;
+	char			    error[256];
+	int			    want_stream;
+	int			    use_lite;
+	int			    result;
+	struct stream_client	    client;
+	struct sse_chat_stream	   *chat_stream;
 	struct sse_response_stream *response_stream;
 
 	/* Convert Chat only here; all upstream work uses Responses JSON. */
@@ -1457,7 +1457,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		    session->access_token, session->account_id,
 		    use_lite ? "x-openai-internal-codex-responses-lite: true"
 			     : NULL,
-		    &response, error, sizeof(error));
+		    NULL, NULL, &response, error, sizeof(error));
 	free(url);
 	free(request_text);
 	if (result == -1) {
@@ -1588,7 +1588,8 @@ handle_image(int fd, const struct proxy_options *options,
 		return send_error(fd, 500, "out of memory", "server_error");
 	}
 	result = http_post_json(url, prepared, session->access_token,
-	    session->account_id, NULL, &response, error, sizeof(error));
+	    session->account_id, NULL, NULL, NULL, &response, error,
+	    sizeof(error));
 	free(url);
 	free(prepared);
 	if (result == -1)
