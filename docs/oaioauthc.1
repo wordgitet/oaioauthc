@@ -121,8 +121,10 @@ HTTP is permitted only for explicit loopback endpoints (localhost, 127.0.0.1,
 or [::1]) used during local testing.
 .TP
 .BI \-\-debug-json
-Write parsed client JSON and normalized upstream JSON to standard error in
-compact form.
+Write parsed client JSON, normalized upstream JSON, and failed upstream
+response diagnostics to standard error in compact form.  Failed-response
+diagnostics include the HTTP status, Content-Type, and a redacted JSON body;
+non-JSON response bodies are omitted.
 .TP
 .BI \-\-debug-json=compact
 Select compact diagnostic JSON explicitly.

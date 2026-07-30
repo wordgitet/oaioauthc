@@ -247,7 +247,7 @@ run_mock_upstream(const char *port, int ready_fd)
 	    "\"delta\":\"incomplete\"}\n\n";
 	static const char upstream_error[] =
 	    "{\"error\":{\"message\":\"mock upstream rejected request\","
-	    "\"type\":\"rate_limit_error\"}}";
+	    "\"type\":\"rate_limit_error\",\"id_token\":\"upstream-secret\"}}";
 	char request[32768];
 	char ready;
 	int  client_fd;
@@ -584,6 +584,10 @@ main(void)
 	REQUIRE(strstr(debug_output.data, "Models (1): gpt-test") != NULL);
 	REQUIRE(strstr(debug_output.data, "client request") != NULL);
 	REQUIRE(strstr(debug_output.data, "Codex request") != NULL);
+	REQUIRE(strstr(debug_output.data, "Codex error response") != NULL);
+	REQUIRE(strstr(debug_output.data, "\"status\":429") != NULL);
+	REQUIRE(strstr(debug_output.data,
+		    "mock upstream rejected request") != NULL);
 	REQUIRE(
 	    strstr(debug_output.data, "client request: {\"model\"") != NULL);
 	REQUIRE(strstr(debug_output.data, "\"type\":\"output_text\"") != NULL);
@@ -596,6 +600,7 @@ main(void)
 	    strstr(debug_output.data, "\"id_token\":\"[redacted]\"") != NULL);
 	REQUIRE(strstr(debug_output.data, "debug-secret") == NULL);
 	REQUIRE(strstr(debug_output.data, "identity-secret") == NULL);
+	REQUIRE(strstr(debug_output.data, "upstream-secret") == NULL);
 	REQUIRE(strstr(debug_output.data, "DATA:image/svg+xml") == NULL);
 	REQUIRE(strstr(debug_output.data, "acct_1") == NULL);
 	REQUIRE(kill(pid, SIGTERM) == 0);

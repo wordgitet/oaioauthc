@@ -401,6 +401,45 @@ debug_json_text(const struct proxy_options *options, const char *label,
 	json_decref(value);
 }
 
+/*
+** Log one failed upstream response without exposing credential fields.
+**
+** Upstream APIs normally return JSON error objects.  Keep a non-JSON body out
+** of diagnostics rather than treating arbitrary bytes as text, while always
+** preserving the HTTP status and Content-Type needed for triage.
+*/
+static void
+debug_upstream_error(const struct proxy_options *options, const char *label,
+    const struct http_response *response)
+{
+	json_t *body;
+	json_t *entry;
+
+	if (options->debug_json == debug_json_disabled)
+		return;
+	if (response->body == NULL || response->body_length == 0)
+		body = json_string("[empty response body]");
+	else
+		body = json_loadb(response->body, response->body_length, 0, NULL);
+	if (body == NULL)
+		body = json_string("[invalid JSON response body omitted]");
+	if (body == NULL) {
+		debug_json_write(label, "[could not encode error response]");
+		return;
+	}
+	entry = json_pack("{s:I,s:s,s:O}", "status",
+	    (json_int_t)response->status, "content_type",
+	    response->content_type == NULL ? "" : response->content_type, "body",
+	    body);
+	json_decref(body);
+	if (entry == NULL) {
+		debug_json_write(label, "[could not encode error response]");
+		return;
+	}
+	debug_json_value(options, label, entry);
+	json_decref(entry);
+}
+
 /* Release every allocation made by read_request and reset the structure. */
 static void
 request_free(struct request *request)
@@ -761,6 +800,8 @@ resolve_codex_version(const struct proxy_options *options, char *error,
 		set_error(error, length,
 		    "Codex version lookup failed with HTTP %ld",
 		    response.status);
+		debug_upstream_error(options, "Codex version error response",
+		    &response);
 		http_response_free(&response);
 		return NULL;
 	}
@@ -847,6 +888,8 @@ load_model_catalog(const struct proxy_options *options,
 	free(url);
 	if (response.status < 200 || response.status >= 300) {
 		set_error(error, length, "failed to load models from Codex");
+		debug_upstream_error(options, "Codex models error response",
+		    &response);
 		http_response_free(&response);
 		return -1;
 	}
@@ -1469,6 +1512,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		return send_error(fd, 502, error, "upstream_error");
 	}
 	if (response.status < 200 || response.status >= 300) {
+		debug_upstream_error(options, "Codex error response", &response);
 		result = send_response(fd, (int)response.status,
 		    response.content_type == NULL ? "application/json"
 						  : response.content_type,
@@ -1594,6 +1638,9 @@ handle_image(int fd, const struct proxy_options *options,
 	free(prepared);
 	if (result == -1)
 		return send_error(fd, 502, error, "upstream_error");
+	if (response.status < 200 || response.status >= 300)
+		debug_upstream_error(options, "Codex image error response",
+		    &response);
 	result = send_response(fd, (int)response.status,
 	    response.content_type == NULL ? "application/json"
 					  : response.content_type,
