@@ -59,6 +59,7 @@ usage(FILE *stream)
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
 	    "                  [--daemon] [--runtime-dir DIR]\n"
 	    "                  [--debug-json[=compact|pretty]]\n"
+	    "                  [--show-http-response]\n"
 	    "  oaioauthc login [--device-auth] [--oauth-file PATH]\n"
 	    "                  [--open|--no-open] [--oauth-issuer URL]\n"
 	    "                  [--oauth-client-id ID] [--oauth-token-url URL]\n"
@@ -100,8 +101,8 @@ parse_positive_number(const char *value, unsigned long maximum,
 static int
 oauth_issuer_is_safe(const char *issuer)
 {
-	return (url_is_secure_or_loopback(issuer) &&
-	    strpbrk(issuer, "?#") == NULL);
+	return (
+	    url_is_secure_or_loopback(issuer) && strpbrk(issuer, "?#") == NULL);
 }
 
 /*
@@ -976,6 +977,8 @@ main(int argc, char **argv)
 			options.debug_json = debug_json_compact;
 		else if (strcmp(argv[index], "--debug-json=pretty") == 0)
 			options.debug_json = debug_json_pretty;
+		else if (strcmp(argv[index], "--show-http-response") == 0)
+			options.show_http_response = 1;
 		else if (strncmp(argv[index], "--debug-json=", 13) == 0) {
 			(void)fprintf(stderr,
 			    "invalid --debug-json format: %s\n",
@@ -1023,7 +1026,9 @@ main(int argc, char **argv)
 		return 1;
 	}
 	if (strcmp(command, "login") == 0) {
-		if (daemon_mode || follow_logs || runtime_directory != NULL) {
+		if (daemon_mode || follow_logs || runtime_directory != NULL ||
+		    options.debug_json != debug_json_disabled ||
+		    options.show_http_response) {
 			usage(stderr);
 			return 1;
 		}
@@ -1066,6 +1071,7 @@ main(int argc, char **argv)
 		    options.token_url != NULL || device_auth ||
 		    issuer_option_seen ||
 		    options.debug_json != debug_json_disabled ||
+		    options.show_http_response ||
 		    (follow_logs && strcmp(command, "logs") != 0)) {
 			usage(stderr);
 			return 1;
@@ -1099,6 +1105,10 @@ main(int argc, char **argv)
 		(void)fprintf(stderr,
 		    "Warning: --debug-json logs prompts and "
 		    "conversation history to stderr.\n");
+	if (options.show_http_response)
+		(void)fprintf(stderr,
+		    "Warning: --show-http-response logs upstream responses "
+		    "to stderr.\n");
 	/*
 	** Foreground serve passes no control endpoint and therefore keeps its
 	** existing synchronous behavior.  --daemon delegates all fork, lock,
