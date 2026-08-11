@@ -305,6 +305,8 @@ parse_boundary(const char *content_type, char **boundary)
 	parameter_done:
 		free(value);
 		free(key);
+		if (result != IMAGE_RESULT_OK)
+			return result;
 	}
 	if (*boundary == NULL)
 		return IMAGE_RESULT_INVALID;

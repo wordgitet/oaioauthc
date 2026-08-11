@@ -311,6 +311,19 @@ test_edit_errors(void)
 	CHECK(result == IMAGE_RESULT_INVALID);
 	CHECK(strstr(error, "at most 5") != NULL);
 
+	multipart_init(&multipart, "third");
+	CHECK(multipart_field(&multipart, "model", "image-model") == 0);
+	CHECK(multipart_field(&multipart, "prompt", "edit") == 0);
+	CHECK(multipart_file(&multipart, "image", "input.png", "image/png", "x",
+		  1) == 0);
+	CHECK(multipart_finish(&multipart) == 0);
+	result = image_prepare_edit(
+	    "multipart/form-data; boundary=first; boundary=second; boundary=third",
+	    multipart.body.data, multipart.body.len, &output, error,
+	    sizeof(error));
+	buffer_free(&multipart.body);
+	CHECK(result == IMAGE_RESULT_INVALID);
+
 	result = image_prepare_edit("application/json", "{}", 2, &output, error,
 	    sizeof(error));
 	CHECK(result == IMAGE_RESULT_INVALID);
