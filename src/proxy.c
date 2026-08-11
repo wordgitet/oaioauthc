@@ -259,8 +259,7 @@ static int
 debug_sensitive_key(const char *key)
 {
 	static const char *sensitive[] = { "access_token", "api_key",
-		"authorization", "encrypted_content", "id_token",
-		"refresh_token" };
+		"authorization", "id_token", "refresh_token" };
 	size_t		   index;
 
 	/* Keep this list conservative: debug output must never collect secrets. */
@@ -336,16 +335,16 @@ debug_json_copy(json_t *value)
 	return json_deep_copy(value);
 }
 
-/* Write one best-effort diagnostic line; logging cannot fail a route. */
+/* Write one best-effort named diagnostic line; logging cannot fail a route. */
 static void
-debug_json_write(const char *label, const char *text)
+diagnostic_write(const char *channel, const char *label, const char *text)
 {
 	struct buffer line;
 	char	      prefix[128];
 	int	      length;
 
-	length = snprintf(prefix, sizeof(prefix),
-	    "[debug-json pid=%ld] %s: ", (long)getpid(), label);
+	length = snprintf(prefix, sizeof(prefix), "[%s pid=%ld] %s: ", channel,
+	    (long)getpid(), label);
 	if (length < 0 || (size_t)length >= sizeof(prefix))
 		return;
 	buffer_init(&line);
@@ -359,28 +358,51 @@ debug_json_write(const char *label, const char *text)
 	buffer_free(&line);
 }
 
-/* Render a redacted JSON value according to the configured debug format. */
+/* Write one JSON-request diagnostic line. */
 static void
-debug_json_value(const struct proxy_options *options, const char *label,
-    json_t *value)
+debug_json_write(const char *label, const char *text)
+{
+	diagnostic_write("debug-json", label, text);
+}
+
+/* Write one upstream-response diagnostic line. */
+static void
+http_response_write(const char *label, const char *text)
+{
+	diagnostic_write("http-response", label, text);
+}
+
+/* Render a redacted JSON value through one selected diagnostic channel. */
+static void
+diagnostic_json_value(int enabled, int pretty, const char *channel,
+    const char *label, json_t *value)
 {
 	json_t *copy;
 	char   *text;
 	size_t	flags;
 
-	if (options->debug_json == debug_json_disabled)
+	if (!enabled)
 		return;
 	copy = debug_json_copy(value);
-	flags = options->debug_json == debug_json_pretty ? JSON_INDENT(2)
-							 : JSON_COMPACT;
+	flags = pretty ? JSON_INDENT(2) : JSON_COMPACT;
 	text = copy == NULL ? NULL : json_dumps(copy, flags);
 	json_decref(copy);
 	if (text == NULL) {
-		debug_json_write(label, "[could not encode JSON]");
+		diagnostic_write(channel, label, "[could not encode JSON]");
 		return;
 	}
-	debug_json_write(label, text);
+	diagnostic_write(channel, label, text);
 	free(text);
+}
+
+/* Render one JSON-request value according to the configured debug format. */
+static void
+debug_json_value(const struct proxy_options *options, const char *label,
+    json_t *value)
+{
+	diagnostic_json_value(options->debug_json != debug_json_disabled,
+	    options->debug_json == debug_json_pretty, "debug-json", label,
+	    value);
 }
 
 /* Parse a prepared JSON string before applying the shared redaction policy. */
@@ -401,6 +423,15 @@ debug_json_text(const struct proxy_options *options, const char *label,
 	json_decref(value);
 }
 
+/* Render one redacted JSON value under the HTTP-response channel. */
+static void
+debug_http_value(const struct proxy_options *options, const char *label,
+    json_t *value)
+{
+	diagnostic_json_value(options->show_http_response, 0, "http-response",
+	    label, value);
+}
+
 /*
 ** Log one failed upstream response without exposing credential fields.
 **
@@ -415,29 +446,118 @@ debug_upstream_error(const struct proxy_options *options, const char *label,
 	json_t *body;
 	json_t *entry;
 
-	if (options->debug_json == debug_json_disabled)
+	if (!options->show_http_response)
 		return;
 	if (response->body == NULL || response->body_length == 0)
 		body = json_string("[empty response body]");
 	else
-		body = json_loadb(response->body, response->body_length, 0, NULL);
+		body =
+		    json_loadb(response->body, response->body_length, 0, NULL);
 	if (body == NULL)
 		body = json_string("[invalid JSON response body omitted]");
 	if (body == NULL) {
-		debug_json_write(label, "[could not encode error response]");
+		http_response_write(label, "[could not encode error response]");
 		return;
 	}
 	entry = json_pack("{s:I,s:s,s:O}", "status",
 	    (json_int_t)response->status, "content_type",
-	    response->content_type == NULL ? "" : response->content_type, "body",
-	    body);
+	    response->content_type == NULL ? "" : response->content_type,
+	    "body", body);
 	json_decref(body);
 	if (entry == NULL) {
-		debug_json_write(label, "[could not encode error response]");
+		http_response_write(label, "[could not encode error response]");
 		return;
 	}
-	debug_json_value(options, label, entry);
+	debug_http_value(options, label, entry);
 	json_decref(entry);
+}
+
+/* Log a failed HTTP transfer while applying the standard JSON redaction. */
+static void
+debug_upstream_transport_error(const struct proxy_options *options,
+    const char *label, const char *error)
+{
+	json_t *entry;
+
+	if (!options->show_http_response)
+		return;
+	entry = json_pack("{s:s}", "error", error == NULL ? "" : error);
+	if (entry == NULL) {
+		http_response_write(label,
+		    "[could not encode transport error]");
+		return;
+	}
+	debug_http_value(options, label, entry);
+	json_decref(entry);
+}
+
+/* Distinguish a silently truncated SSE response from a completed stream. */
+static void
+debug_upstream_stream_error(const struct proxy_options *options)
+{
+	if (!options->show_http_response)
+		return;
+	http_response_write("Codex stream error",
+	    "[upstream stream ended before a completion event]");
+}
+
+/* Record the HTTP result for every completed upstream Responses request. */
+static void
+debug_upstream_response(const struct proxy_options *options,
+    const struct http_response			   *response)
+{
+	json_t *entry;
+
+	if (!options->show_http_response)
+		return;
+	entry = json_pack("{s:I,s:s}", "status", (json_int_t)response->status,
+	    "content_type",
+	    response->content_type == NULL ? "" : response->content_type);
+	if (entry == NULL) {
+		http_response_write("Codex response",
+		    "[could not encode response]");
+		return;
+	}
+	debug_http_value(options, "Codex response", entry);
+	json_decref(entry);
+}
+
+/* Redact and log one parsed upstream event without changing delivery. */
+static void
+debug_sse_event(json_t *event, void *argument)
+{
+	debug_http_value(argument, "Codex stream event", event);
+}
+
+/* Accept normalized trace output without retaining or forwarding it. */
+static int
+discard_sse(const void *data, size_t length, void *argument)
+{
+	(void)data;
+	(void)length;
+	(void)argument;
+	return 0;
+}
+
+/* Trace a buffered SSE response through the shared incremental parser. */
+static void
+debug_sse_response(const struct proxy_options *options, const void *data,
+    size_t length)
+{
+	struct sse_response_stream *stream;
+
+	if (!options->show_http_response)
+		return;
+	stream = sse_response_stream_new(discard_sse, NULL);
+	if (stream == NULL) {
+		http_response_write("Codex stream event",
+		    "[could not inspect buffered SSE response]");
+		return;
+	}
+	sse_response_stream_set_trace(stream, debug_sse_event, (void *)options);
+	if (sse_response_stream_feed(stream, data, length) == 0)
+		(void)sse_response_stream_finish(stream);
+	sse_response_stream_free(stream);
 }
 
 /* Release every allocation made by read_request and reset the structure. */
@@ -1473,6 +1593,9 @@ handle_responses(int fd, const struct proxy_options *options,
 			return send_error(fd, 500, "out of memory",
 			    "server_error");
 		}
+		if (options->show_http_response)
+			sse_response_stream_set_trace(response_stream,
+			    debug_sse_event, (void *)options);
 	}
 	if (as_chat && want_stream) {
 		chat_stream = sse_chat_stream_new(
@@ -1486,6 +1609,9 @@ handle_responses(int fd, const struct proxy_options *options,
 			return send_error(fd, 500, "out of memory",
 			    "server_error");
 		}
+		if (options->show_http_response)
+			sse_chat_stream_set_trace(chat_stream, debug_sse_event,
+			    (void *)options);
 	}
 	if (want_stream)
 		result = http_post_json_stream(url, request_text,
@@ -1504,6 +1630,8 @@ handle_responses(int fd, const struct proxy_options *options,
 	free(url);
 	free(request_text);
 	if (result == -1) {
+		debug_upstream_transport_error(options, "Codex transport error",
+		    error);
 		sse_chat_stream_free(chat_stream);
 		sse_response_stream_free(response_stream);
 		json_decref(request);
@@ -1511,8 +1639,14 @@ handle_responses(int fd, const struct proxy_options *options,
 			return -1;
 		return send_error(fd, 502, error, "upstream_error");
 	}
+	debug_upstream_response(options, &response);
+	if (!want_stream && response.status >= 200 && response.status < 300 &&
+	    response.body != NULL)
+		debug_sse_response(options, response.body,
+		    response.body_length);
 	if (response.status < 200 || response.status >= 300) {
-		debug_upstream_error(options, "Codex error response", &response);
+		debug_upstream_error(options, "Codex error response",
+		    &response);
 		result = send_response(fd, (int)response.status,
 		    response.content_type == NULL ? "application/json"
 						  : response.content_type,
@@ -1528,6 +1662,8 @@ handle_responses(int fd, const struct proxy_options *options,
 			result = sse_chat_stream_finish(chat_stream);
 		else
 			result = sse_response_stream_finish(response_stream);
+		if (result == -1)
+			debug_upstream_stream_error(options);
 		http_response_free(&response);
 		sse_chat_stream_free(chat_stream);
 		sse_response_stream_free(response_stream);
@@ -1541,11 +1677,13 @@ handle_responses(int fd, const struct proxy_options *options,
 	}
 	completed =
 	    sse_collect_completed_response(response.body, error, sizeof(error));
-	http_response_free(&response);
 	if (completed == NULL) {
+		debug_upstream_stream_error(options);
+		http_response_free(&response);
 		json_decref(request);
 		return send_error(fd, 502, error, "upstream_error");
 	}
+	http_response_free(&response);
 	if (as_chat) {
 		json_t *chat;
 
