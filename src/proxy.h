@@ -34,6 +34,7 @@ struct proxy_options {
 	const char	      *client_id;
 	const char	      *token_url;
 	enum debug_json_format debug_json;
+	int		       show_http_response;
 };
 
 /* Handle one accepted local control connection in the listener process. */
