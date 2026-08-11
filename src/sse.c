@@ -45,8 +45,10 @@ struct sse_chat_stream {
 	char		  *id;
 	struct sse_tool	  *tools;
 	size_t		   tool_count;
+	sse_trace_callback trace;
 	sse_write_callback write;
 	void		  *argument;
+	void		  *trace_argument;
 	time_t		   created;
 	int		   role_sent;
 	int		   done;
@@ -64,8 +66,10 @@ struct sse_chat_stream {
 struct sse_response_stream {
 	struct buffer	   pending;
 	json_t		  *items;
+	sse_trace_callback trace;
 	sse_write_callback write;
 	void		  *argument;
+	void		  *trace_argument;
 	int		   done;
 };
 
@@ -190,6 +194,8 @@ process_response_block(struct sse_response_stream *stream, char *block)
 	event = json_loadb(data, (size_t)(data_end - data), 0, &error);
 	if (event == NULL)
 		return write_response_block(stream, block);
+	if (stream->trace != NULL)
+		stream->trace(event, stream->trace_argument);
 	type = json_string_value(json_object_get(event, "type"));
 	item = json_object_get(event, "item");
 	response = json_object_get(event, "response");
@@ -234,6 +240,15 @@ sse_response_stream_new(sse_write_callback callback, void *argument)
 	stream->write = callback;
 	stream->argument = argument;
 	return stream;
+}
+
+/* Configure an optional best-effort observer for parsed upstream events. */
+void
+sse_response_stream_set_trace(struct sse_response_stream *stream,
+    sse_trace_callback callback, void *argument)
+{
+	stream->trace = callback;
+	stream->trace_argument = argument;
 }
 
 /*
@@ -551,6 +566,8 @@ process_event(struct sse_chat_stream *stream, const char *data)
 	event = json_loads(data, 0, &error);
 	if (event == NULL)
 		return 0;
+	if (stream->trace != NULL)
+		stream->trace(event, stream->trace_argument);
 	result = 0;
 	type = json_string_value(json_object_get(event, "type"));
 	item = json_object_get(event, "item");
@@ -666,6 +683,15 @@ sse_chat_stream_new(const char *model, sse_write_callback callback,
 	stream->write = callback;
 	stream->argument = argument;
 	return stream;
+}
+
+/* Configure an optional best-effort observer for parsed upstream events. */
+void
+sse_chat_stream_set_trace(struct sse_chat_stream *stream,
+    sse_trace_callback callback, void *argument)
+{
+	stream->trace = callback;
+	stream->trace_argument = argument;
 }
 
 /*
