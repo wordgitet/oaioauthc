@@ -1,5 +1,5 @@
 AC_PREREQ([2.69])
-AC_INIT([oaioauthc], [0.2.1])
+AC_INIT([oaioauthc], [0.2.2])
 AM_INIT_AUTOMAKE([foreign subdir-objects -Wall])
 AC_CONFIG_SRCDIR([src/app.c])
 AC_CONFIG_HEADERS([config.h])
