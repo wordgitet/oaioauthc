@@ -167,8 +167,8 @@ send_mock_error(int fd, int status, const char *body)
 
 	length = snprintf(header, sizeof(header),
 	    "HTTP/1.1 %d Test\r\nContent-Type: application/json\r\n"
-	    "Content-Length: %zu\r\nConnection: close\r\n\r\n", status,
-	    strlen(body));
+	    "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+	    status, strlen(body));
 	if (length < 0 || (size_t)length >= sizeof(header))
 		return (-1);
 	if (write_all(fd, header, (size_t)length) == -1)
@@ -181,16 +181,17 @@ static int
 send_mock_stream(int fd, const char *body)
 {
 	static const size_t fragments[] = { 1, 7, 3, 19 };
-	struct timespec     delay;
-	char		 header[256];
-	int		 length;
-	size_t		 index;
-	size_t		 offset;
-	size_t		 fragment;
+	struct timespec	    delay;
+	char		    header[256];
+	int		    length;
+	size_t		    index;
+	size_t		    offset;
+	size_t		    fragment;
 
 	length = snprintf(header, sizeof(header),
 	    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-	    "Content-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+	    "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+	    strlen(body));
 	if (length < 0 || (size_t)length >= sizeof(header) ||
 	    write_all(fd, header, (size_t)length) == -1)
 		return (-1);
@@ -245,6 +246,11 @@ run_mock_upstream(const char *port, int ready_fd)
 	    "\"resp_truncated\"}}\n\n"
 	    "data: {\"type\":\"response.output_text.delta\","
 	    "\"delta\":\"incomplete\"}\n\n";
+	static const char failed_events[] =
+	    "data: {\"type\":\"response.failed\",\"response\":{"
+	    "\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{"
+	    "\"message\":\"mock stream rejected request\","
+	    "\"id_token\":\"upstream-stream-secret\"}}}\n\n";
 	static const char upstream_error[] =
 	    "{\"error\":{\"message\":\"mock upstream rejected request\","
 	    "\"type\":\"rate_limit_error\",\"id_token\":\"upstream-secret\"}}";
@@ -269,23 +275,33 @@ run_mock_upstream(const char *port, int ready_fd)
 			if (strncmp(request, "GET /models?", 12) == 0)
 				(void)send_mock_response(client_fd,
 				    "application/json", models);
-			else if (strncmp(request, "POST /responses ", 16) == 0) {
-				if (strstr(request, "please fail upstream") != NULL)
-					(void)send_mock_error(client_fd, 429, upstream_error);
-				else if (strstr(request, "please truncate upstream") !=
+			else if (strncmp(request, "POST /responses ", 16) ==
+			    0) {
+				if (strstr(request, "please fail upstream") !=
 				    NULL)
-					(void)send_mock_stream(client_fd, truncated_events);
+					(void)send_mock_error(client_fd, 429,
+					    upstream_error);
+				else if (strstr(request,
+					     "please fail stream") != NULL)
+					(void)send_mock_stream(client_fd,
+					    failed_events);
+				else if (strstr(request,
+					     "please truncate upstream") !=
+				    NULL)
+					(void)send_mock_stream(client_fd,
+					    truncated_events);
 				else if (strstr(request, "continue") != NULL &&
-				    (strstr(request, "\"type\":\"output_text\"") ==
-				    NULL || strstr(request, "\"text\":\"hello\"") ==
-				    NULL))
+				    (strstr(request,
+					 "\"type\":\"output_text\"") == NULL ||
+					strstr(request, "\"text\":\"hello\"") ==
+					    NULL))
 					(void)send_mock_error(client_fd, 500,
 					    "{\"error\":\"assistant history was not normalized\"}");
 				else
-					(void)send_mock_stream(client_fd, events);
-			}
-			else if (strncmp(request, "POST /images/generations ",
-				     25) == 0 &&
+					(void)send_mock_stream(client_fd,
+					    events);
+			} else if (strncmp(request, "POST /images/generations ",
+				       25) == 0 &&
 			    strstr(request, "\"model\":\"image-model\"") !=
 				NULL &&
 			    strstr(request, "\"prompt\":\"draw a square\"") !=
@@ -484,7 +500,8 @@ main(void)
 		close(debug_fd);
 		execl(TEST_PROGRAM_PATH, "oaioauthc", "serve", "-p", port,
 		    "--oauth-file", path, "--base-url", base_url,
-		    "--codex-version", "9.9.9", "--debug-json", (char *)NULL);
+		    "--codex-version", "9.9.9", "--debug-json",
+		    "--show-http-response", (char *)NULL);
 		_exit(127);
 	}
 	REQUIRE(wait_for_proxy(port, response, sizeof(response)) == 0);
@@ -505,7 +522,8 @@ main(void)
 		    "{\"model\":\"gpt-test\",\"input\":\"hi\","
 		    "\"access_token\":\"debug-secret\","
 		    "\"id_token\":\"identity-secret\",\"metadata\":{"
-		    "\"asset\":\"DATA:image/svg+xml,%3Csvg/%3E\"}}",
+		    "\"asset\":\"DATA:image/svg+xml,%3Csvg/%3E\"},"
+		    "\"encrypted_content\":\"reasoning-secret\"}",
 		    response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"status\":\"completed\"") != NULL);
 	REQUIRE(strstr(response, "\"text\":\"hello\"") != NULL);
@@ -531,14 +549,25 @@ main(void)
 	REQUIRE(strstr(response, "\"prompt_tokens\":2") != NULL);
 	REQUIRE(strstr(response, "\"reasoning_tokens\":1") != NULL);
 	REQUIRE(strstr(response, "data: [DONE]") != NULL);
-	REQUIRE(request_json(port, "/v1/responses",
-	    "{\"model\":\"gpt-test\",\"input\":\"please fail upstream\"}",
-	    response, sizeof(response)) == 0);
+	REQUIRE(
+	    request_json(port, "/v1/responses",
+		"{\"model\":\"gpt-test\",\"input\":\"please fail upstream\"}",
+		response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "429 Error") != NULL);
 	REQUIRE(strstr(response, "mock upstream rejected request") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
-	    "{\"model\":\"gpt-test\",\"input\":\"please truncate upstream\"}",
-	    response, sizeof(response)) == 0);
+		    "{\"model\":\"gpt-test\",\"input\":\"please fail stream\","
+		    "\"stream\":true}",
+		    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "response.failed") != NULL);
+	REQUIRE(request_json(port, "/v1/responses",
+		    "{\"model\":\"gpt-test\",\"input\":\"please fail stream\"}",
+		    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "502 Error") != NULL);
+	REQUIRE(
+	    request_json(port, "/v1/responses",
+		"{\"model\":\"gpt-test\",\"input\":\"please truncate upstream\"}",
+		response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "502 Error") != NULL);
 	REQUIRE(request_json(port, "/v1/images/generations",
 		    "{\"model\":\"image-model\",\"prompt\":\"draw a square\","
@@ -584,10 +613,16 @@ main(void)
 	REQUIRE(strstr(debug_output.data, "Models (1): gpt-test") != NULL);
 	REQUIRE(strstr(debug_output.data, "client request") != NULL);
 	REQUIRE(strstr(debug_output.data, "Codex request") != NULL);
+	REQUIRE(strstr(debug_output.data, "[http-response pid=") != NULL);
+	REQUIRE(strstr(debug_output.data, "Codex response") != NULL);
+	REQUIRE(strstr(debug_output.data, "Codex stream event") != NULL);
 	REQUIRE(strstr(debug_output.data, "Codex error response") != NULL);
 	REQUIRE(strstr(debug_output.data, "\"status\":429") != NULL);
-	REQUIRE(strstr(debug_output.data,
-		    "mock upstream rejected request") != NULL);
+	REQUIRE(strstr(debug_output.data, "mock upstream rejected request") !=
+	    NULL);
+	REQUIRE(strstr(debug_output.data, "Codex stream error") != NULL);
+	REQUIRE(
+	    strstr(debug_output.data, "mock stream rejected request") != NULL);
 	REQUIRE(
 	    strstr(debug_output.data, "client request: {\"model\"") != NULL);
 	REQUIRE(strstr(debug_output.data, "\"type\":\"output_text\"") != NULL);
@@ -600,7 +635,10 @@ main(void)
 	    strstr(debug_output.data, "\"id_token\":\"[redacted]\"") != NULL);
 	REQUIRE(strstr(debug_output.data, "debug-secret") == NULL);
 	REQUIRE(strstr(debug_output.data, "identity-secret") == NULL);
+	REQUIRE(strstr(debug_output.data,
+		    "\"encrypted_content\":\"reasoning-secret\"") != NULL);
 	REQUIRE(strstr(debug_output.data, "upstream-secret") == NULL);
+	REQUIRE(strstr(debug_output.data, "upstream-stream-secret") == NULL);
 	REQUIRE(strstr(debug_output.data, "DATA:image/svg+xml") == NULL);
 	REQUIRE(strstr(debug_output.data, "acct_1") == NULL);
 	REQUIRE(kill(pid, SIGTERM) == 0);
@@ -633,6 +671,8 @@ main(void)
 	REQUIRE(read_file(debug_path, &debug_output) == 0);
 	REQUIRE(strstr(debug_output.data,
 		    "client request: {\n  \"model\": \"gpt-test\"") != NULL);
+	REQUIRE(strstr(debug_output.data, "Codex response") == NULL);
+	REQUIRE(strstr(debug_output.data, "Codex stream event") == NULL);
 	REQUIRE(kill(pid, SIGTERM) == 0);
 	REQUIRE(waitpid(pid, &status, 0) == pid);
 	pid = -1;
