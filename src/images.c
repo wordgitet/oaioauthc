@@ -288,23 +288,22 @@ parse_boundary(const char *content_type, char **boundary)
 		key = copy_bytes(start, (size_t)(end - start));
 		if (key == NULL)
 			return IMAGE_RESULT_NOMEM;
+		value = NULL;
 		result = read_parameter_value(&cursor, &value);
-		if (result != IMAGE_RESULT_OK) {
-			free(key);
-			return result;
-		}
+		if (result != IMAGE_RESULT_OK)
+			goto parameter_done;
 		if (strcasecmp(key, "boundary") == 0) {
 			if (*boundary != NULL) {
-				free(key);
-				free(value);
 				free(*boundary);
 				*boundary = NULL;
-				return IMAGE_RESULT_INVALID;
+				result = IMAGE_RESULT_INVALID;
+				goto parameter_done;
 			}
 			*boundary = value;
-		} else {
-			free(value);
+			value = NULL;
 		}
+	parameter_done:
+		free(value);
 		free(key);
 	}
 	if (*boundary == NULL)
@@ -368,30 +367,31 @@ parse_disposition(const char *value, struct part_info *part)
 		key = copy_bytes(start, (size_t)(end - start));
 		if (key == NULL)
 			return IMAGE_RESULT_NOMEM;
+		parameter = NULL;
 		result = read_parameter_value(&cursor, &parameter);
-		if (result != IMAGE_RESULT_OK) {
-			free(key);
-			return result;
-		}
+		if (result != IMAGE_RESULT_OK)
+			goto parameter_done;
 		if (strcasecmp(key, "name") == 0) {
 			if (part->name != NULL) {
-				free(key);
-				free(parameter);
-				return IMAGE_RESULT_INVALID;
+				result = IMAGE_RESULT_INVALID;
+				goto parameter_done;
 			}
 			part->name = parameter;
+			parameter = NULL;
 		} else if (strcasecmp(key, "filename") == 0) {
 			if (part->has_filename) {
-				free(key);
-				free(parameter);
-				return IMAGE_RESULT_INVALID;
+				result = IMAGE_RESULT_INVALID;
+				goto parameter_done;
 			}
 			part->filename = parameter;
 			part->has_filename = 1;
-		} else {
-			free(parameter);
+			parameter = NULL;
 		}
+	parameter_done:
+		free(parameter);
 		free(key);
+		if (result != IMAGE_RESULT_OK)
+			return result;
 	}
 	return part->name == NULL ? IMAGE_RESULT_INVALID : IMAGE_RESULT_OK;
 }
@@ -673,24 +673,25 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 	 * cannot turn into an unbounded string scan.
 	 */
 	memset(form, 0, sizeof(*form));
+	buffer_init(&marker);
+	memset(&part, 0, sizeof(part));
 	boundary = NULL;
 	result = parse_boundary(content_type, &boundary);
 	if (result != IMAGE_RESULT_OK)
-		return result;
-	buffer_init(&marker);
+		goto multipart_done;
 	if (buffer_append_string(&marker, "--") == -1 ||
 	    buffer_append_string(&marker, boundary) == -1) {
-		free(boundary);
-		buffer_free(&marker);
-		return IMAGE_RESULT_NOMEM;
+		result = IMAGE_RESULT_NOMEM;
+		goto multipart_done;
 	}
 	free(boundary);
+	boundary = NULL;
 	data = body;
 	if (length < marker.len + 2 ||
 	    memcmp(data, marker.data, marker.len) != 0 ||
 	    memcmp(data + marker.len, "\r\n", 2) != 0) {
-		buffer_free(&marker);
-		return IMAGE_RESULT_INVALID;
+		result = IMAGE_RESULT_INVALID;
+		goto multipart_done;
 	}
 	cursor = data + marker.len + 2;
 	remaining = length - marker.len - 2;
@@ -715,7 +716,6 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 		boundary_at = next_boundary(cursor, remaining,
 		    (const unsigned char *)marker.data, marker.len);
 		if (boundary_at == NULL) {
-			part_info_free(&part);
 			result = IMAGE_RESULT_INVALID;
 			break;
 		}
@@ -742,7 +742,10 @@ parse_multipart(const char *content_type, const void *body, size_t length,
 		cursor += 2;
 		remaining -= 2;
 	}
+multipart_done:
+	free(boundary);
 	buffer_free(&marker);
+	part_info_free(&part);
 	if (result != IMAGE_RESULT_OK)
 		image_form_free(form);
 	return result;
@@ -863,23 +866,24 @@ file_data_url(const struct image_file *file)
 	encoded = malloc(encoded_length + 1);
 	if (encoded == NULL)
 		return NULL;
-	result = EVP_EncodeBlock(encoded, file->data, (int)file->length);
-	if (result < 0 || (size_t)result != encoded_length) {
-		free(encoded);
-		return NULL;
-	}
-	encoded[encoded_length] = '\0';
 	buffer_init(&url);
+	result = EVP_EncodeBlock(encoded, file->data, (int)file->length);
+	if (result < 0 || (size_t)result != encoded_length)
+		goto data_url_done;
+	encoded[encoded_length] = '\0';
 	if (buffer_append_string(&url, "data:") == -1 ||
 	    buffer_append_string(&url, file->content_type) == -1 ||
 	    buffer_append_string(&url, ";base64,") == -1 ||
 	    buffer_append(&url, encoded, encoded_length) == -1) {
-		free(encoded);
-		buffer_free(&url);
-		return NULL;
+		goto data_url_done;
 	}
 	free(encoded);
 	return buffer_steal(&url);
+
+data_url_done:
+	free(encoded);
+	buffer_free(&url);
+	return NULL;
 }
 
 /* Append image_url objects in the same order as the multipart upload fields. */
