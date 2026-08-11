@@ -24,6 +24,7 @@ OpenAI-compatible API
 .RB [ \-\-runtime-dir
 .IR directory ]
 .RB [ \-\-debug-json [ =compact | =pretty ]]
+.RB [ \-\-show-http-response ]
 .PP
 .B oaioauthc login
 .RB [ \-\-device-auth ]
@@ -121,16 +122,24 @@ HTTP is permitted only for explicit loopback endpoints (localhost, 127.0.0.1,
 or [::1]) used during local testing.
 .TP
 .BI \-\-debug-json
-Write parsed client JSON, normalized upstream JSON, and failed upstream
-response diagnostics to standard error in compact form.  Failed-response
-diagnostics include the HTTP status, Content-Type, and a redacted JSON body;
-non-JSON response bodies are omitted.
+Write parsed client JSON and normalized upstream JSON to standard error in
+compact form.  OAuth token fields and image data URLs are redacted, but
+encrypted reasoning content, prompts, conversation history, and tool
+definitions remain visible.
 .TP
 .BI \-\-debug-json=compact
 Select compact diagnostic JSON explicitly.
 .TP
 .BI \-\-debug-json=pretty
 Select indented diagnostic JSON.
+.TP
+.B \-\-show-http-response
+Write upstream HTTP status and Content-Type, redacted JSON SSE events, and failed
+response bodies to standard error.  Transport failures and incomplete streams
+are identified directly.  Response JSON remains compact so each SSE event
+occupies one log line.  This option may expose model output and other response
+content, so protect the log and use it only while diagnosing an upstream
+request.
 .TP
 .B \-\-daemon
 Detach the
@@ -149,9 +158,9 @@ then
 .IR ./.local/state/oaioauthc .
 The directory and regular runtime files are created with modes 0700 and 0600.
 .PP
-Diagnostic JSON redacts OAuth token fields, encrypted reasoning content, and
-image data URLs.  It does not redact prompts, conversation history, or tool
-definitions.
+Diagnostic JSON and HTTP-response output redact OAuth token fields and image
+data URLs.  They do not redact encrypted reasoning content, prompts,
+conversation history, tool definitions, or ordinary model output.
 .SH LOGIN OPTIONS
 .TP
 .B \-\-device-auth
