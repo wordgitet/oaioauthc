@@ -972,49 +972,60 @@ load_model_catalog(const struct proxy_options *options,
 	json_t		    *model;
 	size_t		     index;
 	int		     valid_models;
+	int		     result;
 
 	/* Model defaults and visibility are account-specific, not global metadata. */
 	if (catalog->root != NULL && catalog->account_id != NULL &&
 	    strcmp(catalog->account_id, session->account_id) == 0 &&
 	    catalog->expires > time(NULL))
 		return 0;
+	url = NULL;
+	version = NULL;
+	root = NULL;
+	buffer_init(&full);
+	memset(&response, 0, sizeof(response));
 	url = upstream_url(options, "models?client_version=");
 	version = http_form_encode(options->codex_version);
 	if (url == NULL || version == NULL) {
-		free(url);
-		free(version);
 		set_error(error, length, "out of memory");
-		return -1;
+		result = -1;
+		goto catalog_done;
 	}
-	buffer_init(&full);
 	if (buffer_append_string(&full, url) == -1 ||
 	    buffer_append_string(&full, version) == -1) {
-		free(url);
-		free(version);
-		buffer_free(&full);
 		set_error(error, length, "out of memory");
-		return -1;
+		result = -1;
+		goto catalog_done;
 	}
 	free(url);
+	url = NULL;
 	free(version);
+	version = NULL;
 	url = buffer_steal(&full);
-	if (url == NULL)
-		return -1;
-	if (http_get(url, session->access_token, session->account_id, &response,
-		error, length) == -1) {
-		free(url);
-		return -1;
+	if (url == NULL) {
+		set_error(error, length, "out of memory");
+		result = -1;
+		goto catalog_done;
 	}
+	result = http_get(url, session->access_token, session->account_id,
+	    &response, error, length);
+	if (result == -1)
+		goto catalog_done;
 	free(url);
+	url = NULL;
 	if (response.status < 200 || response.status >= 300) {
 		set_error(error, length, "failed to load models from Codex");
 		debug_upstream_error(options, "Codex models error response",
 		    &response);
-		http_response_free(&response);
-		return -1;
+		result = -1;
+		goto catalog_done;
 	}
 	root = json_load_string_checked(response.body, error, length);
 	http_response_free(&response);
+	if (root == NULL) {
+		result = -1;
+		goto catalog_done;
+	}
 	models = json_object_get(root, "models");
 	valid_models = 0;
 	if (json_is_array(models)) {
@@ -1026,20 +1037,31 @@ load_model_catalog(const struct proxy_options *options,
 	}
 	if (!json_is_object(root) || !json_is_array(models) ||
 	    valid_models == 0) {
-		json_decref(root);
 		set_error(error, length,
 		    "Codex returned an empty or malformed models response");
-		return -1;
+		result = -1;
+		goto catalog_done;
 	}
 	model_catalog_free(catalog);
 	catalog->account_id = oaio_strdup(session->account_id);
 	if (catalog->account_id == NULL) {
-		json_decref(root);
-		return -1;
+		set_error(error, length, "out of memory");
+		result = -1;
+		goto catalog_done;
 	}
 	catalog->root = root;
+	root = NULL;
 	catalog->expires = time(NULL) + 300;
-	return 0;
+	result = 0;
+
+catalog_done:
+	free(url);
+	free(version);
+	buffer_free(&full);
+	http_response_free(&response);
+	if (root != NULL)
+		json_decref(root);
+	return result;
 }
 
 /* Initialize the inactive asynchronous catalog-refresh state. */
@@ -1506,6 +1528,7 @@ handle_responses(int fd, const struct proxy_options *options,
 	json_t			   *request;
 	json_t			   *upstream_request;
 	json_t			   *completed;
+	json_t			   *chat;
 	json_t			   *model;
 	char			   *request_text;
 	char			   *url;
@@ -1518,39 +1541,49 @@ handle_responses(int fd, const struct proxy_options *options,
 	struct sse_chat_stream	   *chat_stream;
 	struct sse_response_stream *response_stream;
 
+	request = NULL;
+	upstream_request = NULL;
+	completed = NULL;
+	chat = NULL;
+	request_text = NULL;
+	url = NULL;
+	chat_stream = NULL;
+	response_stream = NULL;
+	memset(&response, 0, sizeof(response));
+
 	/* Convert Chat only here; all upstream work uses Responses JSON. */
 	request = json_load_string_checked(body, error, sizeof(error));
-	if (request == NULL)
-		return send_error(fd, 400, error, "invalid_request_error");
+	if (request == NULL) {
+		result = send_error(fd, 400, error, "invalid_request_error");
+		goto responses_done;
+	}
 	debug_json_value(options, "client request", request);
 	if (as_chat) {
 		upstream_request =
 		    json_chat_to_responses(request, error, sizeof(error));
 		if (upstream_request == NULL) {
-			json_decref(request);
-			return send_error(fd, 400, error,
-			    "invalid_request_error");
+			result =
+			    send_error(fd, 400, error, "invalid_request_error");
+			goto responses_done;
 		}
 	} else {
 		upstream_request = request;
 		json_incref(upstream_request);
 		if (json_has_replay_state(upstream_request)) {
-			json_decref(upstream_request);
-			json_decref(request);
-			return send_error(fd, 400,
+			result = send_error(fd, 400,
 			    "Stateless Codex responses endpoint does not support "
 			    "`previous_response_id` or `item_reference`. Replay "
 			    "the full conversation history in `input` on each "
 			    "request.",
 			    "invalid_request_error");
+			goto responses_done;
 		}
 	}
 	want_stream = json_is_true(json_object_get(upstream_request, "stream"));
 	if (json_normalize_response_request(upstream_request, 1, error,
 		sizeof(error)) == -1) {
-		json_decref(upstream_request);
-		json_decref(request);
-		return send_error(fd, 400, error, "invalid_request_error");
+		result = send_error(fd, 400, error, "invalid_request_error");
+		goto responses_done;
 	}
 	model = NULL;
 	if (load_model_catalog(options, session, catalog, error,
@@ -1562,36 +1595,31 @@ handle_responses(int fd, const struct proxy_options *options,
 	if (model != NULL &&
 	    json_apply_model_defaults(upstream_request, model, &use_lite, error,
 		sizeof(error)) == -1) {
-		json_decref(upstream_request);
-		json_decref(request);
-		return send_error(fd, 500, error, "server_error");
+		result = send_error(fd, 500, error, "server_error");
+		goto responses_done;
 	}
 	debug_json_value(options, "Codex request", upstream_request);
 	request_text = json_dump_compact(upstream_request);
 	json_decref(upstream_request);
+	upstream_request = NULL;
 	if (request_text == NULL) {
-		json_decref(request);
-		return send_error(fd, 500, "out of memory", "server_error");
+		result = send_error(fd, 500, "out of memory", "server_error");
+		goto responses_done;
 	}
 	url = upstream_url(options, "responses");
 	if (url == NULL) {
-		free(request_text);
-		json_decref(request);
-		return send_error(fd, 500, "out of memory", "server_error");
+		result = send_error(fd, 500, "out of memory", "server_error");
+		goto responses_done;
 	}
 	client.fd = fd;
 	client.started = 0;
-	chat_stream = NULL;
-	response_stream = NULL;
 	if (!as_chat && want_stream) {
 		response_stream =
 		    sse_response_stream_new(write_stream_raw, &client);
 		if (response_stream == NULL) {
-			free(url);
-			free(request_text);
-			json_decref(request);
-			return send_error(fd, 500, "out of memory",
+			result = send_error(fd, 500, "out of memory",
 			    "server_error");
+			goto responses_done;
 		}
 		if (options->show_http_response)
 			sse_response_stream_set_trace(response_stream,
@@ -1602,12 +1630,9 @@ handle_responses(int fd, const struct proxy_options *options,
 		    json_string_value(json_object_get(request, "model")),
 		    write_stream_raw, &client);
 		if (chat_stream == NULL) {
-			free(url);
-			free(request_text);
-			sse_response_stream_free(response_stream);
-			json_decref(request);
-			return send_error(fd, 500, "out of memory",
+			result = send_error(fd, 500, "out of memory",
 			    "server_error");
+			goto responses_done;
 		}
 		if (options->show_http_response)
 			sse_chat_stream_set_trace(chat_stream, debug_sse_event,
@@ -1628,16 +1653,17 @@ handle_responses(int fd, const struct proxy_options *options,
 			     : NULL,
 		    NULL, NULL, &response, error, sizeof(error));
 	free(url);
+	url = NULL;
 	free(request_text);
+	request_text = NULL;
 	if (result == -1) {
 		debug_upstream_transport_error(options, "Codex transport error",
 		    error);
-		sse_chat_stream_free(chat_stream);
-		sse_response_stream_free(response_stream);
-		json_decref(request);
 		if (client.started)
-			return -1;
-		return send_error(fd, 502, error, "upstream_error");
+			result = -1;
+		else
+			result = send_error(fd, 502, error, "upstream_error");
+		goto responses_done;
 	}
 	debug_upstream_response(options, &response);
 	if (!want_stream && response.status >= 200 && response.status < 300 &&
@@ -1651,11 +1677,7 @@ handle_responses(int fd, const struct proxy_options *options,
 		    response.content_type == NULL ? "application/json"
 						  : response.content_type,
 		    response.body == NULL ? "" : response.body);
-		http_response_free(&response);
-		sse_chat_stream_free(chat_stream);
-		sse_response_stream_free(response_stream);
-		json_decref(request);
-		return result;
+		goto responses_done;
 	}
 	if (want_stream) {
 		if (as_chat)
@@ -1664,42 +1686,50 @@ handle_responses(int fd, const struct proxy_options *options,
 			result = sse_response_stream_finish(response_stream);
 		if (result == -1)
 			debug_upstream_stream_error(options);
-		http_response_free(&response);
-		sse_chat_stream_free(chat_stream);
-		sse_response_stream_free(response_stream);
-		json_decref(request);
 		if (result == -1 && !client.started)
-			return send_error(fd, 502,
+			result = send_error(fd, 502,
 			    "upstream stream ended before "
 			    "completion",
 			    "upstream_error");
-		return result;
+		goto responses_done;
 	}
 	completed =
 	    sse_collect_completed_response(response.body, error, sizeof(error));
 	if (completed == NULL) {
 		debug_upstream_stream_error(options);
-		http_response_free(&response);
-		json_decref(request);
-		return send_error(fd, 502, error, "upstream_error");
+		result = send_error(fd, 502, error, "upstream_error");
+		goto responses_done;
 	}
 	http_response_free(&response);
 	if (as_chat) {
-		json_t *chat;
-
 		chat = json_response_to_chat(completed, request, error,
 		    sizeof(error));
 		json_decref(completed);
+		completed = NULL;
 		json_decref(request);
+		request = NULL;
 		if (chat == NULL)
-			return send_error(fd, 502, error, "upstream_error");
-		result = send_json(fd, 200, chat);
-		json_decref(chat);
-		return result;
+			result = send_error(fd, 502, error, "upstream_error");
+		else
+			result = send_json(fd, 200, chat);
+		goto responses_done;
 	}
-	json_decref(request);
 	result = send_json(fd, 200, completed);
-	json_decref(completed);
+
+responses_done:
+	http_response_free(&response);
+	free(request_text);
+	free(url);
+	sse_chat_stream_free(chat_stream);
+	sse_response_stream_free(response_stream);
+	if (chat != NULL)
+		json_decref(chat);
+	if (completed != NULL)
+		json_decref(completed);
+	if (upstream_request != NULL)
+		json_decref(upstream_request);
+	if (request != NULL)
+		json_decref(request);
 	return result;
 }
 
