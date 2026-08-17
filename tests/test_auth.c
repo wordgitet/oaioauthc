@@ -194,6 +194,48 @@ close_pipe(int descriptors[2])
 		close(descriptors[1]);
 }
 
+/*
+** Verify that a JWT expiry wins over the timestamp fallback.
+**
+** The future token deliberately carries an old last_refresh, while the
+** expired token carries a future one.  Either fallback would invert the
+** expected decision and expose an incorrect precedence rule.
+*/
+static int
+test_jwt_refresh_expiry(void)
+{
+	struct auth_session session;
+	int		    result;
+
+	memset(&session, 0, sizeof(session));
+	session.access_token = oaio_strdup(
+	    "header.eyJleHAiOjQxMDI0NDQ4MDB9.signature");
+	session.refresh_token = oaio_strdup("refresh");
+	session.last_refresh = oaio_strdup("1970-01-01T00:00:00Z");
+	if (session.access_token == NULL || session.refresh_token == NULL ||
+	    session.last_refresh == NULL) {
+		auth_session_free(&session);
+		return (-1);
+	}
+	result = auth_session_needs_refresh(&session) == 0 ? 0 : -1;
+	auth_session_free(&session);
+	if (result == -1)
+		return (-1);
+
+	memset(&session, 0, sizeof(session));
+	session.access_token = oaio_strdup("header.eyJleHAiOjF9.signature");
+	session.refresh_token = oaio_strdup("refresh");
+	session.last_refresh = oaio_strdup("2099-01-01T00:00:00Z");
+	if (session.access_token == NULL || session.refresh_token == NULL ||
+	    session.last_refresh == NULL) {
+		auth_session_free(&session);
+		return (-1);
+	}
+	result = auth_session_needs_refresh(&session) == 1 ? 0 : -1;
+	auth_session_free(&session);
+	return (result);
+}
+
 /* Verify waiting refresh workers reload the token saved by the lock holder. */
 static int
 test_refresh_serialization(void)
@@ -353,6 +395,7 @@ main(void)
 	oauth_request_free(&request);
 	CHECK(request.authorization_url == NULL && request.state == NULL &&
 	    request.code_verifier == NULL);
+	CHECK(test_jwt_refresh_expiry() == 0);
 	CHECK(test_refresh_serialization() == 0);
 	(void)unlink(path);
 	return 0;
