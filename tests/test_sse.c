@@ -22,6 +22,10 @@ capture(const void *data, size_t length, void *argument)
 int
 main(void)
 {
+	static const char binary_stream[] =
+	    "data: {\"type\":\"response.completed\",\"response\":{"
+	    "\"id\":\"resp_binary\",\"status\":\"completed\","
+	    "\"output\":[]}}\n\n\0ignored";
 	struct buffer		    output;
 	struct sse_chat_stream	   *chat;
 	struct sse_response_stream *responses;
@@ -76,6 +80,31 @@ main(void)
 	response = sse_collect_completed_response(stream, error, sizeof(error));
 	CHECK(response == NULL);
 	CHECK(strstr(error, "no completed response") != NULL);
+
+	/*
+	** A raw NUL is not valid SSE and must not hide bytes after a completion.
+	** Exercise the buffered collector and both incremental parser variants.
+	*/
+	response = sse_collect_completed_response_buffer(binary_stream,
+	    sizeof(binary_stream) - 1, error, sizeof(error));
+	CHECK(response == NULL);
+	CHECK(strstr(error, "invalid binary data") != NULL);
+	buffer_init(&output);
+	responses = sse_response_stream_new(capture, &output);
+	CHECK(responses != NULL);
+	CHECK(sse_response_stream_feed(responses, binary_stream,
+		  sizeof(binary_stream) - 1) == -1);
+	CHECK(output.len == 0);
+	sse_response_stream_free(responses);
+	buffer_free(&output);
+	buffer_init(&output);
+	chat = sse_chat_stream_new("gpt-test", capture, &output);
+	CHECK(chat != NULL);
+	CHECK(sse_chat_stream_feed(chat, binary_stream,
+		  sizeof(binary_stream) - 1) == -1);
+	CHECK(output.len == 0);
+	sse_chat_stream_free(chat);
+	buffer_free(&output);
 
 	stream =
 	    "data: {\"type\":\"response.created\",\"response\":{\"id\":"
