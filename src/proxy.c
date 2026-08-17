@@ -1523,7 +1523,7 @@ handle_models(int fd, const struct proxy_options *options,
 static int
 handle_responses(int fd, const struct proxy_options *options,
     const struct auth_session *session, struct model_catalog *catalog,
-    const char *body, int as_chat)
+    const void *body, size_t body_length, int as_chat)
 {
 	json_t			   *request;
 	json_t			   *upstream_request;
@@ -1551,8 +1551,12 @@ handle_responses(int fd, const struct proxy_options *options,
 	response_stream = NULL;
 	memset(&response, 0, sizeof(response));
 
-	/* Convert Chat only here; all upstream work uses Responses JSON. */
-	request = json_load_string_checked(body, error, sizeof(error));
+	/*
+	** Convert Chat only here; all upstream work uses Responses JSON.  Preserve
+	** the HTTP body length so embedded NULs cannot hide trailing request bytes.
+	*/
+	request =
+	    json_load_buffer_checked(body, body_length, error, sizeof(error));
 	if (request == NULL) {
 		result = send_error(fd, 400, error, "invalid_request_error");
 		goto responses_done;
@@ -1693,8 +1697,12 @@ handle_responses(int fd, const struct proxy_options *options,
 			    "upstream_error");
 		goto responses_done;
 	}
-	completed =
-	    sse_collect_completed_response(response.body, error, sizeof(error));
+	/*
+	** Keep the buffered upstream length through SSE parsing.  A successful
+	** response must account for every byte received from Codex.
+	*/
+	completed = sse_collect_completed_response_buffer(response.body,
+	    response.body_length, error, sizeof(error));
 	if (completed == NULL) {
 		debug_upstream_stream_error(options);
 		result = send_error(fd, 502, error, "upstream_error");
@@ -1861,11 +1869,11 @@ dispatch(int fd, const struct proxy_options *options,
 	else if (strcmp(request->method, "POST") == 0 &&
 	    strcmp(request->path, "/v1/responses") == 0)
 		result = handle_responses(fd, options, &session, catalog,
-		    request->body, 0);
+		    request->body, request->body_length, 0);
 	else if (strcmp(request->method, "POST") == 0 &&
 	    strcmp(request->path, "/v1/chat/completions") == 0)
 		result = handle_responses(fd, options, &session, catalog,
-		    request->body, 1);
+		    request->body, request->body_length, 1);
 	else if (strcmp(request->method, "POST") == 0 &&
 	    strcmp(request->path, "/v1/images/generations") == 0)
 		result = handle_image(fd, options, &session, request, 0);
