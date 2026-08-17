@@ -610,9 +610,14 @@ auth_session_needs_refresh(const struct auth_session *session)
 	}
 	expires = json_integer_value(json_object_get(claims, "exp"));
 	json_decref(claims);
-	result = expires > 0 && expires <= (json_int_t)time(NULL) + 300;
-	if (result)
-		return 1;
+	/*
+	** A usable JWT expiry is authoritative.  Falling through to last_refresh
+	** would refresh a valid token repeatedly when older auth files omit it.
+	*/
+	if (expires > 0) {
+		result = expires <= (json_int_t)time(NULL) + 300;
+		return (result);
+	}
 
 check_last_refresh:
 	if (parse_timestamp(session->last_refresh, &refreshed) == 0)
