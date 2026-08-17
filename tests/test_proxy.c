@@ -140,9 +140,15 @@ read_mock_request(int fd, char *request, size_t length)
 	return headers == NULL ? -1 : 0;
 }
 
-/* Write the exact fixed-length HTTP response used by the local mock. */
+/*
+** Write an exact-length successful response from the local mock.
+**
+** Keeping a separate byte count lets binary-response tests place a NUL before
+** trailing data without making the mock truncate the fixture with strlen.
+*/
 static int
-send_mock_response(int fd, const char *content_type, const char *body)
+send_mock_response_bytes(int fd, const char *content_type, const void *body,
+    size_t body_length)
 {
 	char header[256];
 	int  length;
@@ -150,12 +156,21 @@ send_mock_response(int fd, const char *content_type, const char *body)
 	length = snprintf(header, sizeof(header),
 	    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
 	    "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-	    content_type, strlen(body));
+	    content_type, body_length);
 	if (length < 0 || (size_t)length >= sizeof(header))
-		return -1;
+		return (-1);
 	if (write_all(fd, header, (size_t)length) == -1)
-		return -1;
-	return write_all(fd, body, strlen(body));
+		return (-1);
+	return (write_all(fd, body, body_length));
+}
+
+/*
+** Write one ordinary C-string response through the exact-length helper.
+*/
+static int
+send_mock_response(int fd, const char *content_type, const char *body)
+{
+	return (send_mock_response_bytes(fd, content_type, body, strlen(body)));
 }
 
 /* Write an upstream error response while retaining the mock's fixed framing. */
@@ -222,6 +237,10 @@ send_mock_stream(int fd, const char *body)
 static void
 run_mock_upstream(const char *port, int ready_fd)
 {
+	static const char binary_events[] =
+	    "data: {\"type\":\"response.completed\",\"response\":{"
+	    "\"id\":\"resp_binary\",\"status\":\"completed\","
+	    "\"output\":[]}}\n\n\0ignored";
 	static const char models[] =
 	    "{\"models\":[{\"slug\":\"gpt-test\",\"visibility\":\"list\","
 	    "\"supported_in_api\":true}]}";
@@ -277,8 +296,14 @@ run_mock_upstream(const char *port, int ready_fd)
 				    "application/json", models);
 			else if (strncmp(request, "POST /responses ", 16) ==
 			    0) {
-				if (strstr(request, "please fail upstream") !=
+				if (strstr(request, "please send binary") !=
 				    NULL)
+					(void)send_mock_response_bytes(
+					    client_fd, "text/event-stream",
+					    binary_events,
+					    sizeof(binary_events) - 1);
+				else if (strstr(request,
+					     "please fail upstream") != NULL)
 					(void)send_mock_error(client_fd, 429,
 					    upstream_error);
 				else if (strstr(request,
@@ -349,20 +374,22 @@ open_port(const char *port)
 	return fd;
 }
 
-/* Send a raw HTTP request and collect the connection-close response. */
+/*
+** Send exact request bytes and collect the connection-close response.
+*/
 static int
-request_port(const char *port, const char *request, char *response,
-    size_t response_length)
+request_port_bytes(const char *port, const void *request, size_t request_length,
+    char *response, size_t response_length)
 {
 	int	fd;
 	ssize_t count;
 	size_t	length;
 
 	fd = open_port(port);
-	if (fd == -1 || write_all(fd, request, strlen(request)) == -1) {
+	if (fd == -1 || write_all(fd, request, request_length) == -1) {
 		if (fd != -1)
 			close(fd);
-		return -1;
+		return (-1);
 	}
 	length = 0;
 	while (length + 1 < response_length &&
@@ -371,24 +398,51 @@ request_port(const char *port, const char *request, char *response,
 		length += (size_t)count;
 	response[length] = '\0';
 	close(fd);
-	return 0;
+	return (0);
 }
 
-/* Build and send a minimal JSON POST request to one public proxy path. */
+/*
+** Send one ordinary C-string request through the exact-length helper.
+*/
+static int
+request_port(const char *port, const char *request, char *response,
+    size_t response_length)
+{
+	return (request_port_bytes(port, request, strlen(request), response,
+	    response_length));
+}
+
+/*
+** Build a JSON POST while preserving every supplied request-body byte.
+*/
+static int
+request_json_bytes(const char *port, const char *path, const void *body,
+    size_t body_length, char *response, size_t response_length)
+{
+	char request[2048];
+	int  header_length;
+
+	header_length = snprintf(request, sizeof(request),
+	    "POST %s HTTP/1.1\r\nHost: localhost\r\n"
+	    "Content-Length: %zu\r\n\r\n",
+	    path, body_length);
+	if (header_length < 0 || (size_t)header_length >= sizeof(request) ||
+	    body_length > sizeof(request) - (size_t)header_length)
+		return (-1);
+	memcpy(request + header_length, body, body_length);
+	return (request_port_bytes(port, request,
+	    (size_t)header_length + body_length, response, response_length));
+}
+
+/*
+** Build and send a minimal JSON POST request to one public proxy path.
+*/
 static int
 request_json(const char *port, const char *path, const char *body,
     char *response, size_t response_length)
 {
-	char request[2048];
-	int  length;
-
-	length = snprintf(request, sizeof(request),
-	    "POST %s HTTP/1.1\r\nHost: localhost\r\n"
-	    "Content-Length: %zu\r\n\r\n%s",
-	    path, strlen(body), body);
-	if (length < 0 || (size_t)length >= sizeof(request))
-		return -1;
-	return request_port(port, request, response, response_length);
+	return (request_json_bytes(port, path, body, strlen(body), response,
+	    response_length));
 }
 
 /* Build and send a multipart POST while preserving supplied body bytes. */
@@ -439,6 +493,10 @@ wait_for_proxy(const char *port, char *response, size_t length)
 int
 main(void)
 {
+	static const char binary_chat[] =
+	    "{\"model\":\"gpt-test\",\"messages\":[]}\0ignored";
+	static const char binary_responses[] =
+	    "{\"model\":\"gpt-test\",\"input\":\"hi\"}\0ignored";
 	char	      path[] = "/tmp/oaioauthc-proxy-XXXXXX";
 	char	      debug_path[] = "/tmp/oaioauthc-debug-XXXXXX";
 	char	      base_url[128];
@@ -518,6 +576,17 @@ main(void)
 		    "Host: localhost\r\n\r\n",
 		    response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"id\":\"gpt-test\"") != NULL);
+	/*
+	** JSON routes must reject bytes hidden after an embedded NUL instead of
+	** forwarding the valid prefix to the deterministic upstream.
+	*/
+	REQUIRE(
+	    request_json_bytes(port, "/v1/responses", binary_responses,
+		sizeof(binary_responses) - 1, response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "400 Error") != NULL);
+	REQUIRE(request_json_bytes(port, "/v1/chat/completions", binary_chat,
+		    sizeof(binary_chat) - 1, response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "400 Error") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
 		    "{\"model\":\"gpt-test\",\"input\":\"hi\","
 		    "\"access_token\":\"debug-secret\","
@@ -527,6 +596,12 @@ main(void)
 		    response, sizeof(response)) == 0);
 	REQUIRE(strstr(response, "\"status\":\"completed\"") != NULL);
 	REQUIRE(strstr(response, "\"text\":\"hello\"") != NULL);
+	REQUIRE(request_json(port, "/v1/responses",
+		    "{\"model\":\"gpt-test\",\"input\":"
+		    "\"please send binary\"}",
+		    response, sizeof(response)) == 0);
+	REQUIRE(strstr(response, "502 Error") != NULL);
+	REQUIRE(strstr(response, "invalid binary data") != NULL);
 	REQUIRE(request_json(port, "/v1/responses",
 		    "{\"model\":\"gpt-test\",\"input\":\"hi\",\"stream\":true}",
 		    response, sizeof(response)) == 0);
