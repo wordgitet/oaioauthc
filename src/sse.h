@@ -24,6 +24,11 @@ typedef void (*sse_trace_callback)(json_t *, void *);
 /* Return the completed Responses object reconstructed from buffered SSE. */
 json_t *
 sse_collect_completed_response(const char *, char *, size_t);
+/*
+** Return a completed response only after parsing every supplied SSE byte.
+*/
+json_t *
+sse_collect_completed_response_buffer(const void *, size_t, char *, size_t);
 /* Allocate a Responses stream normalizer for one outgoing client stream. */
 struct sse_response_stream *
 sse_response_stream_new(sse_write_callback, void *);
