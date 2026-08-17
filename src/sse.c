@@ -82,6 +82,21 @@ set_error(char *error, size_t length, const char *message)
 }
 
 /*
+** Accept a transport fragment only when C-string parsing can see every byte.
+**
+** SSE is textual.  Rejecting an embedded NUL at this boundary prevents later
+** strstr and strlen calls from accepting a valid event prefix while hiding
+** malformed trailing upstream data.
+*/
+static int
+sse_fragment_valid(const void *data, size_t length)
+{
+	if (length == 0)
+		return (1);
+	return (data != NULL && memchr(data, '\0', length) == NULL);
+}
+
+/*
 ** Deep-copy an output item into items, replacing an earlier item with its id.
 **
 ** Codex can describe an item incrementally and later provide a completed copy.
@@ -267,6 +282,10 @@ sse_response_stream_feed(struct sse_response_stream *stream, const void *data,
 	size_t	    consumed;
 	size_t	    index;
 
+	if (!sse_fragment_valid(data, length))
+		return (-1);
+	if (length == 0)
+		return (0);
 	source = data;
 	for (index = 0; index < length; index++) {
 		if (source[index] != '\r' &&
@@ -711,6 +730,10 @@ sse_chat_stream_feed(struct sse_chat_stream *stream, const void *data,
 	size_t	    consumed;
 
 	/* Transport writes may split any SSE line, so retain an incomplete block. */
+	if (!sse_fragment_valid(data, length))
+		return (-1);
+	if (length == 0)
+		return (0);
 	source = data;
 	for (index = 0; index < length; index++) {
 		if (source[index] != '\r' &&
@@ -775,7 +798,8 @@ sse_chat_stream_free(struct sse_chat_stream *stream)
 ** returned reference; a missing completed response sets error and returns NULL.
 */
 json_t *
-sse_collect_completed_response(const char *stream, char *error, size_t length)
+sse_collect_completed_response_buffer(const void *stream, size_t stream_length,
+    char *error, size_t length)
 {
 	char   *copy;
 	char   *cursor;
@@ -785,10 +809,21 @@ sse_collect_completed_response(const char *stream, char *error, size_t length)
 	json_t *items;
 	json_t *latest;
 
-	/* Non-streaming Codex replies use SSE too; retain only the final response. */
-	copy = oaio_strdup(stream);
+	/*
+	** Buffered Codex replies are still untrusted transport bytes.  Copy the
+	** exact range only after proving that its NUL terminator cannot hide data.
+	*/
+	if (!sse_fragment_valid(stream, stream_length)) {
+		set_error(error, length,
+		    "SSE stream contains invalid binary data");
+		return (NULL);
+	}
+	copy = malloc(stream_length + 1);
 	if (copy == NULL)
-		return NULL;
+		return (NULL);
+	if (stream_length > 0)
+		memcpy(copy, stream, stream_length);
+	copy[stream_length] = '\0';
 	destination = copy;
 	for (source = copy; *source != '\0'; source++) {
 		if (*source != '\r')
@@ -855,4 +890,21 @@ sse_collect_completed_response(const char *stream, char *error, size_t length)
 	}
 	json_decref(items);
 	return latest;
+}
+
+/*
+** Preserve the original C-string helper for trusted static test fixtures.
+**
+** Network callers must use sse_collect_completed_response_buffer so an exact
+** transport length remains available through the binary-data check.
+*/
+json_t *
+sse_collect_completed_response(const char *stream, char *error, size_t length)
+{
+	if (stream == NULL) {
+		set_error(error, length, "invalid SSE stream");
+		return (NULL);
+	}
+	return (sse_collect_completed_response_buffer(stream, strlen(stream),
+	    error, length));
 }
